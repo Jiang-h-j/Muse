@@ -1,0 +1,11 @@
+# 操作系统产物
+.DS_Store
+
+# BMad 框架本体（可重装的工具框架，非项目产出；产出在 _bmad-output/ 照常提交）
+/_bmad/
+
+# Claude Code 本地配置与 skills（跟随全局忽略，不随仓库分发）
+.claude/
+
+# 空占位文件
+/npx
