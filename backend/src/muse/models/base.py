@@ -1,0 +1,32 @@
+"""SQLAlchemy 2.0 声明式 Base 与通用列 mixin。
+
+本 story（1.1）只提供通用地基：id 主键 + created_at/updated_at 时间戳（UTC）。
+租户列 user_id / project_id 不在此处——它们是 user/project 表的外键，
+分别由 Story 1.2（user）、1.4（project）建表时定义并补 FK，避免此刻 FK 悬空。
+"""
+
+from datetime import datetime
+
+from sqlalchemy import DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """所有 ORM 模型的声明式基类；Base.metadata 即 Alembic autogenerate 的 target。"""
+
+
+class TimestampMixin:
+    """通用时间戳列，数据库侧生成，语义为 UTC。"""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class IntPKMixin:
+    """整型自增主键。业务表按需继承（也可后续换 UUID，届时另定 mixin）。"""
+
+    id: Mapped[int] = mapped_column(primary_key=True)

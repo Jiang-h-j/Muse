@@ -9,3 +9,12 @@
 
 # 空占位文件
 /npx
+
+# Python / uv 后端产物
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,111 @@
+# generated: 2026-07-23
+# last_updated: 2026-07-23
+# project: Muse
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+#
+# MUSE SEQUENCING NOTES (来自 epics.md AR19/AR20 + 就绪报告分层结论):
+# ===============
+# - 可立即开工：Epic 1 全部（骨架/认证/多租户/作品 CRUD），不被任何 P0 阻塞。
+# - 盲测门禁（launch blocker）：Story 4-1 是硬门禁；未通过则阻断 4-4 正文生成接入。
+#   盲测依赖 Epic 2 的 LLM 底座（2-1）+ Epic 3 的 style_profile（3-2）+ 去 AI 味词表。
+# - 跨 epic 受控依赖：Story 1-8 额度护栏「真正生效」依赖 Epic 2 Provider 层埋点（AR14），
+#   本 story 只建表+校验框架+展示；须追踪衔接不留空窗。
+# - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
+
+generated: 2026-07-23
+last_updated: 2026-07-23
+project: Muse
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  # ---------- Epic 1: 账户与作品管理（含后端基座）----------
+  epic-1: in-progress
+  1-1-后端工程基座与本地开发环境: review
+  1-2-用户注册邀请码: backlog
+  1-3-用户登录与JWT双token会话: backlog
+  1-4-作品创建与列表持久化空-失败状态: backlog
+  1-5-作品重命名与删除: backlog
+  1-6-继续创作-按phase跳转当前步骤: backlog
+  1-7-BYOKAPIKey绑定全新设置页: backlog
+  1-8-托管免费额度护栏与用量展示: backlog
+  epic-1-retrospective: optional
+
+  # ---------- Epic 2: 探索（含 LLM / 编排底座）----------
+  epic-2: backlog
+  2-1-LLMProvider抽象-DeepSeek实现-ARQ-SSE异步底座: backlog
+  2-2-探索会话根与模式分叉模式独立: backlog
+  2-3-引导探索-真实Agent理解自由作答-沉浸问答: backlog
+  2-4-引导探索-翻页与答案真实持久化: backlog
+  2-5-引导探索-收尾整理中过渡态: backlog
+  2-6-自由探索-对话-线索区-给方向-持久化: backlog
+  2-7-自由探索-整理为故事设定开放门禁: backlog
+  epic-2-retrospective: optional
+
+  # ---------- Epic 3: 故事设定与文风锚点 ----------
+  epic-3: backlog
+  3-1-story_bible表落地12字段schema-clean-room: backlog
+  3-2-文风锚点入口全新UI-style_profile抽取: backlog
+  3-3-探索整理为12字段故事设定候选卡: backlog
+  3-4-设定候选卡编辑-反馈升版本真实Agent: backlog
+  3-5-确认设定-只读设定圣经-回到探索丢弃: backlog
+  epic-3-retrospective: optional
+
+  # ---------- Epic 4: 章节创作（含盲测门禁）----------
+  epic-4: backlog
+  4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: backlog
+  4-2-五段流水线编排底座V1四段-去AI味词表: backlog
+  4-3-首章无缝进入-幕后阶段规划: backlog
+  4-4-本章想法输入-真实生成章节正文: backlog
+  4-5-分页阅读-段落批注-整体点评: backlog
+  4-6-改进本章-重新生成整章: backlog
+  4-7-定稿本章-阶段循环-阶段交界方向输入: backlog
+  epic-4-retrospective: optional
+
+  # ---------- Epic 5: 故事档案与归档（含 RAG）----------
+  epic-5: backlog
+  5-1-归档核心表落地chapter_card-story_thread-story_state: backlog
+  5-2-写后投影-data-agent-chapter-commit单事务: backlog
+  5-3-归档页-故事档案统一入口设定圣经-分阶段: backlog
+  5-4-归档页-首屏收起-展开交互-章节归档详情: backlog
+  5-5-embedding表-EmbeddingProviderpgvector: backlog
+  5-6-RAG三级召回接回写前上下文: backlog
+  epic-5-retrospective: optional
+
+  # ---------- Epic 6: 通读与交付 ----------
+  epic-6: backlog
+  6-1-全本连续通读视图全新页面: backlog
+  6-2-AI辅助生成标识合规: backlog
+  epic-6-retrospective: optional

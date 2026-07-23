@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: muse-postgres
+    environment:
+      POSTGRES_USER: muse
+      POSTGRES_PASSWORD: muse
+      POSTGRES_DB: muse
+    ports:
+      - "5432:5432"
+    volumes:
+      - muse-pg-data:/var/lib/postgresql/data
+      - ./backend/docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U muse -d muse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: muse-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - muse-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  muse-pg-data:
+  muse-redis-data:
