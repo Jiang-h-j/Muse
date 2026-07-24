@@ -1,4 +1,4 @@
-"""注册测试共享 fixture：真实 DB 建表 + 每用例清表 + 邀请码种子。
+"""认证测试共享 fixture：真实 DB 建表 + 每用例清表 + 邀请码种子。
 
 DB 用例沿用 1.1 约定：需先 `docker compose up -d` 起容器并设 `MUSE_DB_READY=1`，否则 skip。
 测试用与应用相同 psycopg3 DSN 的**同步**引擎做建表/清表/断言查询——与应用的 async 引擎
@@ -6,22 +6,30 @@ DB 用例沿用 1.1 约定：需先 `docker compose up -d` 起容器并设 `MUSE
 """
 
 import os
-from collections.abc import Callable
-from datetime import datetime
-from functools import lru_cache
 
-import pytest
-from sqlalchemy import Engine, create_engine, select, text
-from sqlalchemy.orm import Session
+# 在 import muse 任何模块（会触发 get_settings 校验）之前注入测试专用强 JWT 密钥。
+# 保证测试不依赖某个特定 .env：无论本机 .env 的 DEBUG/JWT_SECRET 为何，测试都用确定配置，
+# 且不触发生产弱密钥 fail-fast（Story 1.3 护栏）。setdefault 不覆盖已显式设置的环境变量。
+os.environ.setdefault("JWT_SECRET", "test-only-strong-secret-do-not-use-in-prod")
+os.environ.setdefault("DEBUG", "true")
 
-from muse.core.settings import get_settings
-from muse.models import account  # noqa: F401  注册 metadata（供 create_all 建表）
-from muse.models.account import InviteCode, User
-from muse.models.base import Base
+from collections.abc import Callable  # noqa: E402
+from datetime import datetime  # noqa: E402
+from functools import lru_cache  # noqa: E402
+
+import pytest  # noqa: E402
+import redis  # noqa: E402
+from sqlalchemy import Engine, create_engine, select, text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from muse.core.settings import get_settings  # noqa: E402
+from muse.models import account  # noqa: F401, E402  注册 metadata（供 create_all 建表）
+from muse.models.account import InviteCode, User  # noqa: E402
+from muse.models.base import Base  # noqa: E402
 
 DB_READY = os.getenv("MUSE_DB_READY") == "1"
 requires_db = pytest.mark.skipif(
-    not DB_READY, reason="需起容器并设 MUSE_DB_READY=1 才跑注册 DB 用例"
+    not DB_READY, reason="需起容器并设 MUSE_DB_READY=1 才跑 DB 用例"
 )
 
 
@@ -33,13 +41,31 @@ def _sync_engine() -> Engine:
     return engine
 
 
+@lru_cache
+def _sync_redis() -> "redis.Redis":
+    """同步 Redis 客户端，仅用于测试清理限流计数（独立于应用的 async 单例，无事件循环耦合）。"""
+    return redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+
+
 @pytest.fixture(autouse=True)
 def _clean_tables() -> None:
-    """每个 DB 用例前清空账户表，保证用例间数据隔离。离线用例不碰 DB。"""
+    """每个 DB 用例前清空账户/会话表 + 限流计数，保证用例间隔离。离线用例不碰 DB/Redis。"""
     if not DB_READY:
         return
     with _sync_engine().begin() as conn:
-        conn.execute(text('TRUNCATE "user", invite_code RESTART IDENTITY CASCADE'))
+        # refresh_session 有 user_id FK 指向 user，CASCADE 一并清；
+        # RESTART IDENTITY 复位序列。
+        conn.execute(
+            text(
+                'TRUNCATE "user", invite_code, refresh_session '
+                "RESTART IDENTITY CASCADE"
+            )
+        )
+    # 清限流计数键，避免登录失败计数跨用例污染（限流用例天然隔离，无需手动 reset）。
+    client = _sync_redis()
+    keys = list(client.scan_iter(match="login:fail:*"))
+    if keys:
+        client.delete(*keys)
 
 
 @pytest.fixture
@@ -75,3 +101,26 @@ def get_user() -> Callable[[str], User | None]:
             return session.scalar(select(User).where(User.email == email))
 
     return _get
+
+
+@pytest.fixture
+def make_user() -> Callable[..., User]:
+    """种子已注册用户 helper：用真实 argon2 哈希落库，供登录用例用。
+
+    直接同步 hash（测试种子无需走应用的 anyio 线程池）；返回持久化后的 User（含 id/email）。
+    """
+    from argon2 import PasswordHasher
+
+    hasher = PasswordHasher()
+
+    def _make(email: str = "login@example.com", password: str = "password123") -> User:
+        with Session(_sync_engine()) as session:
+            user = User(email=email, password_hash=hasher.hash(password))
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            session.expunge(user)
+            return user
+
+    return _make
+

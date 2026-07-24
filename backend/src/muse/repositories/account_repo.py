@@ -18,6 +18,11 @@ async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
+    """按主键查用户；鉴权依赖用它从 access token 的 sub 还原当前 User（Story 1.3）。"""
+    return await session.get(User, user_id)
+
+
 async def create_user(session: AsyncSession, email: str, password_hash: str) -> User:
     """新建 user 并 flush（拿到应用侧生成的 UUID id）；是否提交由 service 决定。"""
     user = User(email=email, password_hash=password_hash)

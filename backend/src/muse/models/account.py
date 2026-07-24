@@ -41,3 +41,22 @@ class InviteCode(Base, UUIDPKMixin, TimestampMixin):
     used_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RefreshSession(Base, UUIDPKMixin, TimestampMixin):
+    """refresh token 会话；access 无状态不可撤销的短板由本表弥补（AC5 退出、AC2 失效判定）。
+
+    只存 refresh 明文的 SHA-256 十六进制哈希（token_hash），明文仅下发前端一次——泄库不可反推。
+    revoked_at NULL = 有效；退出/轮转时置为 now() 即作废。放账户域（本文件）而非新建模块，
+    复用 migrations/env.py 既有 `from muse.models import account` import，免踩空迁移陷阱。
+    """
+
+    __tablename__ = "refresh_session"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("user.id"), nullable=False, index=True
+    )
+    # refresh 是高熵随机串（无字典/暴力面），SHA-256 十六进制定长 64；唯一约束防撞。
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

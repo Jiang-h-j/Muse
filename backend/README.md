@@ -78,6 +78,41 @@ uv run python -m muse.scripts.seed_invite --code MY-CODE  # 指定码
 脚本会把码写入 `invite_code` 表并打印。随后用该码 + 邮箱 + ≥8 位密码调用注册接口即可。
 
 
+## 本地登录 / 刷新 / 退出（Story 1.3）
+
+双 token 会话：`access`（无状态短期 JWT，默认 15 分钟）+ `refresh`（长效可撤销，默认 30 天，
+服务端只存 SHA-256 哈希）。前端存两枚 token，受保护接口带 `Authorization: Bearer <access>`。
+
+```bash
+B=http://localhost:8000
+
+# 1. 登录：得双 token（先按上一节注册好账号）
+LOGIN=$(curl -s -X POST $B/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"your-password"}')
+ACCESS=$(echo "$LOGIN"  | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+REFRESH=$(echo "$LOGIN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["refreshToken"])')
+
+# 2. 访问受保护端点：带 access token
+curl -s $B/api/auth/me -H "Authorization: Bearer $ACCESS"        # → {"id":...,"email":...}
+
+# 3. 刷新：用 refresh 换新 access（会轮转下发新 refresh，旧 refresh 立即失效）
+curl -s -X POST $B/api/auth/refresh -H 'Content-Type: application/json' \
+  -d "{\"refreshToken\":\"$REFRESH\"}"
+
+# 4. 退出：作废当前 refresh 会话（幂等，返回 204）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $B/api/auth/logout \
+  -H 'Content-Type: application/json' -d "{\"refreshToken\":\"$REFRESH\"}"
+```
+
+错误响应统一 error envelope `{code, message, detail}`，`detail` 附对接原型的布尔位：
+密码/邮箱错误 `401 invalid_credentials`（`detail.invalid`）、refresh 失效 `401 token_invalid`
+（`detail.expired`）、失败超阈值 `429 too_many_attempts`（`detail.locked`，默认 5 次 / 15 分钟，
+限流走 Redis，不可用时 fail-open 放行）。
+
+> 生产护栏：`DEBUG=false` 时若 `JWT_SECRET` 仍为默认占位值会**拒绝启动**（fail-fast）。
+> 本地 `.env` 用 `DEBUG=true` 即可开箱即用；部署前务必换强随机 `JWT_SECRET`。
+
+
 ## 前端原型与 Vite 渐进增强（预留，本阶段不初始化）
 
 前端原型位于 `../prototype/app/{index.html, app.js, styles.css}`，是 **UX/契约的唯一事实基准**，

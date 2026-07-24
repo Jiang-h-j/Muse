@@ -1,19 +1,30 @@
-"""注册业务编排（AR2：业务在 service，不在 router）。
+"""认证业务编排（AR2：业务在 service，不在 router）。
 
-编排 register：校验邀请码 → 校验邮箱 → argon2 哈希 → 单事务内建 user + 原子消费邀请码。
-原子性与并发兜底见函数内注释（陷阱③④）。
+- register：校验邀请码 → 校验邮箱 → argon2 哈希 → 单事务内建 user + 原子消费邀请码。
+- login/refresh/logout（Story 1.3）：双 token 签发、refresh 轮转、退出作废，见各函数陷阱注释。
 """
 
 import logging
+import uuid
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from muse.core.errors import ErrorEnvelope
-from muse.core.security import hash_password
+from muse.core.security import (
+    DUMMY_PASSWORD_HASH,
+    create_access_token,
+    generate_refresh_token,
+    hash_password,
+    hash_refresh_token,
+    verify_password,
+)
+from muse.core.settings import get_settings
 from muse.models.account import InviteCode, User
-from muse.repositories import account_repo
+from muse.repositories import account_repo, session_repo
+from muse.services import rate_limit
 
 logger = logging.getLogger("muse")
 
@@ -105,3 +116,120 @@ async def register(session: AsyncSession, invite_code: str, email: str, password
 
     await session.commit()
     return user
+
+
+# ---------- Story 1.3：登录 / 刷新 / 退出 ----------
+
+
+class TokenBundle(NamedTuple):
+    """service 层的双 token 产出；router 据此组装 TokenResponse。"""
+
+    access_token: str
+    expires_in: int
+    refresh_token: str
+
+
+def _invalid_credentials() -> ErrorEnvelope:
+    # 邮箱不存在与密码错误**共用同一文案**（AC3），不泄露账号是否存在（陷阱③）。
+    # detail.invalid=true 兼容原型登录模式 invalid 分支（app.js:261）。
+    return ErrorEnvelope(
+        code="invalid_credentials",
+        message="邮箱或密码错误，请检查后重试。",
+        detail={"invalid": True},
+        http_status=401,
+    )
+
+
+def _too_many_attempts() -> ErrorEnvelope:
+    # 锁定态（AC4）：detail.locked=true 对接原型 locked 文案（app.js:264）。
+    return ErrorEnvelope(
+        code="too_many_attempts",
+        message="登录尝试次数过多，请稍后再试。",
+        detail={"locked": True},
+        http_status=429,
+    )
+
+
+def _token_invalid() -> ErrorEnvelope:
+    # refresh 失效（过期/被撤销/不存在，AC2）：前端据此跳 #/login?state=expired。
+    return ErrorEnvelope(
+        code="token_invalid",
+        message="会话已过期，请重新登录。",
+        detail={"expired": True},
+        http_status=401,
+    )
+
+
+async def _issue_tokens(session: AsyncSession, user_id: uuid.UUID) -> TokenBundle:
+    """签发 access（无状态 JWT）+ refresh（随机串，哈希落库），返回明文双 token。
+
+    refresh 明文只在此产出一次交给前端，库里只存其 SHA-256 哈希（泄库不可反推）。
+    """
+    settings = get_settings()
+    access_token, expires_in = create_access_token(user_id)
+    refresh_plain = generate_refresh_token()
+    await session_repo.create_refresh_session(
+        session,
+        user_id=user_id,
+        token_hash=hash_refresh_token(refresh_plain),
+        ttl_seconds=settings.refresh_token_ttl_seconds,
+    )
+    return TokenBundle(access_token, expires_in, refresh_plain)
+
+
+async def login(session: AsyncSession, email: str, password: str) -> TokenBundle:
+    """登录编排（AC1/AC3/AC4）。成功返回双 token；失败抛语义化 ErrorEnvelope。
+
+    顺序严格：① 锁定早拒（陷阱⑥，不进 argon2）→ ② 查 user；不存在也跑一次等时 verify
+    消除时序侧信道（陷阱③）→ ③ 校验失败则记失败计数 + 抛 invalid_credentials
+    → ④ 成功则清零计数 + 签发双 token。
+    """
+    # ① 锁定判定在密码校验之前（陷阱⑥）：锁定态直接拒绝，省 argon2 开销且不泄露账号存在性。
+    if await rate_limit.is_locked(email):
+        raise _too_many_attempts()
+
+    # ② 查 user。不存在时对固定假 hash 跑一次 verify，使「不存在」与「密码错」耗时相近（陷阱③）。
+    user = await account_repo.get_user_by_email(session, email)
+    password_hash = user.password_hash if user is not None else DUMMY_PASSWORD_HASH
+    password_ok = await verify_password(password_hash, password)
+
+    # ③ user 不存在或密码错：共用同一失败路径（措辞/耗时一致，不泄露账号是否存在）。
+    if user is None or not password_ok:
+        await rate_limit.check_and_incr_login_failure(email)
+        raise _invalid_credentials()
+
+    # ④ 成功：清零失败计数 + 签发双 token 并提交（refresh 会话落库）。
+    await rate_limit.reset_login_failures(email)
+    bundle = await _issue_tokens(session, user.id)
+    await session.commit()
+    return bundle
+
+
+async def refresh(session: AsyncSession, refresh_token: str) -> TokenBundle:
+    """刷新编排（AC2）：校验 refresh 有效后签发新 access，并轮转 refresh（陷阱④防重放）。
+
+    旧 refresh 一经使用即作废、下发全新 refresh。重放的旧 refresh 查 active 落空即 token_invalid。
+    """
+    token_hash = hash_refresh_token(refresh_token)
+    active = await session_repo.get_active_by_token_hash(session, token_hash)
+    if active is None:
+        raise _token_invalid()
+
+    settings = get_settings()
+    access_token, expires_in = create_access_token(active.user_id)
+    new_refresh_plain = generate_refresh_token()
+    await session_repo.revoke_and_replace(
+        session,
+        old_token_hash=token_hash,
+        user_id=active.user_id,
+        new_token_hash=hash_refresh_token(new_refresh_plain),
+        ttl_seconds=settings.refresh_token_ttl_seconds,
+    )
+    await session.commit()
+    return TokenBundle(access_token, expires_in, new_refresh_plain)
+
+
+async def logout(session: AsyncSession, refresh_token: str) -> None:
+    """退出编排（AC5）：作废对应 refresh 会话。幂等（陷阱⑦）——已撤销/不存在也视为成功。"""
+    await session_repo.revoke_by_token_hash(session, hash_refresh_token(refresh_token))
+    await session.commit()

@@ -13,3 +13,12 @@
 ## Deferred from: code review of 1-2-用户注册邀请码 (2026-07-24)
 
 - 邮箱枚举 + 时序侧信道 [backend/src/muse/services/auth_service.py:61-65] — 用户裁决 2026-07-24 接受为已知取舍，内测阶段不修（攻击前提是持有有效邀请码，内测期可控）。**开放注册前须重新评估**：统一错误措辞 + 已存在分支走等时哈希消除时序差 + 接口限流。
+
+## Deferred from: code review of 1-3-用户登录与JWT双token会话 (2026-07-24)
+
+- refresh 轮转并发下可「一换二」[backend/src/muse/repositories/session_repo.py:77] — revoke_and_replace 未校验 revoke rowcount 且 get_active 无行锁，两个并发 /refresh 携同一旧 refresh 可各自换出一枚新 refresh。spec 陷阱④明确 V1 仅需「旧作废+发新」，顺序重放已被测试覆盖。**开放注册前增强**：检测重放（revoke 命中 0 行）即作废该用户全部 session。
+- refresh_session 表无界增长、无清理任务 [backend/src/muse/models/account.py] — 每次登录/刷新 INSERT 新行，撤销/过期行永不清理，单用户会话无限累积。需 cron/定时清理基础设施，跨 story，内测期不紧迫。
+- 全局 async Redis 客户端从不关闭、绑定首个事件循环 [backend/src/muse/services/rate_limit.py:29-34] — 惰性单例无 shutdown/lifespan 清理。生产 uvicorn 单事件循环不触发，测试已用 module-scoped client 规避；随应用 lifespan 管理统一完善。
+- refresh 签发新 access 不校验用户是否仍存在/有效 [backend/src/muse/services/auth_service.py:208] — 与 get_current_user 不一致；已停用/注销但持有效 refresh 的用户仍能刷出 access。V1 无用户停用功能，get_current_user 已 401 兜底。用户停用功能落地时一并处理。
+- 登录限流仅邮箱维度、无 IP：账号锁定型 DoS + 无分布式撞库防护 [backend/src/muse/services/rate_limit.py:37] — 对已知邮箱狂发错误密码可锁死该账号 15 分钟。AC4 明确按归一化邮箱限流；IP 维度 + 撞库防护与邮箱枚举同属「开放注册前」加固项。
+- /refresh 与 /logout 无接口级限流 [backend/src/muse/routers/auth.py] — 可用随机 token 反复轰炸 /refresh（每次 SHA-256+DB 查询）。内测期无 argon2 开销、影响可控；接口限流随开放注册前加固统一处理。

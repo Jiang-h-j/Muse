@@ -13,6 +13,7 @@ dependencies = [
     "psycopg[binary]",
     "pydantic-settings",
     "pyjwt[crypto]",
+    "redis>=8.0.1",
     "sqlalchemy>=2.0",
 ]
 

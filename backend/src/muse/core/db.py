@@ -17,7 +17,7 @@ from muse.core.settings import get_settings
 
 def _create_engine() -> AsyncEngine:
     settings = get_settings()
-    return create_async_engine(settings.database_url, echo=settings.debug, pool_pre_ping=True)
+    return create_async_engine(settings.database_url, echo=settings.db_echo, pool_pre_ping=True)
 
 
 engine: AsyncEngine = _create_engine()
