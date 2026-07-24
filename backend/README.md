@@ -65,6 +65,19 @@ uv run mypy            # 类型
 uv run pytest          # 测试
 ```
 
+## 生成邀请码（本地测试注册）
+
+注册（`POST /api/auth/register`）需要一个有效未使用的邀请码。用内置脚本生成：
+
+```bash
+uv run python -m muse.scripts.seed_invite            # 生成 1 个随机码
+uv run python -m muse.scripts.seed_invite --count 3  # 生成 3 个
+uv run python -m muse.scripts.seed_invite --code MY-CODE  # 指定码
+```
+
+脚本会把码写入 `invite_code` 表并打印。随后用该码 + 邮箱 + ≥8 位密码调用注册接口即可。
+
+
 ## 前端原型与 Vite 渐进增强（预留，本阶段不初始化）
 
 前端原型位于 `../prototype/app/{index.html, app.js, styles.css}`，是 **UX/契约的唯一事实基准**，

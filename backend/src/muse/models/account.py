@@ -1,0 +1,43 @@
+"""账户域 ORM 模型：User（多租户根）与 InviteCode（邀请码）。
+
+User 是全项目租户根（NFR3）：后续 project / byok_key / usage_ledger 等业务表
+均带 user_id FK 指向本表，实现行级隔离。本 story 只建 user + invite_code，
+字段保持精简够用，勿提前塞后续 story 的字段。
+"""
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from muse.models.base import Base, TimestampMixin, UUIDPKMixin
+
+
+class User(Base, UUIDPKMixin, TimestampMixin):
+    """用户账号；多租户根。
+
+    email 加唯一约束——并发重复注册由 DB 层兜底（先查后插存在 TOCTOU 竞态）。
+    密码只存 argon2 哈希，绝不明文。
+    """
+
+    __tablename__ = "user"
+
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class InviteCode(Base, UUIDPKMixin, TimestampMixin):
+    """邀请码；早期创作者注册凭证。
+
+    使用状态由 used_at / used_by 表达（NULL = 未使用），不设冗余 is_used 布尔，
+    避免布尔位与时间/使用者字段不一致。expires_at 可空表示永不过期。
+    """
+
+    __tablename__ = "invite_code"
+
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # 记录使用者与使用时间；二者 NULL 即未使用（消费时单事务条件更新，见 auth_service）。
+    used_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
