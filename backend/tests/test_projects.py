@@ -197,3 +197,199 @@ def test_list_projects_empty_returns_empty_array(
     resp = _client.get("/api/projects", headers=auth_headers(user))
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+# ========== Story 1.5：作品重命名与删除 ==========
+
+# ---------- 离线：鉴权前置（无 token 不需 DB） ----------
+
+
+def test_rename_project_without_token_401() -> None:
+    # 未登录改名 → 401 token_invalid（CurrentUser 依赖先于业务挡下，鉴权前置）。
+    resp = _client.patch(f"/api/projects/{uuid.uuid4()}", json={"title": "新名"})
+    assert resp.status_code == 401
+    body = resp.json()
+    assert set(body.keys()) == {"code", "message", "detail"}
+    assert body["code"] == "token_invalid"
+
+
+def test_delete_project_without_token_401() -> None:
+    resp = _client.delete(f"/api/projects/{uuid.uuid4()}")
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "token_invalid"
+
+
+# ---------- DB 端到端：AC1 改名真实持久化 + updatedAt 刷新 ----------
+
+
+@requires_db
+def test_rename_project_persists_and_refreshes_updated_at(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    user = make_user("rename@example.com")
+    headers = auth_headers(user)
+    created = _client.post(
+        "/api/projects", json={"mode": "guided", "title": "旧名"}, headers=headers
+    ).json()
+    time.sleep(0.01)  # 拉开时间戳，验证 updated_at 确被刷新（陷阱②：漏 refresh 则时间不变）
+
+    resp = _client.patch(
+        f"/api/projects/{created['id']}", json={"title": "新名"}, headers=headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) == {"id", "title", "mode", "phase", "updatedAt"}
+    assert body["id"] == created["id"]
+    assert body["title"] == "新名"
+    # 陷阱②：commit 后须 session.refresh 拉回 DB 计算的 updated_at，否则仍是旧值。
+    assert body["updatedAt"] != created["updatedAt"]
+
+    # 真实持久化：再查列表读到的是新名（非原型仅改 DOM）。
+    listed = _client.get("/api/projects", headers=headers).json()
+    assert listed[0]["title"] == "新名"
+
+
+@requires_db
+@pytest.mark.parametrize("new_title", [None, "", "   "])
+def test_rename_project_untitled_fallback(
+    new_title: str | None,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    # 改名留空/纯空白/缺省 → 回落「未命名小说」（复用 _normalize_title，AC1；陷阱③非 422）。
+    user = make_user(f"rename-untitled-{new_title!r}@example.com")
+    headers = auth_headers(user)
+    created = _client.post(
+        "/api/projects", json={"mode": "guided", "title": "有名字"}, headers=headers
+    ).json()
+    payload = {} if new_title is None else {"title": new_title}
+    resp = _client.patch(f"/api/projects/{created['id']}", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "未命名小说"
+
+
+# ---------- DB 端到端：AC2 删除真实生效 ----------
+
+
+@requires_db
+def test_delete_project_removes_from_list(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    user = make_user("delete@example.com")
+    headers = auth_headers(user)
+    created = _client.post(
+        "/api/projects", json={"mode": "guided", "title": "待删除"}, headers=headers
+    ).json()
+
+    resp = _client.delete(f"/api/projects/{created['id']}", headers=headers)
+    assert resp.status_code == 204
+    assert resp.content == b""  # 204 No Content 无响应体（陷阱⑤）
+
+    # 真实删除（非原型 row.remove() 刷新即恢复）：列表已移除该行。
+    listed = _client.get("/api/projects", headers=headers).json()
+    assert listed == []
+
+
+# ---------- DB 端到端：AC4 租户隔离 + 不泄露存在性（越权=不存在=同 404，陷阱①）----------
+
+
+@requires_db
+def test_rename_others_project_returns_404_and_leaves_untouched(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    # A 建作品，B 改 A 的 → 404 project_not_found（与"不存在"同码，不泄露存在性，不返回 403）。
+    alice = make_user("rename-owner-a@example.com")
+    bob = make_user("rename-owner-b@example.com")
+    created = _client.post(
+        "/api/projects", json={"mode": "guided", "title": "A的作品"}, headers=auth_headers(alice)
+    ).json()
+
+    resp = _client.patch(
+        f"/api/projects/{created['id']}", json={"title": "B篡改"}, headers=auth_headers(bob)
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert set(body.keys()) == {"code", "message", "detail"}  # AR5 envelope 三要素
+    assert body["code"] == "project_not_found"
+
+    # 越权未生效：A 的作品名分毫未动。
+    alice_list = _client.get("/api/projects", headers=auth_headers(alice)).json()
+    assert alice_list[0]["title"] == "A的作品"
+
+
+@requires_db
+def test_delete_others_project_returns_404_and_leaves_untouched(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    alice = make_user("delete-owner-a@example.com")
+    bob = make_user("delete-owner-b@example.com")
+    created = _client.post(
+        "/api/projects", json={"mode": "guided", "title": "A的作品"}, headers=auth_headers(alice)
+    ).json()
+
+    resp = _client.delete(f"/api/projects/{created['id']}", headers=auth_headers(bob))
+    assert resp.status_code == 404
+    body = resp.json()
+    assert set(body.keys()) == {"code", "message", "detail"}  # AR5 envelope 三要素
+    assert body["code"] == "project_not_found"
+
+    # 越权未生效：A 的作品仍在。
+    alice_list = _client.get("/api/projects", headers=auth_headers(alice)).json()
+    assert len(alice_list) == 1
+    assert alice_list[0]["id"] == created["id"]
+
+
+@requires_db
+def test_rename_nonexistent_project_returns_404(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    # 随机 UUID（压根不存在）→ 与"越权"完全相同的 404 project_not_found（验证不泄露存在性）。
+    user = make_user("rename-404@example.com")
+    resp = _client.patch(
+        f"/api/projects/{uuid.uuid4()}", json={"title": "x"}, headers=auth_headers(user)
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert set(body.keys()) == {"code", "message", "detail"}  # AR5 envelope 三要素
+    assert body["code"] == "project_not_found"
+
+
+@requires_db
+def test_delete_nonexistent_project_returns_404(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    user = make_user("delete-404@example.com")
+    resp = _client.delete(f"/api/projects/{uuid.uuid4()}", headers=auth_headers(user))
+    assert resp.status_code == 404
+    body = resp.json()
+    assert set(body.keys()) == {"code", "message", "detail"}  # AR5 envelope 三要素
+    assert body["code"] == "project_not_found"
+
+
+# ---------- DB 端到端：非法路径参数 UUID 解析 ----------
+
+
+@requires_db
+def test_rename_project_invalid_uuid_422(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    # 非法 UUID 路径参数 → 422（FastAPI 类型解析）。需真实身份：本库鉴权先于参数校验
+    # （同 test_create_project_invalid_mode_422），故走 DB 门禁而非离线。
+    user = make_user("bad-uuid@example.com")
+    resp = _client.patch(
+        "/api/projects/not-a-uuid", json={"title": "x"}, headers=auth_headers(user)
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "validation_error"
+
+
+@requires_db
+def test_delete_project_invalid_uuid_422(
+    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+) -> None:
+    # 非法 UUID 路径参数 → 422（FastAPI 类型解析）；与 PATCH 版对齐，守护 DELETE 路由的
+    # project_id: uuid.UUID 解析。需真实身份：本库鉴权先于参数校验，故走 DB 门禁。
+    user = make_user("bad-uuid-del@example.com")
+    resp = _client.delete("/api/projects/not-a-uuid", headers=auth_headers(user))
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "validation_error"

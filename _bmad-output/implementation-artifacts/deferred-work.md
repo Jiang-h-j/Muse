@@ -28,3 +28,7 @@
 - `GET /api/projects` 无分页/无上限，返回用户全部作品 [backend/src/muse/repositories/project_repo.py] — 单用户作品达数千条时无界查询 + 超大响应体；且索引仅 `user_id`，缺 `(user_id, updated_at)` 复合索引使排序需额外 sort。原型未设计分页 UI、V1 内测作品数少，分页涉及前端契约 + 产品决策，跨 story 处理。
 - `project.user_id` FK 未声明 `ON DELETE` 行为 [backend/migrations/versions/b56755f75420_create_project.py] — 默认 NO ACTION/RESTRICT，删除仍有作品的用户会 FK 约束失败；用户数据生命周期（级联/软删/归档）未定义。V1 无删除用户入口触发不到，与 1.3 deferred「用户停用功能落地时处理」一并。（注：conftest `TRUNCATE ... CASCADE` 能清干净靠 TRUNCATE 级联，与 FK ondelete 无关。）
 - `_clean_tables`（autouse）在 `MUSE_DB_READY=1` 时无条件访问 Redis [backend/tests/conftest.py] — `_sync_redis().scan_iter("login:fail:*")` 无 Redis 就绪门禁，Redis 宕机（DB 正常）则全部 DB 用例 setup 阶段 error；且 project 用例根本不碰限流。属 Story 1.3 引入的限流测试基建（非 1.4 增量），建议补 Redis 就绪门禁或 try 兜底。
+
+## Deferred from: code review of 1-5-作品重命名与删除 (2026-07-24)
+
+- 并发改名/删除的 check-then-act TOCTOU：非原子，commit/UPDATE 命中 0 行抛 `StaleDataError` 退化 500 而非幂等 404 [backend/src/muse/services/project_service.py:rename_project/delete_project] — 两个并发请求各自 `get_owned_project` 查到同一行后先后 commit，第二个命中 0 行。单用户作品库极低概率触发；根治需 commit 处 try/except StaleDataError → rollback → 转 404，或加行锁/乐观版本。与 1.3/1.4 并发类 deferred 同属「开放注册/多端并发前」加固项。

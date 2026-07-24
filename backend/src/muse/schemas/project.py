@@ -28,6 +28,17 @@ class ProjectCreateRequest(CamelModel):
     title: str | None = Field(default=None, max_length=_TITLE_MAX_LENGTH)
 
 
+class ProjectRenameRequest(CamelModel):
+    """改名入参（Story 1.5 AC1）。
+
+    与 ProjectCreateRequest.title 同规则（陷阱③）：title 可留空/纯空白提交，service
+    strip 后回落「未命名小说」（原型 app.js:1849-1850）。**不设 min_length**——设了会
+    422 拒绝合法的留空提交；仍设 max_length 防超列宽输入。
+    """
+
+    title: str | None = Field(default=None, max_length=_TITLE_MAX_LENGTH)
+
+
 class ProjectResponse(CamelModel):
     """作品响应：列表/创建共用的安全视图（AC1/AC2）。
 

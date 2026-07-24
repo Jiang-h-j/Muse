@@ -39,3 +39,25 @@ async def list_projects_by_user(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def get_owned_project(
+    session: AsyncSession, project_id: uuid.UUID, user_id: uuid.UUID
+) -> Project | None:
+    """按 id + user_id 一步取本人作品（Story 1.5 改名/删除的通用前置，NFR3）。
+
+    id 与 user_id **写在同一个 where 里一次过滤**是关键（陷阱①）：取不到就返回 None，
+    「作品不存在」与「作品不属于我」二义合一——调用方（service）统一转同一个 404，
+    攻击者无法据响应差异区分 project_id 是否真实存在（消除 IDOR 侦察面）。
+    不要先按 id 查再比对 owner，那样代码里会出现「存在但不属于你」分支，易手滑返回 403。
+    """
+    stmt = select(Project).where(
+        Project.id == project_id, Project.user_id == user_id
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def delete_project(session: AsyncSession, project: Project) -> None:
+    """删除给定 Project（只 delete、不 commit）；事务边界归 service，延续 repo 只 flush 约定。"""
+    await session.delete(project)
