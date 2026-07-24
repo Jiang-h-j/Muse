@@ -23,7 +23,10 @@ from sqlalchemy import Engine, create_engine, select, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from muse.core.settings import get_settings  # noqa: E402
-from muse.models import account  # noqa: F401, E402  注册 metadata（供 create_all 建表）
+from muse.models import (
+    account,  # noqa: F401, E402  注册 metadata（供 create_all 建表）
+    project,  # noqa: F401, E402  注册 metadata（供 create_all 建表）
+)
 from muse.models.account import InviteCode, User  # noqa: E402
 from muse.models.base import Base  # noqa: E402
 
@@ -53,11 +56,11 @@ def _clean_tables() -> None:
     if not DB_READY:
         return
     with _sync_engine().begin() as conn:
-        # refresh_session 有 user_id FK 指向 user，CASCADE 一并清；
+        # refresh_session/project 均有 user_id FK 指向 user，CASCADE 一并清；
         # RESTART IDENTITY 复位序列。
         conn.execute(
             text(
-                'TRUNCATE "user", invite_code, refresh_session '
+                'TRUNCATE "user", invite_code, refresh_session, project '
                 "RESTART IDENTITY CASCADE"
             )
         )
@@ -123,4 +126,20 @@ def make_user() -> Callable[..., User]:
             return user
 
     return _make
+
+
+@pytest.fixture
+def auth_headers() -> Callable[[User], dict[str, str]]:
+    """为给定 User 直接签发 access token 并组装 Authorization 头。
+
+    项目里 project 用例只需「已登录身份」，无需每次都走 /login（省一次 argon2 + refresh 落库）。
+    直接复用应用的 create_access_token，与 get_current_user 解出的身份严格一致。
+    """
+    from muse.core.security import create_access_token
+
+    def _headers(user: User) -> dict[str, str]:
+        token, _ = create_access_token(user.id)
+        return {"Authorization": f"Bearer {token}"}
+
+    return _headers
 

@@ -56,7 +56,7 @@ development_status:
   1-1-后端工程基座与本地开发环境: done
   1-2-用户注册邀请码: done
   1-3-用户登录与JWT双token会话: done
-  1-4-作品创建与列表持久化空-失败状态: backlog
+  1-4-作品创建与列表持久化空-失败状态: done
   1-5-作品重命名与删除: backlog
   1-6-继续创作-按phase跳转当前步骤: backlog
   1-7-BYOKAPIKey绑定全新设置页: backlog

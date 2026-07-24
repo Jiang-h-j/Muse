@@ -10,7 +10,10 @@ from muse.core.settings import get_settings
 
 # 导入所有 ORM 模型，确保它们注册到 Base.metadata，供 autogenerate 检测。
 # 每建一张业务表就在此登记其模块（漏 import 会导致 autogenerate「看不见」新表却不报错）。
-from muse.models import account  # noqa: F401  仅为注册 metadata 的副作用导入
+from muse.models import (
+    account,  # noqa: F401  仅为注册 metadata 的副作用导入
+    project,  # noqa: F401  仅为注册 metadata 的副作用导入
+)
 from muse.models.base import Base
 
 # this is the Alembic Config object, which provides
