@@ -211,7 +211,7 @@ const projects = [
     id: "mist-harbor",
     title: "雾港回声",
     mode: "引导探索",
-    phase: "章节创作",
+    phase: "chapter",
     attention: "等待你",
     detail: "第 3 章草稿等待阅读",
     updated: "今天 16:40",
@@ -221,7 +221,7 @@ const projects = [
     id: "stardust-postman",
     title: "星尘邮差",
     mode: "自由探索",
-    phase: "章节创作",
+    phase: "archive",
     attention: "等待你",
     detail: "第 2 章草稿等待阅读",
     updated: "昨天 21:08",
@@ -231,13 +231,32 @@ const projects = [
     id: "nameless",
     title: "未命名小说",
     mode: "引导探索",
-    phase: "故事设定",
+    phase: "explore",
     attention: "可以继续",
     detail: "继续回答关于主角的问题",
     updated: "7 月 12 日",
     action: "继续设定",
   },
 ];
+
+// phase → 展示文案 + 继续路由的单一数据源（键须与后端英文枚举逐字一致）
+const PHASE_META = {
+  explore: {
+    label: "故事设定",
+    continueLabel: "继续设定",
+    route: (id) => `#/projects/${id}/explore`,
+  },
+  chapter: {
+    label: "章节创作",
+    continueLabel: "阅读草稿",
+    route: (id) => `#/projects/${id}/chapters/1`,
+  },
+  archive: {
+    label: "已归档",
+    continueLabel: "回到归档",
+    route: (id) => `#/projects/${id}/archive`,
+  },
+};
 
 function hashPath() {
   return location.hash.split("?")[0] || "#/login";
@@ -323,17 +342,18 @@ function renderAuth() {
 
 function projectRow(project, index) {
   const number = String(index + 1).padStart(2, "0");
+  const meta = PHASE_META[project.phase];
   return `
     <li class="project-row" data-project-id="${project.id}">
       <a class="project-archive-link" href="#/projects/${project.id}/archive" aria-label="查看《${project.title}》的章节归档"></a>
       <span class="project-number">${number}</span>
       <div class="project-copy">
         <div class="project-title-line"><h2>${project.title}</h2><span class="project-mode">${project.mode}</span></div>
-        <div class="project-status"><span>${project.phase}</span><i></i><strong>${project.attention}</strong></div>
+        <div class="project-status"><span>${meta?.label ?? project.phase}</span><i></i><strong>${project.attention}</strong></div>
         <p>${project.detail}</p>
       </div>
       <time>${project.updated}</time>
-      <button class="project-primary" data-continue="${project.id}">${project.action}<span>→</span></button>
+      <button class="project-primary" data-continue="${project.id}">${meta?.continueLabel ?? "继续"}<span>→</span></button>
       <div class="project-menu-wrap">
         <button class="project-menu-button" aria-label="${project.title}的更多操作" aria-expanded="false" data-menu="${project.id}">•••</button>
         <div class="project-menu" hidden><button data-rename="${project.id}">重命名</button><button data-delete="${project.id}">删除</button></div>
@@ -1834,9 +1854,12 @@ function bindProjectInteractions() {
   );
   document.querySelectorAll("[data-continue]").forEach((button) =>
     button.addEventListener("click", () => {
-      if (button.dataset.continue === "nameless")
-        location.hash = "#/projects/demo/explore";
-      else button.textContent = "目标页面待设计";
+      // continue = 回到已有作品断点，按 phase 路由，不重置任何状态
+      const project = projects.find(
+        (item) => item.id === button.dataset.continue,
+      );
+      const meta = project && PHASE_META[project.phase];
+      if (meta) location.hash = meta.route(project.id);
     }),
   );
   document.querySelector("[data-reload]")?.addEventListener("click", () => {
@@ -2292,15 +2315,18 @@ function bindStyleAnchorInteractions() {
 
 function render() {
   document.body.classList.remove("dialog-open");
-  const chapterMatch = hashPath().match(/^#\/projects\/demo\/chapters\/(\d+)$/);
+  const exploreMatch = hashPath().match(/^#\/projects\/([^/]+)\/explore$/);
+  const chapterMatch = hashPath().match(
+    /^#\/projects\/([^/]+)\/chapters\/(\d+)$/,
+  );
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
   if (hashPath() === "#/projects") renderProjects();
-  else if (hashPath() === "#/projects/demo/explore") renderExploration();
   else if (hashPath() === "#/projects/demo/style-anchor") renderStyleAnchor();
   else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
   else if (hashPath() === "#/settings/model-access") renderByok();
   else if (hashPath() === "#/projects/demo/stage-direction")
     renderStageDirection();
+  else if (exploreMatch) renderExploration();
   else if (archiveMatch) {
     const archiveProject = projects.find(
       (project) => project.id === archiveMatch[1],
@@ -2308,7 +2334,7 @@ function render() {
     if (archiveProject) explorationTitle = archiveProject.title;
     renderChapterArchive();
   } else if (chapterMatch) {
-    chapterCreationIndex = Math.max(0, Number(chapterMatch[1]) - 1);
+    chapterCreationIndex = Math.max(0, Number(chapterMatch[2]) - 1);
     renderChapterCreation();
   } else renderAuth();
 }

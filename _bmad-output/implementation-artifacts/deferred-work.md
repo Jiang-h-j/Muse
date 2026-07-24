@@ -32,3 +32,7 @@
 ## Deferred from: code review of 1-5-作品重命名与删除 (2026-07-24)
 
 - 并发改名/删除的 check-then-act TOCTOU：非原子，commit/UPDATE 命中 0 行抛 `StaleDataError` 退化 500 而非幂等 404 [backend/src/muse/services/project_service.py:rename_project/delete_project] — 两个并发请求各自 `get_owned_project` 查到同一行后先后 commit，第二个命中 0 行。单用户作品库极低概率触发；根治需 commit 处 try/except StaleDataError → rollback → 转 404，或加行锁/乐观版本。与 1.3/1.4 并发类 deferred 同属「开放注册/多端并发前」加固项。
+
+## Deferred from: code review of 1-6-继续创作-按phase跳转当前步骤 (2026-07-24)
+
+- explore/chapter 目标页未消费路由 id [prototype/app/app.js:2328,2335] — `render()` 的 `exploreMatch`/`chapterMatch` 已捕获 id，但 `renderExploration`/`renderChapterCreation` 函数体不读 id：页面标题依赖全局 `explorationTitle`（首次进入显示默认「未命名小说」而非项目名）、内部返回链硬编码 `#/projects/demo/explore`、chapter route 恒跳 `/chapters/1` 占位（无真实「读到第几章」数据源）。spec AC2 明确「只保证路由正确、不改目标页函数体」，陷阱④/⑤已授权占位并划归 Epic 2（探索）/ Epic 4（章节）无缝接管——届时在对应 render 函数内用路由 id 取真实数据即可闭合。
