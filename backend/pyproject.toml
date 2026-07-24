@@ -5,14 +5,14 @@ description = "Muse 后端：FastAPI 分层骨架、多租户、AI 编排底座"
 requires-python = ">=3.12"
 dependencies = [
     "alembic",
+    "argon2-cffi",
     "fastapi[standard]",
     "greenlet>=3.5.4",
     "openai",
-    "passlib[bcrypt]",
     "pgvector",
     "psycopg[binary]",
     "pydantic-settings",
-    "python-jose[cryptography]",
+    "pyjwt[crypto]",
     "sqlalchemy>=2.0",
 ]
 

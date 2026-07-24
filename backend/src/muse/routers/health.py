@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from muse.core.db import get_session
@@ -15,10 +15,17 @@ router = APIRouter(tags=["health"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health(session: SessionDep) -> HealthResponse:
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": HealthResponse}},
+)
+async def health(session: SessionDep, response: Response) -> HealthResponse:
+    # DB 连通=200(ok)，不通=503(degraded)：探针按状态码判活，避免 DB 已宕的实例被判健康继续导流。
     db_ok = await check_db_connected(session)
-    return HealthResponse(status="ok", db_connected=db_ok)
+    if not db_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return HealthResponse(status="ok" if db_ok else "degraded", db_connected=db_ok)
 
 
 @router.get("/health/error-probe")

@@ -18,7 +18,8 @@ config = context.config
 
 # DSN 收敛到单一事实源：从 core.settings 注入（postgresql+psycopg://，psycopg3 async），
 # 覆盖 alembic.ini 的占位值，避免连接串两处维护、且确保用 psycopg 而非 asyncpg。
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# 转义 % → %%：alembic 底层 ConfigParser 用 BasicInterpolation，密码含 % 时会被误当插值语法。
+config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
