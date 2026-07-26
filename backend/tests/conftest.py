@@ -59,12 +59,12 @@ def _clean_tables() -> None:
     if not DB_READY:
         return
     with _sync_engine().begin() as conn:
-        # refresh_session/project/byok_key 均有 user_id FK 指向 user，CASCADE 一并清；
-        # RESTART IDENTITY 复位序列。
+        # refresh_session/project/byok_key/usage_ledger 均有 user_id FK 指向 user，
+        # CASCADE 一并清；RESTART IDENTITY 复位序列。
         conn.execute(
             text(
-                'TRUNCATE "user", invite_code, refresh_session, project, byok_key '
-                "RESTART IDENTITY CASCADE"
+                'TRUNCATE "user", invite_code, refresh_session, project, byok_key, '
+                "usage_ledger RESTART IDENTITY CASCADE"
             )
         )
     # 清限流计数键，避免登录失败计数跨用例污染（限流用例天然隔离，无需手动 reset）。

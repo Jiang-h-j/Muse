@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     # 约定存 base64(32 字节随机串)；生产 fail-fast 见 _fail_fast_on_weak_byok_master_key。
     byok_master_key: str = _DEFAULT_BYOK_MASTER_KEY
 
+    # 托管免费额度护栏阈值（Story 1.8，AR6/AR14）：托管路径累计用量触顶即拦。
+    # **护栏计量单位 = tokens 而非「章」**（dev 定档，story Dev Notes 推荐 A）：usage_ledger 一次
+    # LLM 调用记一行、一章要 5–10 次调用，COUNT(*) 数的是调用不是章，拿它当章数会 5–10 倍虚高触顶；
+    # SUM(total_tokens) 与「一次调用一行」的记账粒度天然对齐、无换算歧义。展示层「N/M 章」由前端接线
+    # 切片折算或改文案（本 story 不改 app.js）。
+    # **占位默认值**：粗略对齐原型「5 章免费」（app.js:2081，假设占位单章 ~40k tokens），
+    # 真实数值待 Epic 4 盲测出单章真实 token 成本后定档（architecture.md:200/531）。业务配置非安全
+    # 密钥，占位默认值可直接用于生产，故**不加 fail-fast**（与 JWT/BYOK 主密钥相反）。
+    free_quota_tokens: int = Field(default=200_000, gt=0)
+
     @model_validator(mode="after")
     def _fail_fast_on_weak_secret(self) -> "Settings":
         """生产环境弱 JWT 密钥拒绝启动（deferred-work.md L5，AC6）。

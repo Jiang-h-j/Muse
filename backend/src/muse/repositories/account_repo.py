@@ -5,12 +5,13 @@
 """
 
 import uuid
+from decimal import Decimal
 from typing import cast
 
 from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from muse.models.account import ByokKey, InviteCode, User
+from muse.models.account import ByokKey, InviteCode, UsageLedger, User
 
 
 async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
@@ -112,3 +113,63 @@ async def delete_byok(session: AsyncSession, user_id: uuid.UUID) -> int:
     stmt = delete(ByokKey).where(ByokKey.user_id == user_id)
     result = cast("CursorResult[object]", await session.execute(stmt))
     return result.rowcount
+
+
+# ---------- 用量流水（Story 1.8）：账户级 tokens/成本记账与聚合 ----------
+# 用量属账户域，DAO 扩展本 repo（与 BYOK 同款决策，勿新建 usage_repo.py）。所有查询显式
+# 绑定 user_id 租户守卫（NFR3，陷阱⑦）：查他人用量一律等同「自己 0 用量」，不泄露他人用量。
+# repo 只 add/flush/查询，**不 commit**——事务边界归 usage_service（account_repo 铁律）。
+
+
+async def record_usage(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    billing_path: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    cost: Decimal,
+    project_id: uuid.UUID | None = None,
+    model_name: str | None = None,
+) -> UsageLedger:
+    """插入一行用量流水（AC1，供 Epic 2 Provider 层调用完 LLM 后记账的写入接口）。
+
+    只 add + flush（拿到应用侧生成的 UUID id），**不 commit**——是否提交由 usage_service 决定
+    （repo 只 flush 的事务边界铁律）。billing_path 由调用方按「本次调用是否走 BYOK」传入
+    hosted/byok（陷阱⑧）——本 story 只存该列，判定归 Epic 2 Provider 层。
+    """
+    usage = UsageLedger(
+        user_id=user_id,
+        project_id=project_id,
+        billing_path=billing_path,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cost=cost,
+        model_name=model_name,
+    )
+    session.add(usage)
+    await session.flush()
+    return usage
+
+
+async def sum_hosted_usage(session: AsyncSession, user_id: uuid.UUID) -> int:
+    """聚合本人 **托管路径（billing_path="hosted"）** 的已用 tokens（AC2/AC3）。
+
+    护栏与展示都基于 hosted 累计——BYOK 行不占免费额度（NFR5/AC4），故只累计 hosted（陷阱⑧）。
+    计量单位为 tokens（SUM(total_tokens)）而非流水行数：一次 LLM 调用记一行、一章 5–10 次调用，
+    COUNT(*) 数的是调用不是章（Task 3 高危口径点），tokens 与记账粒度天然对齐。
+
+    where(user_id) 是租户守卫（陷阱⑦）：只累计属于该用户的行。新用户无任何流水时 SUM 空集
+    在 PG 返 NULL，用 func.coalesce(..., 0) 兜底返 0（陷阱⑥）——绝不让 None 流到
+    remaining = quota - used 的算术里（None 参与算术 → TypeError → 500）。
+    """
+    stmt = select(
+        func.coalesce(func.sum(UsageLedger.total_tokens), 0)
+    ).where(
+        UsageLedger.user_id == user_id,
+        UsageLedger.billing_path == "hosted",
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one()

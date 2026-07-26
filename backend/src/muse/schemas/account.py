@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import EmailStr, Field, field_validator
 
-from muse.schemas.base import CamelModel
+from muse.schemas.base import CamelModel, UTCDateTime
 
 _EMAIL_MAX_LENGTH = 320
 # refresh 明文为 secrets.token_urlsafe(32)（约 43 字符）；给宽松上界防超大 body 打到 SHA-256/DB。
@@ -127,3 +127,22 @@ class ByokStatusResponse(CamelModel):
     bound: bool
     provider: str | None = None
     masked_key: str | None = None
+
+
+class UsageViewResponse(CamelModel):
+    """用量展示响应（Story 1.8 AC3）。边界自动 camelCase：billingPath/quotaApplies/used/...
+
+    托管用户 → billingPath="hosted"、quotaApplies=true、used/quota/remaining 为具体 tokens 数；
+    BYOK 用户 → billingPath="byok"、quotaApplies=false、used/quota/remaining 为 null（前端展示
+    「走自有 Key、不占免费额度」，对齐原型 byok tab 文案 app.js:2104，AC4）。
+    reset_at V1 恒为 null（累计总量护栏，不做每日重置）；未来做每日重置时返次日 0 点，
+    UTCDateTime 保证 ISO8601+Z 序列化（schemas/base.py:25）。
+    used/quota 单位为 tokens（护栏 dev 定档以 tokens 计量），前端「N/M 章」展示由接线切片折算。
+    """
+
+    billing_path: str
+    quota_applies: bool
+    used: int | None = None
+    quota: int | None = None
+    remaining: int | None = None
+    reset_at: UTCDateTime | None = None

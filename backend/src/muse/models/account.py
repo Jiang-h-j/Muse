@@ -7,8 +7,9 @@ User 是全项目租户根（NFR3）：后续 project / byok_key / usage_ledger 
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from muse.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -84,3 +85,45 @@ class ByokKey(Base, UUIDPKMixin, TimestampMixin):
     encrypted_key: Mapped[str] = mapped_column(Text, nullable=False)
     # 明文尾 4 位，供掩码回显（避免每次查询只为取尾 4 位而解密整串）；仅尾 4 位不足以泄露密钥。
     key_suffix: Mapped[str] = mapped_column(String(8), nullable=False)
+
+
+class UsageLedger(Base, UUIDPKMixin, TimestampMixin):
+    """用量流水（Story 1.8，AR9/AR14）：每次 LLM 调用记一行 tokens 与成本。
+
+    放账户域（本文件）而非新建模块，复用 migrations/env.py 既有 `from muse.models import account`
+    import，免踩空迁移陷阱（deferred-work.md L10，与 ByokKey 同款理由）。
+
+    与 ByokKey 的关键差异（陷阱①）：BYOK 是账户级单例（user_id 唯一，每账户至多一条）；用量是
+    **一对多流水**——每次 LLM 调用插一行，同账户 N 行。故 user_id **只加 index、绝不 unique**
+    （加速按账户聚合的护栏/展示查询），照抄 ByokKey 的 unique 会让第二次记账违反唯一约束炸掉。
+
+    **本 story 只建表 + 供 Epic 2 消费的记账/护栏接口，不自行触发任何 LLM 调用、不埋点到生成链路**
+    （AR14 跨 epic 受控依赖）：tokens 数与成本是 LLM 调用的返回产物，本 story 无处可埋，实际写入由
+    Epic 2 Story 2.1 建 Provider 层时接入（见 story Dev Notes「跨 Epic 边界」）。
+    """
+
+    __tablename__ = "usage_ledger"
+
+    # 租户列：FK 指向 user 根，**非 unique**（一对多流水）；index 支撑按账户聚合（护栏/展示）。
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("user.id"), nullable=False, index=True
+    )
+    # 用量可归属某作品，也可账户级（探索/设定阶段可能无 project 上下文）；V1 允许空。
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("project.id"), nullable=True, index=True
+    )
+    # 归账面英文枚举 hosted/byok（区分托管 vs 自有 Key，NFR5）：护栏只累计 hosted、byok 不占额度。
+    # 与 mode/phase/provider 存英文枚举一脉相承。记账那刻的绑定态由调用方（Epic 2 Provider）传入。
+    billing_path: Mapped[str] = mapped_column(String(16), nullable=False)
+    # tokens 三分量（AR14）：prompt/completion 明细 + total 冗余（护栏按 SUM(total_tokens) 聚合，
+    # 免每次聚合都算 prompt+completion）。默认 0，均非空。
+    prompt_tokens: Mapped[int] = mapped_column(nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(nullable=False, default=0)
+    # 成本金额（陷阱②）：**用 Numeric/Decimal 不用 Float**——钱不能用浮点（0.1+0.2≠0.3 累加漂移）。
+    # Numeric(12,6)：6 位小数容纳 per-token 微额成本，12 位精度足够内测期。Python 侧全程 Decimal。
+    cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), nullable=False, default=Decimal("0")
+    )
+    # 记录哪个模型产生本次用量，便于成本审计（architecture.md:181 全链路 trace）；V1 可空。
+    model_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
