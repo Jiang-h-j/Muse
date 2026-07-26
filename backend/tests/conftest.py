@@ -12,6 +12,9 @@ import os
 # 且不触发生产弱密钥 fail-fast（Story 1.3 护栏）。setdefault 不覆盖已显式设置的环境变量。
 os.environ.setdefault("JWT_SECRET", "test-only-strong-secret-do-not-use-in-prod")
 os.environ.setdefault("DEBUG", "true")
+# BYOK 主密钥（Story 1.7）：注入合法 base64(32 字节) 固定测试值，保证 BYOK 加解密测试
+# 不依赖本机 .env、且加解密可确定往返（同法参照上方 JWT_SECRET/DEBUG 注入）。
+os.environ.setdefault("BYOK_MASTER_KEY", "bXVzZS1ieW9rLXRlc3QtbWFzdGVyLWtleS0zMmJ5dGU=")
 
 from collections.abc import Callable  # noqa: E402
 from datetime import datetime  # noqa: E402
@@ -56,11 +59,11 @@ def _clean_tables() -> None:
     if not DB_READY:
         return
     with _sync_engine().begin() as conn:
-        # refresh_session/project 均有 user_id FK 指向 user，CASCADE 一并清；
+        # refresh_session/project/byok_key 均有 user_id FK 指向 user，CASCADE 一并清；
         # RESTART IDENTITY 复位序列。
         conn.execute(
             text(
-                'TRUNCATE "user", invite_code, refresh_session, project '
+                'TRUNCATE "user", invite_code, refresh_session, project, byok_key '
                 "RESTART IDENTITY CASCADE"
             )
         )

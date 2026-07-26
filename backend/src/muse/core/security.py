@@ -6,7 +6,10 @@
 - AES-GCM BYOK 加解密：Story 1.7（BYOK API Key 绑定）。
 """
 
+import base64
+import binascii
 import hashlib
+import os
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -16,6 +19,8 @@ import anyio
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from muse.core.settings import get_settings
 
@@ -28,6 +33,10 @@ _password_hasher = PasswordHasher()
 DUMMY_PASSWORD_HASH = _password_hasher.hash("muse-timing-equalizer")
 
 _JWT_ALGORITHM = "HS256"
+
+# AES-256-GCM BYOK 加解密（Story 1.7）：密钥 32 字节、nonce 12 字节（96-bit，GCM 标准）。
+_AES_KEY_BYTES = 32
+_GCM_NONCE_BYTES = 12
 
 
 class TokenError(Exception):
@@ -127,3 +136,63 @@ def hash_refresh_token(token: str) -> str:
     无谓变慢（陷阱⑤）。与低熵、需抗暴力的密码（argon2）严格区分，勿混用。
     """
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+class KeyDecryptError(Exception):
+    """BYOK 密文解密失败的语义化异常（Story 1.7 陷阱⑥）。
+
+    密文损坏 / 被篡改（GCM 认证标签校验失败）/ 主密钥轮转导致旧密文无法解密时抛出。
+    上层据此走 500 或「视同未绑定回落托管」，**绝不 silently 返回空串**——空串会被误当合法 Key 用。
+    异常信息不含密文/明文，避免敏感数据进日志。
+    """
+
+
+def _load_master_key() -> bytes:
+    """加载 AES-256-GCM 主密钥（32 字节），来源 settings.byok_master_key（陷阱③）。
+
+    生产（debug=False）已由 settings fail-fast 保证是合法 base64(32 字节)，直接解码返回。
+    开发环境的默认占位值不是合法 base64(32)，退化为对原串做 SHA-256 确定性派生得 32 字节——
+    保证本地开箱即用且加解密可往返（同一占位值每次派生同一密钥）。不做模块级缓存：读 settings
+    的 lru_cache 已够快，且便于测试注入不同 BYOK_MASTER_KEY 即时生效。
+    """
+    raw = get_settings().byok_master_key
+    try:
+        decoded = base64.urlsafe_b64decode(raw)
+    except (binascii.Error, ValueError):
+        decoded = b""
+    if len(decoded) == _AES_KEY_BYTES:
+        return decoded
+    return hashlib.sha256(raw.encode()).digest()
+
+
+def encrypt_api_key(plaintext: str) -> str:
+    """AES-256-GCM 加密 BYOK API Key 明文，返回 base64(nonce‖ciphertext_with_tag) 单串（AC1）。
+
+    每次加密现取全新随机 nonce（os.urandom(12)），绝不复用（陷阱②：GCM 同密钥+同 nonce 会
+    灾难性泄露密钥流）。nonce 前置拼进密文，解密时按固定长度切回，便于单列存储。
+    """
+    key = _load_master_key()
+    nonce = os.urandom(_GCM_NONCE_BYTES)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode(), None)
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode()
+
+
+def decrypt_api_key(token: str) -> str:
+    """逆 encrypt_api_key：从 base64(nonce‖ct) 解出明文 API Key（AC5 内部消费）。
+
+    切出前 12 字节 nonce + 余下密文，AESGCM 解密。密文损坏/篡改/主密钥变更会让 decrypt 抛
+    InvalidTag，或 base64/切片异常——一律转 KeyDecryptError（陷阱⑥），绝不 `except: return ""`。
+    """
+    key = _load_master_key()
+    try:
+        blob = base64.urlsafe_b64decode(token)
+    except (binascii.Error, ValueError) as exc:
+        raise KeyDecryptError("BYOK 密文 base64 解码失败") from exc
+    if len(blob) <= _GCM_NONCE_BYTES:
+        # 不足以切出 nonce+密文（至少要 nonce + GCM tag），密文残缺。
+        raise KeyDecryptError("BYOK 密文长度不足")
+    nonce, ciphertext = blob[:_GCM_NONCE_BYTES], blob[_GCM_NONCE_BYTES:]
+    try:
+        return AESGCM(key).decrypt(nonce, ciphertext, None).decode()
+    except InvalidTag as exc:
+        raise KeyDecryptError("BYOK 密文认证失败（篡改或主密钥变更）") from exc

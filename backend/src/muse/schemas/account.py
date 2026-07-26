@@ -6,6 +6,7 @@ snake_case。响应只暴露安全视图，绝不含 password_hash / token 明�
 """
 
 import uuid
+from typing import Literal
 
 from pydantic import EmailStr, Field, field_validator
 
@@ -14,6 +15,8 @@ from muse.schemas.base import CamelModel
 _EMAIL_MAX_LENGTH = 320
 # refresh 明文为 secrets.token_urlsafe(32)（约 43 字符）；给宽松上界防超大 body 打到 SHA-256/DB。
 _REFRESH_TOKEN_MAX_LENGTH = 512
+# BYOK API Key 长度上限：与 byok_service._KEY_MAX_LENGTH 对齐，防超大输入（Story 1.7）。
+_BYOK_KEY_MAX_LENGTH = 512
 
 
 def _normalize_email(value: str) -> str:
@@ -98,3 +101,29 @@ class MeResponse(CamelModel):
 
     id: uuid.UUID
     email: EmailStr
+
+
+class ByokBindRequest(CamelModel):
+    """BYOK 绑定/替换入参（Story 1.7 AC1）。边界收 apiKey/provider，自动映射 snake_case。
+
+    空 Key 校验的明确分工（与 project title「留空是合法回落」相反——此处空 Key 非法，AC2）：
+    - api_key 设 min_length=1：明显空串 "" 在边界走 422 validation_error；
+    - 纯空白（如 "   "）无法被 min_length 拦，由 byok_service._validate_key strip 后判空抛
+      ErrorEnvelope("byok_invalid_key")（400）。两条路径都保证「空/纯空白被拒、不写库」。
+    provider 用 Literal 在边界枚举校验：非法 provider 直接 422（AC2）。
+    """
+
+    api_key: str = Field(min_length=1, max_length=_BYOK_KEY_MAX_LENGTH)
+    provider: Literal["deepseek", "claude", "custom"]
+
+
+class ByokStatusResponse(CamelModel):
+    """BYOK 绑定状态响应（AC1/AC4）。边界自动 camelCase：bound/provider/maskedKey。
+
+    已绑定 → bound=True + provider + maskedKey（中性 `…`+尾 4 位，陷阱⑦不硬编码 sk-）；
+    未绑定 → bound=False，后两者为 null。**绝不含任何回显明文 Key 的字段**（安全红线 AC1/AC4）。
+    """
+
+    bound: bool
+    provider: str | None = None
+    masked_key: str | None = None

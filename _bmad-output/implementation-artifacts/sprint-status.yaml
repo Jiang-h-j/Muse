@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-24
+# last_updated: 2026-07-24 (code review 1-7 done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -59,7 +59,7 @@ development_status:
   1-4-作品创建与列表持久化空-失败状态: done
   1-5-作品重命名与删除: done
   1-6-继续创作-按phase跳转当前步骤: done
-  1-7-BYOKAPIKey绑定全新设置页: backlog
+  1-7-BYOKAPIKey绑定全新设置页: done
   1-8-托管免费额度护栏与用量展示: backlog
   epic-1-retrospective: optional
 

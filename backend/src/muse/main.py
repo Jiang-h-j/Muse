@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from muse.core.db import engine
 from muse.core.errors import register_exception_handlers
 from muse.core.settings import get_settings
-from muse.routers import auth, health, projects
+from muse.routers import auth, byok, health, projects
 
 
 @asynccontextmanager
@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(projects.router)
+    app.include_router(byok.router)
     return app
 
 

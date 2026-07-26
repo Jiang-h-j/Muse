@@ -3,6 +3,8 @@
 DB / Redis 连接串、JWT 签名密钥与双 token 有效期。生产弱密钥 fail-fast 见 model_validator。
 """
 
+import base64
+import binascii
 from functools import lru_cache
 
 from pydantic import Field, model_validator
@@ -12,6 +14,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _DEFAULT_JWT_SECRET = "dev-only-change-me"
 # 生产 JWT 密钥最小长度：HS256 密钥过短易被暴力/伪造，低于此长度即拒绝启动。
 _MIN_JWT_SECRET_LENGTH = 32
+
+# BYOK 主密钥默认占位值；生产（debug=False）若仍为此值则拒绝启动（与 JWT 同构，Story 1.7）。
+_DEFAULT_BYOK_MASTER_KEY = "dev-only-byok-key-change-me"
+# AES-256-GCM 要求密钥恰好 32 字节；约定 BYOK_MASTER_KEY 存 base64(32 字节随机串)。
+_BYOK_MASTER_KEY_BYTES = 32
 
 
 class Settings(BaseSettings):
@@ -40,6 +47,10 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = Field(default=900, gt=0)  # 15 分钟：短 TTL，无状态本地验签
     refresh_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 30, gt=0)  # 30 天：长效可撤销
 
+    # BYOK 主密钥（Story 1.7）：应用层 AES-256-GCM 加解密用户 API Key 的主密钥（NFR6/AR9）。
+    # 约定存 base64(32 字节随机串)；生产 fail-fast 见 _fail_fast_on_weak_byok_master_key。
+    byok_master_key: str = _DEFAULT_BYOK_MASTER_KEY
+
     @model_validator(mode="after")
     def _fail_fast_on_weak_secret(self) -> "Settings":
         """生产环境弱 JWT 密钥拒绝启动（deferred-work.md L5，AC6）。
@@ -54,6 +65,35 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"生产环境（DEBUG=false）必须设置长度≥{_MIN_JWT_SECRET_LENGTH} 的强随机 "
                 "JWT_SECRET，当前仍为默认占位值或过短，拒绝启动。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _fail_fast_on_weak_byok_master_key(self) -> "Settings":
+        """生产环境弱 BYOK 主密钥拒绝启动（NFR6/AR9，与 JWT fail-fast 同构）。
+
+        debug=False 时若主密钥仍为默认占位值、或 base64 解码后不是恰好 32 字节（含非法 base64、
+        空串、长度不符），AES-256-GCM 无法安全加密用户 API Key，属致命配置错误，拒绝启动。
+        debug=True（本地开发）放行——_load_master_key 会对占位值做确定性派生保证开箱即用。
+        """
+        if self.debug:
+            return self
+        if self.byok_master_key == _DEFAULT_BYOK_MASTER_KEY:
+            raise ValueError(
+                "生产环境（DEBUG=false）必须设置 BYOK_MASTER_KEY 为 base64 编码的 32 字节强随机"
+                '串，当前仍为默认占位值，拒绝启动。可用 python -c "import base64,os; '
+                'print(base64.urlsafe_b64encode(os.urandom(32)).decode())" 生成。'
+            )
+        try:
+            decoded = base64.urlsafe_b64decode(self.byok_master_key)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                "生产环境 BYOK_MASTER_KEY 必须为合法 base64 编码，当前无法解码，拒绝启动。"
+            ) from exc
+        if len(decoded) != _BYOK_MASTER_KEY_BYTES:
+            raise ValueError(
+                f"生产环境 BYOK_MASTER_KEY base64 解码后必须恰好 {_BYOK_MASTER_KEY_BYTES} 字节"
+                f"（AES-256-GCM 要求），当前为 {len(decoded)} 字节，拒绝启动。"
             )
         return self
 

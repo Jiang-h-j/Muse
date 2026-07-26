@@ -8,7 +8,7 @@ User 是全项目租户根（NFR3）：后续 project / byok_key / usage_ledger 
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from muse.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -60,3 +60,27 @@ class RefreshSession(Base, UUIDPKMixin, TimestampMixin):
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ByokKey(Base, UUIDPKMixin, TimestampMixin):
+    """BYOK（Bring Your Own Key）：用户自带的 LLM API Key，AES-GCM 加密后落库（Story 1.7）。
+
+    放账户域（本文件）而非新建模块，复用 migrations/env.py 既有 `from muse.models import account`
+    import，免踩空迁移陷阱（deferred-work.md L10）。V1 按账户级绑定（user_id 唯一）——每账户至多
+    一条 BYOK，支撑「绑定即替换」的 upsert 语义（陷阱④）；未来若需作品级，加 project_id + 复合唯一
+    即可平滑升级，账户级是其子集不阻塞。明文 API Key 绝不落库：只存 encrypted_key 密文 + 尾 4 位
+    明文供掩码回显（陷阱①）。
+    """
+
+    __tablename__ = "byok_key"
+
+    # user_id 唯一 = 每账户至多一条 BYOK（陷阱④ 替换语义的约束基础）；FK 指向租户根 user。
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("user.id"), unique=True, nullable=False, index=True
+    )
+    # provider 存英文枚举 deepseek/claude/custom（与 mode/phase 存英文枚举一脉相承）。
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    # AES-GCM 密文单串 base64(nonce‖ciphertext)；API Key 长度不定，用 Text 不封顶。
+    encrypted_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # 明文尾 4 位，供掩码回显（避免每次查询只为取尾 4 位而解密整串）；仅尾 4 位不足以泄露密钥。
+    key_suffix: Mapped[str] = mapped_column(String(8), nullable=False)
