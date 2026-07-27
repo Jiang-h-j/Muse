@@ -26,12 +26,11 @@ from sqlalchemy import Engine, create_engine, select, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from muse.core.settings import get_settings  # noqa: E402
-from muse.models import (
-    account,  # noqa: F401, E402  注册 metadata（供 create_all 建表）
-    project,  # noqa: F401, E402  注册 metadata（供 create_all 建表）
-)
+from muse.models import Base, load_all_models  # noqa: E402
 from muse.models.account import InviteCode, User  # noqa: E402
-from muse.models.base import Base  # noqa: E402
+
+# 注册所有 ORM 模型到 Base.metadata（供 create_all 建表）；自动发现，新增模型无需改此处。
+load_all_models()
 
 DB_READY = os.getenv("MUSE_DB_READY") == "1"
 requires_db = pytest.mark.skipif(
