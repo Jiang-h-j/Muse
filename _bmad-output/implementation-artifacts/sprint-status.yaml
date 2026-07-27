@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-27 (Story 2-1 LLMProvider/DeepSeek/ARQ/SSE 底座实现完成，状态 → done)
+# last_updated: 2026-07-27 (Story 2-2 探索会话根 get-or-create 实现完成 + code review 通过，状态 → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -66,7 +66,7 @@ development_status:
   # ---------- Epic 2: 探索（含 LLM / 编排底座）----------
   epic-2: in-progress
   2-1-LLMProvider抽象-DeepSeek实现-ARQ-SSE异步底座: done
-  2-2-探索会话根与模式分叉模式独立: backlog
+  2-2-探索会话根与模式分叉模式独立: done
   2-3-引导探索-真实Agent理解自由作答-沉浸问答: backlog
   2-4-引导探索-翻页与答案真实持久化: backlog
   2-5-引导探索-收尾整理中过渡态: backlog

@@ -82,3 +82,10 @@
 - **SSE `event_stream` 的 `listen()` 无服务端超时，worker 崩溃/永不推终态则流永久挂起** [backend/src/muse/core/sse.py:126] — 快照为 None（任务入队但 worker 未起/已崩）或快照非终态时进入 `pubsub.listen()` 无 watchdog；worker `except Exception` 不捕获 `CancelledError`（SIGTERM 不推 error）。客户端 UI 永久「生成中」，靠 sse-starlette 15s ping 保活。本 story 示范任务不主动崩，真实长时生成才现实化。**归 Epic 4**：任务级看门狗/整体超时，或 worker 信号处理器捕获 CancelledError 推 error 终态。
 - **AC4/Task5/定档① 原文「先补发快照再订阅」与代码「先订阅再补发」矛盾（spec 可追溯性）** [spec L33/L87/L149 vs backend/src/muse/core/sse.py:113-126] — 文档修正而非代码问题：代码顺序**更正确**（dev 实现中发现原顺序有竞态并纠正，Debug Log + 模块 docstring + Completion Notes 定档① 均已 subscribe-first）。AC4 Then-意图由代码达成且测试佐证。属同文档前文陈旧措辞与后文+代码打架。**归文档收尾**：回改 AC4/Task5/定档① 的 snapshot-first 措辞为 subscribe-first。
 
+## Deferred from: code review of 2-2-探索会话根与模式分叉模式独立 (2026-07-27)
+
+> 三层对抗式审查（Blind/Edge/Auditor）。5 条 AC 全部满足、8 个陷阱全部规避。1 条 decision-needed（main.py 提交边界，已按 2.1/2.2 拆分提交解决）；3 条噪声/假阳性 dropped；以下 2 条 defer 归后续。
+
+- **`except IntegrityError` 过宽，并发删 project 时 FK 违例退化成 500 而非 404** [backend/src/muse/services/exploration_service.py:59] — 同用户 TOCTOU 竞态（一处进入探索、一处删除该 project 并发）下，若删除发生在 `get_owned_project` 通过之后、`create_session` 的 INSERT 之前，INSERT 撞的是 project_id 的 FK 约束而非 (user_id, project_id) 唯一约束，同样抛 IntegrityError 落进同一 except；rollback 后重查 get_session_by_project 返 None（project 已删）→ 走 raise → 全局 handler 500。正常时序下对已删 project 进入探索应得 404 project_not_found。极罕见同用户竞态、无数据损坏、无越权，raise 路径安全，仅错误码不一致。**归后续**：如需精确化，按 sqlstate/约束名区分唯一约束冲突与 FK 违例（后者转 404）。
+- **测试 conftest `_clean_tables` 未列 `exploration_session`，靠 CASCADE 兜底** [backend/tests/conftest.py:77] — 当前 `TRUNCATE "user", ... RESTART IDENTITY CASCADE` 会级联清空引用 user 的 exploration_session，且各用例断言按 `WHERE project_id = :pid` 收敛到本用例，不会污染——现无 bug。但清表清单注释逐个列举 refresh_session/project/byok_key/usage_ledger 却漏了 exploration_session，其安全性隐式依赖 FK+CASCADE；若日后改成显式逐表 TRUNCATE（不带 CASCADE）或调整 FK，会话残留会静默泄漏进后续用例。**归测试基建维护**：将 exploration_session 显式补入清表清单。
+
