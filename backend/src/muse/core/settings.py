@@ -61,6 +61,20 @@ class Settings(BaseSettings):
     # 密钥，占位默认值可直接用于生产，故**不加 fail-fast**（与 JWT/BYOK 主密钥相反）。
     free_quota_tokens: int = Field(default=200_000, gt=0)
 
+    # DeepSeek Provider（Story 2.1，AR12/焦点一）：托管默认路径的模型接入配置。
+    # deepseek_api_key 是 **Muse 自有** Key（托管路径用；BYOK 路径用用户自己的 Key，见
+    # byok_service）。**无 fail-fast**（与 JWT/BYOK 主密钥相反，参照 free_quota_tokens 决策）：
+    # DeepSeek key 是业务配置而非安全密钥——空值只导致 chat/stream 调用报明确错误、不导致越权，
+    # 故不加 model_validator 拒启动。空串默认便于本地/CI 无 key 时其余功能正常跑，真实调用时缺 key
+    # 由 Provider 报错。
+    deepseek_api_key: str = ""
+    # base_url 切到 DeepSeek（OpenAI SDK 兼容，spike P1 实测确认）；允许 .env 覆盖便于换区域/代理。
+    deepseek_base_url: str = "https://api.deepseek.com"
+    # 双档模型名（spike P1 `models.list()` 已实测确认与 architecture.md:196 完全吻合）：
+    # thinking 档起草/审查、fast 档提取/轻任务，均 128K 上下文。配置化便于模型改名时不改代码。
+    deepseek_model_thinking: str = "deepseek-v4-pro"
+    deepseek_model_fast: str = "deepseek-v4-flash"
+
     @model_validator(mode="after")
     def _fail_fast_on_weak_secret(self) -> "Settings":
         """生产环境弱 JWT 密钥拒绝启动（deferred-work.md L5，AC6）。

@@ -18,7 +18,7 @@ export PATH := /opt/homebrew/bin:/usr/local/bin:$(HOME)/.local/bin:$(PATH)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help dev-up dev-down dev-stop dev-status
+.PHONY: help dev-up dev-down dev-stop dev-status dev-api dev-worker
 
 help: ## 显示本 Makefile 支持的命令
 	@echo "Muse 本地开发环境："
@@ -26,6 +26,8 @@ help: ## 显示本 Makefile 支持的命令
 	@echo "  make dev-down    停容器、保留数据（VM 仍运行，重启快）"
 	@echo "  make dev-stop    ⭐彻底收尾：停容器 + 停 Colima VM，释放内存（长时间不用时执行）"
 	@echo "  make dev-status  查看 Colima 与容器当前状态"
+	@echo "  make dev-api     起后端 API（uvicorn 热重载，需先 make dev-up）"
+	@echo "  make dev-worker  起 ARQ worker（消费长时任务，需先 make dev-up 起 Redis）"
 	@echo ""
 	@echo "  资源上限（可覆盖）：COLIMA_CPU=$(COLIMA_CPU) COLIMA_MEMORY=$(COLIMA_MEMORY)GiB COLIMA_DISK=$(COLIMA_DISK)GiB"
 
@@ -55,3 +57,11 @@ dev-stop: ## ⭐彻底收尾：停容器 + 停 Colima VM，释放内存
 dev-status: ## 查看 Colima 与容器状态
 	@echo "=== Colima ==="; colima status 2>&1 || echo "（Colima 未运行）"
 	@echo "=== 容器 ==="; docker compose ps 2>&1 || echo "（Colima 未运行，无法查询容器）"
+
+dev-api: ## 起后端 API（uvicorn 热重载）；需先 make dev-up
+	@echo "▶ 起后端 API（http://127.0.0.1:8000，热重载）…"
+	@cd backend && uv run uvicorn muse.main:app --reload
+
+dev-worker: ## 起 ARQ worker（消费长时生成任务）；需先 make dev-up 起 Redis
+	@echo "▶ 起 ARQ worker（消费 tasks/worker.py 的长时任务）…"
+	@cd backend && uv run arq muse.tasks.worker.WorkerSettings

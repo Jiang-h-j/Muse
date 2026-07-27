@@ -37,6 +37,20 @@ requires_db = pytest.mark.skipif(
     not DB_READY, reason="需起容器并设 MUSE_DB_READY=1 才跑 DB 用例"
 )
 
+# Redis 门禁（Story 2.1 SSE/ARQ 用例）：需 `make dev-up` 起 Redis 并设 MUSE_REDIS_READY=1。
+# 与 @requires_db 同构——离线 Provider 单元不需 Redis，SSE/ARQ 端到端才需。
+REDIS_READY = os.getenv("MUSE_REDIS_READY") == "1"
+requires_redis = pytest.mark.skipif(
+    not REDIS_READY, reason="需起 Redis 并设 MUSE_REDIS_READY=1 才跑 SSE/ARQ 用例"
+)
+
+# DeepSeek 真实契约门禁（Story 2.1）：需真实 key 且设 MUSE_DEEPSEEK_READY=1 才打真实 API。
+# CI 默认 skip（无 key）、本地可跑；仿 @requires_db 门禁。
+DEEPSEEK_READY = os.getenv("MUSE_DEEPSEEK_READY") == "1"
+requires_deepseek = pytest.mark.skipif(
+    not DEEPSEEK_READY, reason="需真实 DEEPSEEK_API_KEY 并设 MUSE_DEEPSEEK_READY=1 才跑真实契约用例"
+)
+
 
 @lru_cache
 def _sync_engine() -> Engine:
