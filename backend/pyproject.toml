@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic",
     "argon2-cffi",
+    "arq>=0.25.0",
     "fastapi[standard]",
     "greenlet>=3.5.4",
     "openai",
@@ -15,6 +16,7 @@ dependencies = [
     "pyjwt[crypto]",
     "redis>=8.0.1",
     "sqlalchemy>=2.0",
+    "sse-starlette>=3.4.6",
 ]
 
 [build-system]

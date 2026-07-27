@@ -62,3 +62,11 @@
 - **双档模型名已实测确认，与架构文档一致** [architecture.md:108,196] — `models.list()` 探测账号可用模型恰为 `deepseek-v4-pro`（思考，起草/审查）+ `deepseek-v4-flash`（快，提取/轻任务）两个，与 architecture.md 写定的名字**完全吻合**。实测延迟 flash（~2.9s）约为 pro（~5.6s）的一半，token 用量两档相当。**2.1 可直接按这两个模型名写 Provider，无需再探**。
 - **⚠️ 护栏计量必须信 API 回报的 `usage.total_tokens`，不能用「生成前本地字符预估」做触顶判据** [backend/src/muse/services/usage_service.py `check_quota`、backend/src/muse/repositories/account_repo.py `record_usage`] — spike 用「CJK×0.6+其余×0.3」本地估算同一 prompt，得 13 tokens，而 API 实际 `prompt_tokens=17`，**偏差 +23.5%（低估）**。这印证 Story 1.8 以 `SUM(total_tokens)` 为触顶数据源的方向正确；**2.1 接记账埋点时，务必以 chat 响应 `usage`（prompt/completion/total）落库，而非任何本地预估**——本地预估只可用于「调用前的粗略拦截提示」，不可作为扣费/触顶的准数。
 - **双档均返回 `reasoning_content`（含 flash 快档），SSE 推送需区分 reasoning vs content** [architecture.md:194 `LLMProvider` chat/stream 接口] — spike 意外发现 flash 快档也带思考过程字段（非仅 pro）。**2.1 的 `LLMProvider.stream` + SSE 三事件设计需明确**：reasoning_content 是单独推给前端（做「思考中」展示）还是丢弃，两档都要处理该字段，不能假设只有 pro 有。此点与 P2（ARQ+SSE 骨架）的事件设计衔接。
+
+## 设计输入 from: P2 ARQ + SSE 端到端骨架 spike (2026-07-27)
+
+> 非留茬，是 spike 实测产出的**正向设计输入**，供 Epic 2 Story 2.x 编排/回传落地时采用。可复跑凭证见 `backend/scripts/spike_arq_sse.py`（单文件同进程起 worker+uvicorn，httpx 跑两轮端到端；需先 `make dev-up` 起 Redis）。依赖已入库：`arq==0.25.0`、`sse-starlette==3.4.6`（pyproject.toml/uv.lock）。
+
+- **技术选型已实测跑通，可直接定为正式选型** — ARQ（`arq==0.25.0`，async 原生 + Redis broker，architecture.md:197）+ sse-starlette（`EventSourceResponse` 接受异步生成器，自动处理 event-stream 帧/心跳）+ Redis Pub/Sub 作 worker→SSE 通道（推模型，对齐 architecture.md:472「Redis+SSE 推送」、:358「禁轮询」）。端到端两轮（happy + error）全绿。**2.x 建 `tasks/worker.py` + `core/sse.py` + `routers/tasks.py` 时可直接照此骨架**。
+- **三事件契约已端到端验证，含 error 路径** [architecture.md:335-336] — `progress`（payload `{step, percent}` camelCase）× N → `result`；worker 内异常经 `try/except` 推 `error`（payload `{code, message}`，复用错误 envelope）。**关键：error 是长时任务最需保证的路径**——spike 特地用 `--fail` 让 worker 第 2 步抛异常，确认 error 事件经同一 Pub/Sub 链路推达客户端、且失败后不再有 progress/result。2.x 五段流水线每 step 失败都须走此 error 事件。
+- **⚠️ Pub/Sub「先订阅后发布」时序风险，2.x 须处理** [backend/scripts/spike_arq_sse.py `events` 端点] — Redis Pub/Sub 不留存历史消息：若客户端 SSE 订阅**晚于** worker 首个 progress 发布，早期事件会丢。spike 里因 worker 有 0.3s/step 延迟、客户端提交后立即订阅，天然错开未暴露此问题。**2.x 正式实现须补**：要么用 Redis Stream（可回放 + 消费位点）替代纯 Pub/Sub，要么 SSE 端点先补发一次「当前任务快照/已完成 step」再订阅增量——否则页面刷新/断线重连会丢进度。此为 spike 刻意留给正式设计的已知缺口，非疏漏。
