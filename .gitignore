@@ -7,6 +7,9 @@
 # Claude Code 本地配置与 skills（跟随全局忽略，不随仓库分发）
 .claude/
 
+# 编辑器 / IDE 本地配置（因人而异，不随仓库分发）
+.vscode/
+
 # 空占位文件
 /npx
 
