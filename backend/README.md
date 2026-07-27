@@ -33,10 +33,27 @@ backend/
 
 ## 本地开发
 
-前置：已装 [uv](https://docs.astral.sh/uv/) 与 Docker。
+前置：已装 [uv](https://docs.astral.sh/uv/) 与 Colima（公司禁用 Docker Desktop，用 Colima 提供 docker daemon）。
+
+> **一键起停（推荐）**：项目根 `Makefile` 封装了 Colima + 容器的起停，省去手记命令。
+>
+> ```bash
+> # 在项目根 Muse/ 执行
+> make dev-up      # 起 Colima(如未运行，限 4CPU/4GiB) + PostgreSQL + Redis，等到 healthy
+> make dev-status  # 查看 Colima 与容器状态
+> make dev-down    # 停容器、保留数据（VM 仍在，重启快 —— 短暂小憩用）
+> make dev-stop    # ⭐彻底收尾：停容器 + 停 Colima VM，释放内存（长时间不用/下班时用）
+> ```
+>
+> **⚠️ 用完务必收尾**：Colima 是常驻 VM，起了不 stop 会一直占内存；叠加 PG + Redis
+> 两个容器长期运行，会逐渐顶满内存导致机器卡死（Epic 1 曾踩此坑）。日常小憩 `make dev-down`
+> 即可，长时间不用请 `make dev-stop` 连 VM 一起释放。
+
+手动等价命令（不用 Makefile 时）：
 
 ```bash
 # 1. 起本地依赖（PostgreSQL+pgvector / Redis），在项目根 Muse/ 执行
+colima start --cpu 4 --memory 4   # 若 Colima 未运行
 docker-compose up -d
 
 # 2. 安装依赖（在 backend/ 执行；据 uv.lock 装齐）
@@ -52,6 +69,10 @@ uv run alembic upgrade head
 uv run fastapi dev src/muse/main.py
 # 健康检查
 curl http://localhost:8000/health      # → {"status":"ok","dbConnected":true}
+
+# 6. 用完收尾（重要，释放内存）
+docker-compose down    # 停容器、保留数据
+colima stop            # 停 VM，释放内存
 ```
 
 > 说明：首次搭建时依赖是经 `uv add` 引入并写入 `pyproject.toml` / `uv.lock` 的；
