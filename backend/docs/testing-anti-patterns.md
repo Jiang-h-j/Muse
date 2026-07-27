@@ -23,9 +23,14 @@
 - 排序不确定 → 在被测代码补确定性次级键（如 `id.desc()`），测试无需 sleep。
 - 需验证"时间戳确实变化" → 优先 mock 时间（`freezegun` / 注入 clock），或断言"新值 > 旧值"配合 DB server-side `now()`，而非真实 sleep。
 
-**⚠️ 现存待清理**：`backend/tests/test_projects.py:160`（倒序测试）的 sleep 在 repo 补了次级键后**已属逻辑冗余**，应删除。`:234`（改名刷新 `updated_at`）的 sleep 也应换成 mock 时间。根因修了但测试里的 sleep 常被漏删——这正是本条要防的。
+**✅ 已清理（2026-07-27）**：`test_projects.py` 两处 sleep 已消除，改用 `db_engine` fixture 直接 `UPDATE project SET updated_at` 设确定时间——
+- 倒序测试（原 :160）：建三部后显式设递增 `updated_at`，不再靠 sleep 制造时间差；
+- 改名刷新测试（原 :234）：先把 `updated_at` 回拨到 2020 早时间，改名后断言新值 `> old_ts`，确定性验证刷新。
+经变异测试确认守卫有效：临时注释 `project_service.py` 的 `session.refresh` 后该用例翻红。此为本条"根因修了但 sleep 常被漏删"的正例——清单落地即清理。
 
 **Review 检查点**：测试里出现 `sleep` 一律要求解释——能用确定性手段（次级键 / mock 时间 / 显式设值）替代的，不放行。
+
+> **待查（既有 flaky，非本次引入）**：`test_auth_login.py::test_tampered_access_token_rejected` 在全套连跑中曾偶发失败一次，单独跑及重跑均通过（干净 HEAD 上连跑 4 次未复现）。疑为测试隔离/时序问题，属本清单类别 1 关注范畴。待独立排查，勿在无关改动里顺手动它。
 
 ---
 

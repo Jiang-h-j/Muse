@@ -9,10 +9,12 @@
 import time
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, text
 
 from muse.core.settings import get_settings
 from muse.main import app
@@ -149,15 +151,27 @@ def test_create_project_untitled_fallback(
 
 @requires_db
 def test_list_projects_ordered_by_updated_desc(
-    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
 ) -> None:
     user = make_user("order@example.com")
     headers = auth_headers(user)
-    # 依次建三部；updated_at server_default now()，后建的更新时间更晚 → 倒序应最先出现。
+    # 建三部后，显式把 updated_at 设成确定递增时间——不靠 sleep 制造时间差（脆弱且慢）。
     titles = ["第一部", "第二部", "第三部"]
-    for t in titles:
-        _client.post("/api/projects", json={"mode": "guided", "title": t}, headers=headers)
-        time.sleep(0.01)  # 拉开 server 时间戳，避免同一时刻导致顺序不确定
+    ids = [
+        _client.post(
+            "/api/projects", json={"mode": "guided", "title": t}, headers=headers
+        ).json()["id"]
+        for t in titles
+    ]
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    with db_engine.begin() as conn:
+        for i, pid in enumerate(ids):
+            conn.execute(
+                text("UPDATE project SET updated_at = :ts WHERE id = :id"),
+                {"ts": base + timedelta(minutes=i), "id": pid},
+            )
 
     listed = _client.get("/api/projects", headers=headers).json()
     assert [p["title"] for p in listed] == list(reversed(titles))
@@ -224,14 +238,23 @@ def test_delete_project_without_token_401() -> None:
 
 @requires_db
 def test_rename_project_persists_and_refreshes_updated_at(
-    make_user: Callable[..., User], auth_headers: Callable[[User], dict[str, str]]
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
 ) -> None:
     user = make_user("rename@example.com")
     headers = auth_headers(user)
     created = _client.post(
         "/api/projects", json={"mode": "guided", "title": "旧名"}, headers=headers
     ).json()
-    time.sleep(0.01)  # 拉开时间戳，验证 updated_at 确被刷新（陷阱②：漏 refresh 则时间不变）
+    # 把 updated_at 显式回拨到确定的早时间——不靠 sleep 赌两次请求落在不同时钟刻度。
+    # 改名后新时间戳必然远大于此，确定性地验证「刷新确实发生」（陷阱②：漏 refresh 则时间不变）。
+    old_ts = datetime(2020, 1, 1, tzinfo=UTC)
+    with db_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE project SET updated_at = :ts WHERE id = :id"),
+            {"ts": old_ts, "id": created["id"]},
+        )
 
     resp = _client.patch(
         f"/api/projects/{created['id']}", json={"title": "新名"}, headers=headers
@@ -242,7 +265,8 @@ def test_rename_project_persists_and_refreshes_updated_at(
     assert body["id"] == created["id"]
     assert body["title"] == "新名"
     # 陷阱②：commit 后须 session.refresh 拉回 DB 计算的 updated_at，否则仍是旧值。
-    assert body["updatedAt"] != created["updatedAt"]
+    # 断言新时间戳严格晚于回拨的早时间——漏 refresh 则响应仍是 2020 旧值，此断言翻红。
+    assert datetime.fromisoformat(body["updatedAt"]) > old_ts
 
     # 真实持久化：再查列表读到的是新名（非原型仅改 DOM）。
     listed = _client.get("/api/projects", headers=headers).json()
