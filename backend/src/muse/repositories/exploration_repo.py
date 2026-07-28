@@ -10,9 +10,11 @@ user_id 的全表查询入口。
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from muse.models.exploration_message import ExplorationMessage
 from muse.models.exploration_session import ExplorationSession
 
 
@@ -46,3 +48,73 @@ async def create_session(
     session.add(exploration_session)
     await session.flush()
     return exploration_session
+
+
+async def upsert_guided_answer(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+    question_index: int,
+    question: str,
+    answer: str,
+    answer_type: str,
+) -> ExplorationMessage:
+    """定点写某题位答案：不存在则插入，撞 (session_id, question_index) 唯一约束则覆盖（AC4/AC5）。
+
+    PG 原生 upsert（on_conflict_do_update）：一次往返、并发安全（仿 2.2 用唯一约束兜底并发
+    TOCTOU 的精神，且比「先查后写」少一次往返）。用 RETURNING 一并取回写入行（无需再 flush 或
+    额外 SELECT），事务边界（commit）归 service。
+
+    陷阱②（updated_at 不刷新）：on_conflict_do_update 走 core insert 路径，SQLAlchemy 列级
+    onupdate=func.now()（base.py:26）**不触发**——set_ 里必须显式 updated_at=func.now()，否则
+    重选覆盖后 updated_at 停在首答时间，违反 updated_at=内容最后修改时间（改答即刷新）。
+    陷阱③（created_at 不可覆盖）：set_ 只更 answer/answer_type/question/updated_at，不含
+    created_at（保留首答时间）；values(...) 含全部列供插入分支，set_ 只列更新分支要改的列。
+    """
+    insert_stmt = insert(ExplorationMessage).values(
+        user_id=user_id,
+        project_id=project_id,
+        session_id=session_id,
+        question_index=question_index,
+        question=question,
+        answer=answer,
+        answer_type=answer_type,
+    )
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        constraint="uq_exploration_message_session_id_question_index",
+        set_={
+            "question": insert_stmt.excluded.question,
+            "answer": insert_stmt.excluded.answer,
+            "answer_type": insert_stmt.excluded.answer_type,
+            "updated_at": func.now(),
+        },
+    ).returning(ExplorationMessage)
+    result = await session.execute(upsert_stmt)
+    return result.scalar_one()
+
+
+async def list_guided_answers_by_session(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> list[ExplorationMessage]:
+    """列出该会话全部答案，按 question_index 升序（前端按题位顺序回填 explorationHistory）。
+
+    where 显式带 user_id（租户守卫，base_repo 约定 NFR3，勿只按 session_id 查）——session_id
+    已足够定位，但守卫列必带 user_id 是硬红线（architecture.md:357）。
+    """
+    stmt = (
+        select(ExplorationMessage)
+        .where(
+            ExplorationMessage.user_id == user_id,
+            ExplorationMessage.project_id == project_id,
+            ExplorationMessage.session_id == session_id,
+        )
+        .order_by(ExplorationMessage.question_index.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())

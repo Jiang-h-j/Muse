@@ -4,6 +4,8 @@
 - POST /{project_id}/explore：进入探索（get-or-create 语义，Story 2.2）。
 - POST /{project_id}/explore/guided/interpret：引导自述理解流式 SSE（Story 2.3 AC4）——真实
   Explorer Agent 把用户一句话自述凝练为该题答案，逐块 SSE 推送 delta→done→error。
+- POST /{project_id}/explore/guided/answers：保存/更新某题位引导答案（Story 2.4，幂等 upsert 200）。
+- GET  /{project_id}/explore/guided/answers：恢复本会话全部已答（Story 2.4，题位升序，空态 []）。
 
 依赖 CurrentUser 自动完成 access token 校验并取当前 User；未登录/token 失效在依赖内 401。
 所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。
@@ -22,7 +24,12 @@ from sse_starlette.sse import EventSourceResponse
 from muse.core import sse
 from muse.core.deps import CurrentUser, SessionDep
 from muse.core.errors import ErrorEnvelope, logger
-from muse.schemas.exploration import ExplorationSessionResponse, GuidedInterpretRequest
+from muse.schemas.exploration import (
+    ExplorationSessionResponse,
+    GuidedAnswerRequest,
+    GuidedAnswerResponse,
+    GuidedInterpretRequest,
+)
 from muse.services import exploration_service, explorer_agent
 
 router = APIRouter(prefix="/api/projects", tags=["exploration"])
@@ -132,3 +139,49 @@ async def interpret_guided_answer(
             free_text=payload.free_text,
         )
     )
+
+
+@router.post(
+    "/{project_id}/explore/guided/answers", response_model=GuidedAnswerResponse
+)
+async def save_guided_answer(
+    project_id: uuid.UUID,
+    payload: GuidedAnswerRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> GuidedAnswerResponse:
+    """保存/更新某题位引导答案（AC5）：常规 REST CRUD，非流式。
+
+    返 200（幂等 upsert，非恒 201，陷阱⑦）——重复保存/改答返同题位最新态。project_id 非法 UUID
+    由 FastAPI 自动 422；越权/不存在在 service 统一 404（陷阱①）；body 字段校验由 Pydantic 完成
+    （answerType Literal / questionIndex ge=0 / question,answer 非空有界，陷阱⑧）。
+    无 SSE/provider/ARQ——本端点不调 LLM、不需 Redis（陷阱⑨）。
+    """
+    message = await exploration_service.save_guided_answer(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        question_index=payload.question_index,
+        question=payload.question,
+        answer=payload.answer,
+        answer_type=payload.answer_type,
+    )
+    return GuidedAnswerResponse.model_validate(message)
+
+
+@router.get(
+    "/{project_id}/explore/guided/answers",
+    response_model=list[GuidedAnswerResponse],
+)
+async def list_guided_answers(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> list[GuidedAnswerResponse]:
+    """恢复本会话全部已答（AC5）：按题位升序列表；空会话/未答返 []（200，非 404，陷阱⑥）。
+
+    越权/不存在在 service 统一 404（陷阱①）；非法 UUID 自动 422。供前端进探索页回填
+    explorationHistory（前端接线 defer 至前端集成切片，受控决策 A）。
+    """
+    messages = await exploration_service.list_guided_answers(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return [GuidedAnswerResponse.model_validate(m) for m in messages]

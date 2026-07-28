@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-28 (Story 2-3 code review 通过：6 patch 全部应用+验证，状态 → done)
+# last_updated: 2026-07-28 (Story 2-4 code review 完成：1 decision-needed 裁定 defer 至 2.6 + 2 patch 已应用并实测(int4 上界/docstring，含新增用例，170 passed 零回归) + 2 defer 登记，状态 review → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -68,7 +68,7 @@ development_status:
   2-1-LLMProvider抽象-DeepSeek实现-ARQ-SSE异步底座: done
   2-2-探索会话根与模式分叉模式独立: done
   2-3-引导探索-真实Agent理解自由作答-沉浸问答: done
-  2-4-引导探索-翻页与答案真实持久化: backlog
+  2-4-引导探索-翻页与答案真实持久化: done
   2-5-引导探索-收尾整理中过渡态: backlog
   2-6-自由探索-对话-线索区-给方向-持久化: backlog
   2-7-自由探索-整理为故事设定开放门禁: backlog

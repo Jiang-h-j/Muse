@@ -9,9 +9,9 @@ GuidedInterpretRequest 收当前题干 + 用户一句话自述。
 """
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import StringConstraints
+from pydantic import Field, StringConstraints
 
 from muse.schemas.base import CamelModel, UTCDateTime
 
@@ -47,3 +47,36 @@ class GuidedInterpretRequest(CamelModel):
 
     question: _NonBlankText
     free_text: _NonBlankText
+
+
+class GuidedAnswerRequest(CamelModel):
+    """引导答案保存请求（Story 2.4 AC5）：某题位的一句话答案 + 作答路径。
+
+    边界 camelCase：questionIndex / question / answer / answerType。question_index 非负
+    （ge=0）——不硬编码上界 6（延续「后端不镜像题库」精神，题数是前端知识；脏 index 由前端
+    契约保证，唯一约束 + 至多几条孤儿记录无严重后果）。但须加 int4 上界（lt=2**31）：DB
+    question_index 是 PG int4，超上界值会在 INSERT 时抛 DataError（未注册专用 handler → 落
+    通用 Exception → 500），加界后由 pydantic 拦成 422，把「脏 index」统一收敛到入参校验层而非
+    DB 层。question/answer 复用 _NonBlankText（strip + 1≤len≤2000，空/纯空白/超长 → 422）；
+    answer_type 用 Literal 限定，非法值自动 422。
+    """
+
+    question_index: int = Field(ge=0, lt=2**31)
+    question: _NonBlankText
+    answer: _NonBlankText
+    answer_type: Literal["option", "custom"]
+
+
+class GuidedAnswerResponse(CamelModel):
+    """引导答案资源视图（Story 2.4 AC5）：保存后回传 + 恢复列表元素。
+
+    边界自动 camelCase：id/questionIndex/question/answer/answerType/updatedAt。updated_at 经
+    UTCDateTime 序列化为带 Z 的 ISO 8601（AR5）。GET 列表端点返回 list[GuidedAnswerResponse]。
+    """
+
+    id: uuid.UUID
+    question_index: int
+    question: str
+    answer: str
+    answer_type: str
+    updated_at: UTCDateTime

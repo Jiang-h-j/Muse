@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from muse.core.errors import ErrorEnvelope
+from muse.models.exploration_message import ExplorationMessage
 from muse.models.exploration_session import ExplorationSession
 from muse.repositories import exploration_repo, project_repo
 
@@ -64,3 +65,63 @@ async def enter_exploration(
             # 唯一约束触发却重查不到：状态异常（非预期路径），交全局 handler 兜底 500。
             raise
         return existing
+
+
+async def save_guided_answer(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    question_index: int,
+    question: str,
+    answer: str,
+    answer_type: str,
+) -> ExplorationMessage:
+    """保存/更新某题位引导答案（AC5）。纯 CRUD——不调 LLM、不涉护栏、不触发整理态。
+
+    1. 租户守卫（陷阱①）：get_owned_project → None 抛 404 project_not_found（二义合一，不 403）。
+    2. get-or-create session（陷阱④）：复用 enter_exploration 幂等编排拿 session_id——作答隐含
+       探索已开始，前端即使没先调 enter 也不失败；别自造 get 判空建会话（会漏并发兜底 + mode
+       单一事实源）。
+    3. upsert 定点写该题位（重选覆盖同题位）→ commit → 返回资源。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+
+    exploration_session = await enter_exploration(
+        session, user_id=user_id, project_id=project_id
+    )
+    message = await exploration_repo.upsert_guided_answer(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        session_id=exploration_session.id,
+        question_index=question_index,
+        question=question,
+        answer=answer,
+        answer_type=answer_type,
+    )
+    await session.commit()
+    return message
+
+
+async def list_guided_answers(
+    session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
+) -> list[ExplorationMessage]:
+    """列出该作品本会话全部已答，按题位升序（AC5 恢复查询）。get-only，不 create。
+
+    1. 租户守卫同上（get_owned_project → None 抛 404）。
+    2. get session（不 create，陷阱⑨）：无会话（还没进探索/没答过）返回 []（自然空态，非 404）。
+    3. 有会话则按题位升序列出。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+
+    existing = await exploration_repo.get_session_by_project(session, user_id, project_id)
+    if existing is None:
+        return []
+    return await exploration_repo.list_guided_answers_by_session(
+        session, user_id=user_id, project_id=project_id, session_id=existing.id
+    )
