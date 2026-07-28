@@ -6,6 +6,10 @@
   Explorer Agent 把用户一句话自述凝练为该题答案，逐块 SSE 推送 delta→done→error。
 - POST /{project_id}/explore/guided/answers：保存/更新某题位引导答案（Story 2.4，幂等 upsert 200）。
 - GET  /{project_id}/explore/guided/answers：恢复本会话全部已答（Story 2.4，题位升序，空态 []）。
+- POST /{project_id}/explore/guided/settle：引导收尾触发「整理为故事设定」ARQ 后台任务（Story 2.5
+  AC2）——租户守卫 + 登记属主 + 入队 settle_guided_exploration，返 taskId，前端连 2.1 的
+  GET /api/tasks/{taskId}/events 消费 SSE（progress/占位 result/error）。非流式提交（非 interpret
+  的 EventSourceResponse）——异步模型二分 epics.md:457：settle 走 ARQ 后台任务、interpret 走流式。
 
 依赖 CurrentUser 自动完成 access token 校验并取当前 User；未登录/token 失效在依赖内 401。
 所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。
@@ -30,6 +34,7 @@ from muse.schemas.exploration import (
     GuidedAnswerResponse,
     GuidedInterpretRequest,
 )
+from muse.schemas.task import TaskSubmitResponse
 from muse.services import exploration_service, explorer_agent
 
 router = APIRouter(prefix="/api/projects", tags=["exploration"])
@@ -185,3 +190,26 @@ async def list_guided_answers(
         session, user_id=current_user.id, project_id=project_id
     )
     return [GuidedAnswerResponse.model_validate(m) for m in messages]
+
+
+@router.post(
+    "/{project_id}/explore/guided/settle", response_model=TaskSubmitResponse
+)
+async def settle_guided_exploration(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> TaskSubmitResponse:
+    """引导收尾触发「整理为故事设定」ARQ 后台任务（AC2）：提交语义，返 200 + taskId。
+
+    **非流式**（陷阱③）：这是 POST→taskId 提交（照 tasks.py:30 demo 范式），前端拿 taskId 后连
+    2.1 的 GET /api/tasks/{taskId}/events 消费 SSE——**不返 EventSourceResponse**（那是 2.3
+    interpret 的交互式流式模式；settle 是 ARQ 后台任务模式，epics.md:457 二分）。SSE 消费端点由
+    2.1 已建，本 story 复用、不重建（陷阱⑪）。
+
+    无 body（触发即整理，凝练所需数据由任务自己从库读；project_id 已在路径）；project_id 非法
+    UUID 由 FastAPI 自动 422。越权/不存在在 service 统一 404（陷阱①）。整理任务体只推占位 result
+    （真实 LLM 12 字段凝练是 Story 3.3，受控决策 B）。
+    """
+    task_id = await exploration_service.trigger_guided_settle(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return TaskSubmitResponse(task_id=task_id)

@@ -22,6 +22,7 @@ from muse.core import sse
 from muse.core.errors import ErrorEnvelope
 from muse.core.settings import get_settings
 from muse.providers.factory import get_provider_for_user
+from muse.repositories import exploration_repo
 from muse.services import usage_service
 
 logger = logging.getLogger("muse")
@@ -105,6 +106,95 @@ async def demo_generate(
         raise
 
 
+# 整理任务步数（skeleton V1：读答案 + 占位凝练 + 完成），每步一个 progress 事件。
+_SETTLE_TOTAL_STEPS = 3
+
+
+def _settle_progress(step: int) -> dict[str, object]:
+    """构造 settle 任务 progress payload（camelCase，architecture.md:336，陷阱⑦）。"""
+    return {"step": step, "percent": round(step / _SETTLE_TOTAL_STEPS * 100)}
+
+
+async def settle_guided_exploration(
+    ctx: dict, task_id: str, user_id: str, project_id: str
+) -> dict[str, object]:
+    """引导收尾「整理为故事设定」任务——**V1 是管道 skeleton，非真实凝练**（Story 2.5，AC2）。
+
+    本任务打通「触发→ARQ→SSE」异步链：分 step 推 progress、以独立 session 读本会话引导答案
+    （证明整理任务能拿到 2.4 落库的答案）、末推**占位 result**（不调 LLM）、异常推 error。
+
+    **⚠️ 真实调用 LLM 把引导答案凝练成 12 字段设定候选卡（FR12）是 Story 3.3**（epics.md:715-717
+    「接 Epic 2 Story 2.5/2.7 的 ARQ 任务」）——3.3 在下方 **step 2 替换占位为真实凝练**：喂本任务
+    读到的引导答案 → LLM → 12 字段设定候选卡，result 从占位换成 profile payload，并在调 provider
+    **之前** check_quota（护栏，承 2.1 AC6 / demo_generate step 1 范式）、接设定卡持久化/恢复
+    （Epic 3 边界 epics.md:456）。本 story 的占位 result 无消费者、跑完即弃、零副作用（前端全
+    defer、Epic 3 未实现），只为验证管道可端到端跑（受控决策 B/C）。
+
+    陷阱④：worker 独立进程/事件循环，从 ctx 取 session_maker/pub_redis（on_startup 备好），
+    **绝不复用 web 请求 session**。陷阱⑨：读答案空态（无会话/无答案）不失败，仍推 progress +
+    占位 result（answeredCount=0）——前端契约保证只在收尾态触发，但任务本身不因空答案脆弱。
+    """
+    pub: Redis = ctx["pub_redis"]
+    session_maker: async_sessionmaker = ctx["session_maker"]
+    uid = uuid.UUID(user_id)
+    pid = uuid.UUID(project_id)
+    try:
+        # ---- step 1：读本会话引导答案（证明能拿到 2.4 落的答案，供 3.3 喂 LLM）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(1))
+        async with session_maker() as session:
+            # get-only（不 create/不 commit）：skeleton 零副作用（受控决策 B）。session 为 None
+            # （还没进探索/没答过）→ answers=[]，任务仍跑通（陷阱⑨）。repo 的 where 带 user_id
+            # 天然租户隔离（属主已在触发端点校验）。
+            exploration_session = await exploration_repo.get_session_by_project(
+                session, uid, pid
+            )
+            if exploration_session is None:
+                answers = []
+            else:
+                answers = await exploration_repo.list_guided_answers_by_session(
+                    session,
+                    user_id=uid,
+                    project_id=pid,
+                    session_id=exploration_session.id,
+                )
+        answered_count = len(answers)
+
+        # ---- step 2：占位凝练（**3.3 在此替换为真实 LLM 12 字段凝练**，受控决策 B）----
+        # 不调 provider、不调 LLM、不 check_quota（skeleton 无成本，受控决策 C）；仅构造占位
+        # payload 证明管道跑通。3.3 换成：check_quota → provider 凝练 answers → profile payload。
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(2))
+
+        # ---- step 3：完成，推占位 result（camelCase，陷阱⑦）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(3))
+        payload: dict[str, object] = {
+            "taskId": task_id,
+            "status": "settle_pending",  # 3.3 就绪后换为真实 profile 状态/字段
+            "answeredCount": answered_count,
+        }
+        await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
+        return payload
+    except ErrorEnvelope as exc:
+        # 受控业务错误（3.3 引入 check_quota 后触顶 429 等）：透传面向用户的 code/message
+        # （照 demo_generate worker.py:87-93）。本 story skeleton 不主动抛 ErrorEnvelope。
+        await sse.publish_event(
+            pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001  worker 内任何异常都要推 error 事件（陷阱⑧）
+        # 原始异常仅落日志（可能含 DB 连接串/驱动错误/内部路径）；对外 error 只用固定泛化文案，
+        # 避免内部实现细节经 SSE 外泄（承 demo_generate worker.py:94-105）。
+        logger.exception(
+            "settle_guided_exploration 任务失败：task_id=%s", task_id, exc_info=exc
+        )
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_ERROR,
+            {"code": "settle_failed", "message": "整理失败，请稍后重试。"},
+        )
+        raise
+
+
 async def on_startup(ctx: dict) -> None:
     """worker 启动：建独立 async engine + session_maker + 发布用 Redis 连接（陷阱⑦）。"""
     settings = get_settings()
@@ -132,7 +222,7 @@ class WorkerSettings:
     worker 独立的 DB/Redis 连接生命周期（陷阱⑦）。
     """
 
-    functions = [demo_generate]
+    functions = [demo_generate, settle_guided_exploration]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     on_startup = on_startup
     on_shutdown = on_shutdown
