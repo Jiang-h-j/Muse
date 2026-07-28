@@ -115,9 +115,38 @@ def _stream_chunk(
     return chunk
 
 
-async def _aiter(items: list[MagicMock]):
-    for item in items:
-        yield item
+class _FakeAsyncStream:
+    """模拟 openai.AsyncStream：支持 async context manager + async 迭代 + close()。
+
+    Story 2.3 Task 4 把 DeepSeekProvider.stream() 改为 `async with await create(...) as stream:`
+    后，mock 必须模拟真实 AsyncStream 的协议：`__aenter__`/`__aexit__`（async with）+ `__aiter__`
+    （async for）+ `close()`（__aexit__ 内调，释放连接）。旧的纯 async generator（`_aiter`）只有
+    `aclose`、无 `__aenter__`/`close`，在新写法下必 AttributeError——故重构为本 fake（Task 4 ⚠️）。
+    closed 标志供测试断言早断/正常收尾时连接被释放。
+    """
+
+    def __init__(self, chunks: list[MagicMock]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aenter__(self) -> "_FakeAsyncStream":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        await self.close()
+        return False
+
+    async def __aiter__(self):
+        for item in self._chunks:
+            yield item
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _fake_create(chunks: list[MagicMock]) -> AsyncMock:
+    """构造 mock 的 `create`：await 后返回一个 _FakeAsyncStream（模拟 AsyncStream）。"""
+    return AsyncMock(return_value=_FakeAsyncStream(chunks))
 
 
 async def test_stream_distinguishes_reasoning_and_content_then_usage() -> None:
@@ -133,7 +162,7 @@ async def test_stream_distinguishes_reasoning_and_content_then_usage() -> None:
         _stream_chunk(usage=usage),  # 末 chunk：仅 usage、choices 空
     ]
     with patch("muse.providers.deepseek.AsyncOpenAI") as mock_cls:
-        mock_cls.return_value.chat.completions.create = AsyncMock(return_value=_aiter(chunks))
+        mock_cls.return_value.chat.completions.create = _fake_create(chunks)
         provider = DeepSeekProvider(api_key=_DUMMY_KEY, base_url=_DUMMY_BASE)
         events = [ev async for ev in provider.stream([{"role": "user", "content": "写"}])]
 
@@ -153,12 +182,40 @@ async def test_stream_falls_back_to_local_estimate_when_no_api_usage() -> None:
     # AC2/AC5：服务端末 chunk 未回 usage 时，流末用 count_tokens 兜底估算并标 estimated=True。
     chunks = [_stream_chunk(content="正文")]  # 无 usage chunk
     with patch("muse.providers.deepseek.AsyncOpenAI") as mock_cls:
-        mock_cls.return_value.chat.completions.create = AsyncMock(return_value=_aiter(chunks))
+        mock_cls.return_value.chat.completions.create = _fake_create(chunks)
         provider = DeepSeekProvider(api_key=_DUMMY_KEY, base_url=_DUMMY_BASE)
         events = [ev async for ev in provider.stream([{"role": "user", "content": "写"}])]
     usages = [e for e in events if isinstance(e, StreamUsage)]
     assert len(usages) == 1
     assert usages[0].estimated is True  # 兜底估算口径
+
+
+async def test_stream_closes_underlying_stream_on_full_consume() -> None:
+    # Story 2.3 Task 4：正常消费完 → async with 的 __aexit__ 释放底层连接（close 被调）。
+    usage = MagicMock()
+    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens = 1, 2, 3
+    fake_stream = _FakeAsyncStream([_stream_chunk(content="正文"), _stream_chunk(usage=usage)])
+    with patch("muse.providers.deepseek.AsyncOpenAI") as mock_cls:
+        mock_cls.return_value.chat.completions.create = AsyncMock(return_value=fake_stream)
+        provider = DeepSeekProvider(api_key=_DUMMY_KEY, base_url=_DUMMY_BASE)
+        _ = [ev async for ev in provider.stream([{"role": "user", "content": "写"}])]
+    assert fake_stream.closed is True  # 连接已释放，不泄漏
+
+
+async def test_stream_closes_underlying_stream_on_early_break() -> None:
+    # Story 2.3 Task 4/陷阱⑦：消费方早断（只取一块就 break）→ generator aclose →
+    # async with __aexit__ 仍执行 → 底层流被 close，连接不泄漏（闭合 2.1 defer①）。
+    fake_stream = _FakeAsyncStream(
+        [_stream_chunk(content="一"), _stream_chunk(content="二"), _stream_chunk(content="三")]
+    )
+    with patch("muse.providers.deepseek.AsyncOpenAI") as mock_cls:
+        mock_cls.return_value.chat.completions.create = AsyncMock(return_value=fake_stream)
+        provider = DeepSeekProvider(api_key=_DUMMY_KEY, base_url=_DUMMY_BASE)
+        agen = provider.stream([{"role": "user", "content": "写"}])
+        async for _ev in agen:
+            break  # 早断：只取第一块就停
+        await agen.aclose()  # 模拟 SSE 客户端断连触发的 generator 关闭
+    assert fake_stream.closed is True  # 早断路径也释放连接
 
 
 # ========== 离线：count_tokens 本地估算（粗估非扣费准据，AC1）==========
@@ -353,3 +410,33 @@ async def test_real_deepseek_chat_contract() -> None:
     assert result.content  # 非空正文
     assert result.total_tokens > 0  # usage 非空（记账源）
     assert result.total_tokens == result.prompt_tokens + result.completion_tokens
+
+
+@requires_deepseek
+async def test_real_deepseek_stream_contract() -> None:
+    # Story 2.3 Task 4（闭合 2.1 流式 defer②）：真打一次 DeepSeek stream，断言收到正文 delta +
+    # 末尾 StreamUsage 非空且 estimated=False——坐实 stream_options={"include_usage": True} 在真实
+    # API 生效（2.1 只离线 mock 验过两分支）。max_tokens 给足 512 避免推理档挤空正文（陷阱⑥）。
+    from muse.core.settings import get_settings
+
+    settings = get_settings()
+    provider = DeepSeekProvider(
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+    )
+    events = [
+        ev
+        async for ev in provider.stream(
+            [{"role": "user", "content": "用一句话描述修仙世界开场。"}],
+            model=settings.deepseek_model_fast,
+            max_tokens=512,
+        )
+    ]
+    content = "".join(
+        e.delta for e in events if isinstance(e, StreamChunk) and e.kind == "content"
+    )
+    usages = [e for e in events if isinstance(e, StreamUsage)]
+    assert content  # 收到非空正文 delta
+    assert len(usages) == 1  # 末尾恰一个 StreamUsage
+    assert usages[0].total_tokens > 0  # 真实 usage 非空（记账源）
+    assert usages[0].estimated is False  # 服务端确回 usage（include_usage 真实生效）

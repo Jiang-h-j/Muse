@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-27 (Story 2-2 探索会话根 get-or-create 实现完成 + code review 通过，状态 → done)
+# last_updated: 2026-07-28 (Story 2-3 code review 通过：6 patch 全部应用+验证，状态 → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -44,7 +44,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-07-27
+last_updated: 2026-07-28
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -67,7 +67,7 @@ development_status:
   epic-2: in-progress
   2-1-LLMProvider抽象-DeepSeek实现-ARQ-SSE异步底座: done
   2-2-探索会话根与模式分叉模式独立: done
-  2-3-引导探索-真实Agent理解自由作答-沉浸问答: backlog
+  2-3-引导探索-真实Agent理解自由作答-沉浸问答: done
   2-4-引导探索-翻页与答案真实持久化: backlog
   2-5-引导探索-收尾整理中过渡态: backlog
   2-6-自由探索-对话-线索区-给方向-持久化: backlog

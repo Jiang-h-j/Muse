@@ -135,32 +135,38 @@ class DeepSeekProvider(LLMProvider):
         stream_options={"include_usage": True} 请求服务端在末 chunk 附总 usage（DeepSeek/OpenAI
         兼容）。若服务端未回 usage（末 chunk 无 usage），用 count_tokens 兜底估算并标
         estimated=True，记账口径差异见 Completion Notes。
+
+        生命周期硬化（Story 2.3 Task 4，闭合 2.1 defer①）：用 `async with` 包裹 AsyncStream——
+        消费方提前断开（SSE 客户端断连 → generator aclose → GeneratorExit）或中途异常时，
+        `__aexit__` 保证底层 httpx 流响应被 close、连接归还池，不泄漏。与工厂层
+        MeteredProvider.stream 的 try/finally 兜底记账配套：底层释放连接 + 上层兜底记账，
+        早断路径既不漏连接也不漏账。
         """
         used_model = model or self._default_model
-        stream = await self._client.chat.completions.create(
+        api_usage = None
+        # 兜底估算用：累计已产出的正文/思考文本，末尾无 API usage 时据此本地粗估。
+        content_acc: list[str] = []
+        prompt_text = "".join(m.get("content", "") for m in messages)
+        async with await self._client.chat.completions.create(
             model=used_model,
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_tokens=max_tokens,
             stream=True,
             stream_options={"include_usage": True},
-        )
-        api_usage = None
-        # 兜底估算用：累计已产出的正文/思考文本，末尾无 API usage 时据此本地粗估。
-        content_acc: list[str] = []
-        prompt_text = "".join(m.get("content", "") for m in messages)
-        async for chunk in stream:
-            # include_usage 的末 chunk 通常 choices 为空、仅带 usage。
-            if chunk.usage is not None:
-                api_usage = chunk.usage
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            reasoning_delta = getattr(delta, "reasoning_content", None)
-            if reasoning_delta:
-                yield StreamChunk(delta=reasoning_delta, kind="reasoning")
-            if delta.content:
-                content_acc.append(delta.content)
-                yield StreamChunk(delta=delta.content, kind="content")
+        ) as stream:
+            async for chunk in stream:
+                # include_usage 的末 chunk 通常 choices 为空、仅带 usage。
+                if chunk.usage is not None:
+                    api_usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if reasoning_delta:
+                    yield StreamChunk(delta=reasoning_delta, kind="reasoning")
+                if delta.content:
+                    content_acc.append(delta.content)
+                    yield StreamChunk(delta=delta.content, kind="content")
         # 流末回传总 usage（AC5 流式记账用）：优先 API 回报，缺失则本地兜底估算并标记。
         if api_usage is not None:
             yield StreamUsage(
