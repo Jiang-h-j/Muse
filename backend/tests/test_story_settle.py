@@ -1,7 +1,8 @@
 """Story 3.3 验证：探索整理为 12 字段故事设定候选卡（AC 全覆盖）。
 
-本 story 把 2.5/2.7 打通的 settle 管道 skeleton 的占位凝练替换为真实 LLM 12 字段凝练，
-**emit-only**（候选卡经 SSE result 返回、不写 story_bible，持久化归 3.4/3.5）。
+本 story 把 2.5/2.7 打通的 settle 管道 skeleton 的占位凝练替换为真实 LLM 12 字段凝练。
+**Story 3.4 起 settle 从 emit-only 改为落库 pending 卡**（upsert_profile_card，本文件相应用例
+断言 settle 调用了 upsert；候选卡内容契约不变）。
 
 - 解析/组装单元（离线）：_parse_settle_response 防御性解析、genre 驱动特化、空产判定。
 - 编排单元（离线，mock get_provider_for_user + check_quota + repos，不打真实 LLM，CI 必过）：
@@ -85,13 +86,19 @@ def _session(mode: str = "guided") -> MagicMock:
 
 
 class _FakeSessionCtx:
-    """可 async with 的哑 session（repo/provider 均 mock，session 本身不被真正使用）。"""
+    """可 async with 的哑 session（repo/provider 均 mock）；commit/rollback 哑 async（3.4）。"""
 
     async def __aenter__(self) -> "object":
         return self
 
     async def __aexit__(self, *exc: object) -> bool:
         return False
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
 
 
 def _fake_session_maker() -> Callable[[], object]:
@@ -160,6 +167,11 @@ def _orchestration(
             story_settle_agent.story_bible_repo,
             "get_by_project",
             AsyncMock(return_value=bible),
+        ),
+        (
+            story_settle_agent.story_bible_repo,
+            "upsert_profile_card",
+            AsyncMock(return_value=MagicMock()),
         ),
         (
             story_settle_agent.usage_service,
@@ -256,13 +268,19 @@ async def test_settle_guided_happy_builds_card() -> None:
     uid, pid = uuid.uuid4(), uuid.uuid4()
     provider = AsyncMock()
     provider.chat = AsyncMock(return_value=_fake_chat_result(_GOOD_LLM_OUTPUT))
+    upsert = AsyncMock(return_value=MagicMock())
     with _orchestration(
         mode="guided",
         provider=provider,
         guided_answers=[_guided_answer("你想写什么故事？", "一个修仙逆袭的故事")],
         bible=None,
     ):
-        card = await story_settle_agent.settle_into_profile(user_id=uid, project_id=pid)
+        with patch.object(
+            story_settle_agent.story_bible_repo, "upsert_profile_card", new=upsert
+        ):
+            card = await story_settle_agent.settle_into_profile(
+                user_id=uid, project_id=pid
+            )
     assert card["genre"] == "修仙"
     assert card["power_system"] == "练气-筑基-金丹-元婴"
     assert card["golden_finger"] is None  # 特化未激活
@@ -270,6 +288,13 @@ async def test_settle_guided_happy_builds_card() -> None:
     # 主干 7 恒有键
     for key, _ in story_settle_agent._BACKBONE_FIELDS:
         assert key in card
+    # Story 3.4：settle 落库 pending 卡（status='pending', revision=1）。
+    upsert.assert_awaited_once()
+    kwargs = upsert.await_args.kwargs
+    assert kwargs["status"] == "pending"
+    assert kwargs["revision"] == 1
+    assert kwargs["changed_fields"] is None
+    assert kwargs["card"]["genre"] == "修仙"
 
 
 async def test_settle_free_happy_reads_messages_and_clues() -> None:

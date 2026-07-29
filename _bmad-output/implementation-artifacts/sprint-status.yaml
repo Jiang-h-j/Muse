@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-29 (Story 3-3 code review 通过 + 2 patch 修复：review → done)
+# last_updated: 2026-07-29 (Story 3-4 code review 通过 + 2 patch 修复：review → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -79,7 +79,7 @@ development_status:
   3-1-story_bible表落地12字段schema-clean-room: done
   3-2-文风锚点入口全新UI-style_profile抽取: done
   3-3-探索整理为12字段故事设定候选卡: done
-  3-4-设定候选卡编辑-反馈升版本真实Agent: backlog
+  3-4-设定候选卡编辑-反馈升版本真实Agent: done
   3-5-确认设定-只读设定圣经-回到探索丢弃: backlog
   epic-3-retrospective: optional
 

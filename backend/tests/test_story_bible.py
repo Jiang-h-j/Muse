@@ -145,3 +145,39 @@ def test_unique_bible_per_project(db_engine: Engine) -> None:
         session.add(StoryBible(user_id=user_id, project_id=project_id, genre="悬疑"))
         with pytest.raises(IntegrityError):
             session.commit()
+
+
+@requires_db
+def test_status_revision_changed_fields_defaults(db_engine: Engine) -> None:
+    """Story 3.4 新 3 列默认值：不填时 status='draft'、revision=1、changed_fields=NULL；
+    changed_fields（JSONB）可存字段名列表。status 默认 draft（非 pending）——只建行/只锚文风
+    还不是候选卡，settle 才升 pending（code review 发现 1）。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+
+    with Session(db_engine) as session:
+        session.add(StoryBible(user_id=user_id, project_id=project_id, genre="修仙"))
+        session.commit()
+
+    with Session(db_engine) as session:
+        bible = session.scalar(
+            select(StoryBible).where(StoryBible.project_id == project_id)
+        )
+        assert bible is not None
+        assert bible.status == "draft"  # server_default（非 pending）
+        assert bible.revision == 1  # server_default
+        assert bible.changed_fields is None  # 首版无变化项
+
+        # JSONB 可存字段名列表（反馈升版本 changed_fields）
+        bible.changed_fields = ["protagonist", "main_conflict"]
+        bible.status = "confirmed"
+        bible.revision = 2
+        session.commit()
+
+    with Session(db_engine) as session:
+        bible = session.scalar(
+            select(StoryBible).where(StoryBible.project_id == project_id)
+        )
+        assert bible is not None
+        assert bible.status == "confirmed"
+        assert bible.revision == 2
+        assert bible.changed_fields == ["protagonist", "main_conflict"]

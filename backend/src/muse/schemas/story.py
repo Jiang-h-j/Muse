@@ -1,8 +1,7 @@
-"""故事设定域 API schema：文风锚点抽取请求/响应（Story 3.2，AR4 camelCase 边界）。
+"""故事设定域 API schema：文风锚点抽取（3.2）、12 字段候选卡（3.3）、编辑/反馈升版本（3.4）。
 
 响应/请求继承 CamelModel，边界自动 snake_case↔camelCase（如 sample_id↔sampleId、
-style_profile↔styleProfile）。story 域 schema 起点——设定候选卡（3.3）、编辑/确认（3.4/3.5）
-的 schema 后续在本文件按需扩。
+style_profile↔styleProfile、changed_fields↔changedFields）。确认（3.5）的 schema 后续按需扩。
 """
 
 from typing import Annotated
@@ -100,4 +99,79 @@ class StoryProfileCard(CamelModel):
     faction_landscape: str | None = None
     # Muse 独有 1（读 3.2 style_profile，未锚定 None）
     style_profile: str | None = None
+
+
+class StoryProfileCardResponse(CamelModel):
+    """候选卡完整响应（Story 3.4）：12 内容字段 + 状态位（revision/changedFields/status）。
+
+    编辑（PATCH）/反馈升版本（POST revise）/恢复（GET）三端点的统一响应契约，直接从
+    story_bible ORM 行序列化（CamelModel from_attributes=True）。边界 camelCase（如
+    coreAppeal / styleProfile / changedFields）。
+
+    与 StoryProfileCard（3.3 SSE emit 纯契约）区别：本类多带 revision/changed_fields/status
+    状态位——它们是 3.4 落库后才有的概念，故独立成 response 类、不污染 3.3 的 emit 契约
+    （worker SSE result 仍用 StoryProfileCard，零改动、3.3 测试零回归）。
+    """
+
+    # 12 内容字段（同 StoryProfileCard）
+    genre: str
+    core_appeal: str
+    protagonist: str
+    main_conflict: str
+    world_rules: str
+    overall_tone: str
+    opening_hook: str
+    power_system: str | None = None
+    golden_finger: str | None = None
+    romance_line: str | None = None
+    faction_landscape: str | None = None
+    style_profile: str | None = None
+    # 状态位（3.4）
+    revision: int
+    changed_fields: list[str] | None = None
+    status: str
+
+
+class ProfileFeedbackRequest(CamelModel):
+    """反馈升版本请求（Story 3.4 AC3）：用户「你想调整什么？」的反馈文本。
+
+    边界 camelCase：feedback。非空有界——min_length=1（非空，strip 后）拦空反馈（原型
+    app.js:684 空反馈 return 不提交）；max_length 保守上界拦超长挤爆重凝练 prompt，超长即
+    422 挡在进 LLM 前（同 _SampleText 超长防护思路）。
+    """
+
+    feedback: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
+    ]
+
+
+class ProfileCardEditRequest(CamelModel):
+    """直接编辑候选卡请求（Story 3.4 AC2）：12 内容字段全可选，只改传入的字段值。
+
+    边界 camelCase（coreAppeal 等）。全字段 `str | None`（默认 None=不改该字段）——model 只
+    暴露 12 内容字段、不含 status/revision/changedFields，天然防越权改状态位（受控决策 3）。
+    service 侧 update_card_fields 仅对非 None 字段写值、revision 不变。允许编辑 style_profile
+    文本（原型第⑫字段亦 contenteditable，story 待确认项 5）。
+    """
+
+    genre: str | None = None
+    core_appeal: str | None = None
+    protagonist: str | None = None
+    main_conflict: str | None = None
+    world_rules: str | None = None
+    overall_tone: str | None = None
+    opening_hook: str | None = None
+    power_system: str | None = None
+    golden_finger: str | None = None
+    romance_line: str | None = None
+    faction_landscape: str | None = None
+    style_profile: str | None = None
+
+    def to_fields(self) -> dict[str, str]:
+        """收集用户实际传入（非 None）的字段为 {snake_case 列名: 值}，供 service 定点更新。"""
+        return {
+            key: value
+            for key, value in self.model_dump().items()
+            if value is not None
+        }
 
