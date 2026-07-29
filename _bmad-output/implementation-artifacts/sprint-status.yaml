@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-29 (Story 2-6 code review 通过 + 8 项 patch 修复完成：review → done)
+# last_updated: 2026-07-29 (Story 2-7 code review 通过 + 1 项 patch 修复：review → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -71,7 +71,7 @@ development_status:
   2-4-引导探索-翻页与答案真实持久化: done
   2-5-引导探索-收尾整理中过渡态: done
   2-6-自由探索-对话-线索区-给方向-持久化: done
-  2-7-自由探索-整理为故事设定开放门禁: backlog
+  2-7-自由探索-整理为故事设定开放门禁: done
   epic-2-retrospective: optional
 
   # ---------- Epic 3: 故事设定与文风锚点 ----------

@@ -174,3 +174,31 @@ async def list_free_messages_by_session(
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
+
+async def has_free_user_message(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> bool:
+    """本会话是否存在至少 1 条自由对话「用户」消息（2.7 AC4 门禁近似的布尔判定）。
+
+    门禁只需布尔存在性判定，用 `exists()` 而非拉回全部消息再 `len()`（后者是恢复列表用途、
+    语义不同勿复用）。where 显式带 user_id + project_id + session_id（租户守卫 NFR3），过滤
+    `kind="free"` + `role="user"`——只数真正的用户发言，Agent 回复与引导题位不计。
+    """
+    stmt = select(
+        select(ExplorationMessage.id)
+        .where(
+            ExplorationMessage.user_id == user_id,
+            ExplorationMessage.project_id == project_id,
+            ExplorationMessage.session_id == session_id,
+            ExplorationMessage.kind == "free",
+            ExplorationMessage.role == "user",
+        )
+        .exists()
+    )
+    result = await session.execute(stmt)
+    return bool(result.scalar())
+

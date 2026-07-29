@@ -19,6 +19,11 @@ free_explorer_agent）。
 - PATCH/DELETE /{project_id}/explore/free/clues/{clue_id}：编辑/删除线索（删除仅限自定义线索）。
 - POST /{project_id}/explore/free/clues/refresh：Agent 依对话自动整理线索（Story 2.6 AC5，硬 AC）
   ——同步调用，只更新未被用户编辑的预设槙位。
+- POST /{project_id}/explore/free/settle：自由探索触发「整理为故事设定」ARQ 后台任务（Story 2.7
+  AC3/AC4）——租户守卫 + **门禁硬校验**（本会话须至少 1 条 free 用户消息，否则 400
+  exploration_not_ready）+ 登记属主 + 入队 settle_guided_exploration，返 taskId，前端连 2.1 的
+  GET /api/tasks/{taskId}/events 消费 SSE。非流式提交（同 guided/settle，异步模型二分见 epics）。
+  门禁硬校验是本 story 相对 2.5 的差异（FR10「补足信息才开放」+ 2.6「不止于前端」先例）。
 
 依赖 CurrentUser 自动完成 access token 校验并取当前 User；未登录/token 失效在依赖内 401。
 所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。guided/free
@@ -423,4 +428,33 @@ async def refresh_clues(
         session, user_id=current_user.id, project_id=project_id
     )
     return [ClueResponse.model_validate(c) for c in clues]
+
+
+@router.post(
+    "/{project_id}/explore/free/settle", response_model=TaskSubmitResponse
+)
+async def settle_free_exploration(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> TaskSubmitResponse:
+    """自由探索触发「整理为故事设定」ARQ 后台任务（AC3/AC4）：提交语义，返 200 + taskId。
+
+    **非流式**（陷阱③）：POST→taskId 提交（同 guided/settle），前端拿 taskId 后连 2.1 的
+    GET /api/tasks/{taskId}/events 消费 SSE——**不返 EventSourceResponse**（那是 interpret /
+    free/messages 的交互式流式模式；settle 是 ARQ 后台任务模式，epics.md:457 二分）。SSE 消费
+    端点由 2.1 已建，本 story 复用、不重建（陷阱⑪）。
+
+    **门禁硬校验（AC4，本 story 相对 2.5 的差异）**：service 层在租户守卫 + mode 守卫之后，再校验
+    本会话至少有 1 条 free 用户消息，否则 400 exploration_not_ready（不入队、不登记属主、不返
+    taskId）。门禁「补足信息才开放」是 user story 核心 benefit（FR10），且延续 2.6「模式独立在数据
+    写入层真正落地不止于前端」先例，故后端做实（前端 disabled + 后端 400 双防线）。
+
+    无 body（触发即整理，凝练所需数据由任务自己从库读；project_id 已在路径）；project_id 非法
+    UUID 由 FastAPI 自动 422。越权/不存在在 service 统一 404（陷阱①，先于门禁）。整理任务体复用
+    settle_guided_exploration skeleton（占位 result），真实 12 字段凝练是 Story 3.3（受控决策 B）。
+    """
+    task_id = await exploration_service.trigger_free_settle(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return TaskSubmitResponse(task_id=task_id)
+
 

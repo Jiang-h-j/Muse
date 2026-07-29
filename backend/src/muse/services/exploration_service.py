@@ -69,6 +69,25 @@ def _require_project_mode(project: Project, expected_mode: str) -> None:
         )
 
 
+def _exploration_not_ready() -> ErrorEnvelope:
+    """自由探索「整理为故事设定」门禁未满足（2.7 AC4）：本会话尚无用户消息。
+
+    用 400（前置条件未满足）而非 409/404——这既非「模式不匹配」（409）也非「不存在/不属于我」
+    （404），而是「对话内容不足、门禁未开放」的前置条件未满足。message 直接复用原型 formingHint
+    未开放态文案（prototype/app/app.js:904），保证前端 disabled 态与后端 400 态文案一致。
+
+    这是本 story 相对 2.5 guided settle 的显式差异：2.5 不校验是否有引导答案（受控决策 C），本
+    story 因门禁「补足信息才开放」是 user story 核心 benefit（FR10）、且延续 2.6「模式独立在数据
+    写入层真正落地不止于前端」的先例，故后端做实门禁（前端 disabled + 后端 400 双防线）。
+    """
+    return ErrorEnvelope(
+        code="exploration_not_ready",
+        message="继续和 Agent 讨论，线索足够时就能整理为故事设定。",
+        http_status=400,
+    )
+
+
+
 async def enter_exploration(
     session: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> ExplorationSession:
@@ -213,6 +232,66 @@ async def trigger_guided_settle(
         # 先登记属主（SSE 鉴权依据），再入队——顺序保证 SSE 端点总能读到属主（陷阱②）。
         await sse.register_task_owner(pool, task_id, uid)
         # _job_id=task_id：stable id 作 pubsub 频道键；user_id/project_id 传给 worker 供读答案。
+        await pool.enqueue_job(
+            "settle_guided_exploration", task_id, uid, pid, _job_id=task_id
+        )
+    finally:
+        await pool.aclose()
+    return task_id
+
+
+async def trigger_free_settle(
+    session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
+) -> str:
+    """自由探索触发「整理为故事设定」ARQ 后台任务（2.7 AC3/AC4）。返回 taskId 供前端连 SSE。
+
+    结构照搬 `trigger_guided_settle`，仅两点差异：① mode 守卫要求 free；② **门禁硬校验**（AC4）
+    ——2.5 guided settle 不校验是否有答案（受控决策 C），本 story 因门禁是 user story 核心 benefit
+    （FR10「须补足信息才开放」）且延续 2.6「模式独立在数据写入层真正落地」先例，后端做实门禁。
+
+    1. 租户守卫（陷阱①）：get_owned_project → None 抛 project_not_found 404（二义合一，NFR3）。
+    2. mode 守卫（AC7）：project.mode 须为 free，否则 409 mode_mismatch。
+    3. **门禁硬校验（AC4）**：本会话须至少有 1 条 free 用户消息，否则 400 exploration_not_ready。
+       无会话（还没进探索）视为无消息、门禁不通过。门禁在入队前——不满足则不建 Redis 池、不登记
+       属主、不入队（越权/不存在先于门禁返 404，不泄露存在性）。
+    4. task_id = uuid4 hex（不可枚举，陷阱⑤）。
+    5. register_task_owner **必须在 enqueue_job 之前**（陷阱②）：否则 worker 可能在属主键写入前
+       发首个事件、SSE 端点鉴权读不到属主而对合法属主误返 404。
+    6. **复用既有 `settle_guided_exploration` 任务**（worker.py，mode-agnostic skeleton）：free 会话
+       无 guided 答案 → answeredCount=0，任务仍跑通推 progress×3 + 占位 result（陷阱⑨空态兜底）。
+       V1 两者产出都是占位、无消费者、跑完即弃；真实凝练（读 free 对话/线索 → LLM → 12 字段候选卡）
+       归 Story 3.3（epics.md:715-717「接 2.5/2.7 的 ARQ 任务」），届时若逻辑分叉再由 3.3 决定拆分。
+
+    **不做**（受控决策 B/C）：不 check_quota（skeleton 无 LLM 调用、无成本，护栏随 3.3 落地）、
+    不生成设定卡（Epic 3）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    # 门禁硬校验（AC4）：无会话 → 无消息 → 门禁不通过；有会话则判是否有 free 用户消息。
+    exploration_session = await exploration_repo.get_session_by_project(
+        session, user_id, project_id
+    )
+    if exploration_session is None or not await exploration_repo.has_free_user_message(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        session_id=exploration_session.id,
+    ):
+        raise _exploration_not_ready()
+
+    settings = get_settings()
+    task_id = uuid.uuid4().hex
+    uid = str(user_id)
+    pid = str(project_id)
+
+    pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    try:
+        # 先登记属主（SSE 鉴权依据），再入队——顺序保证 SSE 端点总能读到属主（陷阱②）。
+        await sse.register_task_owner(pool, task_id, uid)
+        # 复用 settle_guided_exploration（mode-agnostic skeleton，free 会话空 guided 答案照跑）。
         await pool.enqueue_job(
             "settle_guided_exploration", task_id, uid, pid, _job_id=task_id
         )
