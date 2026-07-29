@@ -113,8 +113,64 @@ async def list_guided_answers_by_session(
             ExplorationMessage.user_id == user_id,
             ExplorationMessage.project_id == project_id,
             ExplorationMessage.session_id == session_id,
+            ExplorationMessage.kind == "guided",
         )
         .order_by(ExplorationMessage.question_index.asc())
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def append_free_message(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+    role: str,
+    content: str,
+) -> ExplorationMessage:
+    """追加一条自由对话消息（2.6 AC2/AC6）。纯追加、无定点覆盖语义（与引导答案 upsert 不同）。
+
+    只 flush 不 commit（事务边界归 service）——`free_explorer_agent.stream_free_chat` 依赖
+    「用户消息与 Agent 回复分两次独立 commit」来避免同一事务内 `func.now()` 求值坍缩为相同
+    `created_at`（Dev Notes 已论证），故本函数刻意不越权提交。
+    """
+    message = ExplorationMessage(
+        user_id=user_id,
+        project_id=project_id,
+        session_id=session_id,
+        kind="free",
+        role=role,
+        content=content,
+    )
+    session.add(message)
+    await session.flush()
+    return message
+
+
+async def list_free_messages_by_session(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> list[ExplorationMessage]:
+    """列出该会话全部自由对话消息，按 created_at 升序、id 二级排序兜底（2.6 AC6）。
+
+    二级排序是防御性 tie-break（Dev Notes）：分两次 commit 已能保证不同事务时刻，此处仅兜底
+    理论上的同值场景，零额外成本。where 显式带 user_id（租户守卫，NFR3）。
+    """
+    stmt = (
+        select(ExplorationMessage)
+        .where(
+            ExplorationMessage.user_id == user_id,
+            ExplorationMessage.project_id == project_id,
+            ExplorationMessage.session_id == session_id,
+            ExplorationMessage.kind == "free",
+        )
+        .order_by(ExplorationMessage.created_at.asc(), ExplorationMessage.id.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+

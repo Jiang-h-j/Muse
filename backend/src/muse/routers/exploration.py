@@ -1,4 +1,5 @@
-"""探索路由（AR2：router 仅校验入参 + 分发，业务在 exploration_service / explorer_agent）。
+"""探索路由（AR2：router 仅校验入参 + 分发，业务在 exploration_service / explorer_agent /
+free_explorer_agent）。
 
 探索挂在 project 层级下（prefix /api/projects）：
 - POST /{project_id}/explore：进入探索（get-or-create 语义，Story 2.2）。
@@ -10,32 +11,47 @@
   AC2）——租户守卫 + 登记属主 + 入队 settle_guided_exploration，返 taskId，前端连 2.1 的
   GET /api/tasks/{taskId}/events 消费 SSE（progress/占位 result/error）。非流式提交（非 interpret
   的 EventSourceResponse）——异步模型二分 epics.md:457：settle 走 ARQ 后台任务、interpret 走流式。
+- POST /{project_id}/explore/free/messages：自由对话一轮，流式 SSE（Story 2.6 AC2/AC6）——真实
+  Free Explorer Agent 多轮对话，delta→done→error，用户消息与 Agent 回复均真实落库。
+- GET  /{project_id}/explore/free/messages：恢复本会话全部自由对话消息（Story 2.6 AC6，创建时间
+  升序，空态 []）。
+- GET/POST /{project_id}/explore/free/clues：列出/新增自定义故事线索（Story 2.6 AC3/AC6）。
+- PATCH/DELETE /{project_id}/explore/free/clues/{clue_id}：编辑/删除线索（删除仅限自定义线索）。
+- POST /{project_id}/explore/free/clues/refresh：Agent 依对话自动整理线索（Story 2.6 AC5，硬 AC）
+  ——同步调用，只更新未被用户编辑的预设槙位。
 
 依赖 CurrentUser 自动完成 access token 校验并取当前 User；未登录/token 失效在依赖内 401。
-所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。
+所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。guided/free
+两模式端点互相串门返 409 mode_mismatch（Story 2.6 AC7，mode 守卫在 service 层）。
 
-交互式流式（受控决策 B，epics.md:457）：interpret 走**直连 provider.stream** 逐块推
-（EventSourceResponse over async gen），**不走 ARQ 的 POST→taskId→GET /events 那套**（那是批量
-后台任务模式，2.5/2.7 用）——故不引入 Redis/worker，仅复用 core/sse.format_sse_event 纯编码。
+交互式流式（受控决策 B，epics.md:457）：interpret / free/messages 走**直连 provider.stream**
+逐块推（EventSourceResponse over async gen），**不走 ARQ 的 POST→taskId→GET /events 那套**（那是
+批量后台任务模式，2.5/2.7 用）——故不引入 Redis/worker，仅复用 core/sse.format_sse_event 纯编码。
+线索整理（free/clues/refresh）同属此类：一次性结构化提炼、非长时生成，同步端点即可。
 """
 
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter
+from fastapi import APIRouter, status
 from sse_starlette.sse import EventSourceResponse
 
 from muse.core import sse
 from muse.core.deps import CurrentUser, SessionDep
 from muse.core.errors import ErrorEnvelope, logger
 from muse.schemas.exploration import (
+    ClueCreateRequest,
+    ClueEditRequest,
+    ClueResponse,
     ExplorationSessionResponse,
+    FreeMessageRequest,
+    FreeMessageResponse,
     GuidedAnswerRequest,
     GuidedAnswerResponse,
     GuidedInterpretRequest,
 )
 from muse.schemas.task import TaskSubmitResponse
-from muse.services import exploration_service, explorer_agent
+from muse.services import exploration_service, explorer_agent, free_explorer_agent
 
 router = APIRouter(prefix="/api/projects", tags=["exploration"])
 
@@ -213,3 +229,198 @@ async def settle_guided_exploration(
         session, user_id=current_user.id, project_id=project_id
     )
     return TaskSubmitResponse(task_id=task_id)
+
+
+def _free_chat_event_stream(
+    *, user_id: uuid.UUID, project_id: uuid.UUID, user_message: str
+) -> AsyncIterator[dict[str, str]]:
+    """把 Free Explorer Agent 的正文增量编码为 SSE 事件流：delta×N → done →（异常时）error。
+
+    结构照搬 `_interpret_event_stream`（Dev Notes「SSE 编码范式照搬」），只替换调用的编排
+    函数（`stream_free_chat` 替代 `interpret_guided_answer`）：delta 累积正文块、空产兜底
+    改发 error（不发空 done）、ErrorEnvelope 透传 code/message、未预期异常泛化为
+    generate_failed + 日志记完整栈但不外泄。
+    """
+
+    async def _gen() -> AsyncIterator[dict[str, str]]:
+        parts: list[str] = []
+        try:
+            async for delta in free_explorer_agent.stream_free_chat(
+                user_id=user_id,
+                project_id=project_id,
+                user_message=user_message,
+            ):
+                parts.append(delta)
+                yield sse.format_sse_event("delta", {"text": delta})
+            answer = "".join(parts)
+            if not answer.strip():
+                logger.warning("自由对话流式产出为空，改发 error 而非空 done")
+                yield sse.format_sse_event(
+                    "error",
+                    {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+                )
+                return
+            yield sse.format_sse_event("done", {"text": answer})
+        except ErrorEnvelope as exc:
+            logger.warning("自由对话流式失败（业务错误）：%s", exc.code)
+            yield sse.format_sse_event(
+                "error", {"code": exc.code, "message": exc.message}
+            )
+        except Exception:
+            logger.exception("自由对话流式失败（未预期错误）")
+            yield sse.format_sse_event(
+                "error",
+                {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+            )
+
+    return _gen()
+
+
+@router.post("/{project_id}/explore/free/messages")
+async def send_free_message(
+    project_id: uuid.UUID,
+    payload: FreeMessageRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> EventSourceResponse:
+    """自由对话一轮流式 SSE（AC2/AC6）：真实 Free Explorer Agent 多轮对话。
+
+    **先预检再建流**（同 interpret 范式）：EventSourceResponse 一旦返回即提交 HTTP 200，之后
+    无法再改状态码。故租户 404 / mode 守卫 409 / 护栏 429 在此**预检阶段**用请求 session 校验；
+    预检通过后才返回 SSE 流。流内错误走 error 事件。流式生成用独立 session 自管
+    （free_explorer_agent，陷阱⑩），不占用此请求 session。
+    """
+    await free_explorer_agent.preflight_free_chat(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return EventSourceResponse(
+        _free_chat_event_stream(
+            user_id=current_user.id,
+            project_id=project_id,
+            user_message=payload.content,
+        )
+    )
+
+
+@router.get(
+    "/{project_id}/explore/free/messages",
+    response_model=list[FreeMessageResponse],
+)
+async def list_free_messages(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> list[FreeMessageResponse]:
+    """恢复本会话全部自由对话消息（AC6）：按创建时间升序；空会话/无消息返 []（200，非 404）。
+
+    越权/不存在在 service 统一 404；mode 不匹配 409；非法 UUID 自动 422。供前端进自由探索页
+    回填对话记录（前端接线 defer 至前端集成切片，受控决策 A）。
+    """
+    messages = await exploration_service.list_free_messages(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return [FreeMessageResponse.model_validate(m) for m in messages]
+
+
+@router.get(
+    "/{project_id}/explore/free/clues",
+    response_model=list[ClueResponse],
+)
+async def list_clues(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> list[ClueResponse]:
+    """列出本会话全部故事线索（预设槙位 + 自定义，AC3/AC6）：按 display_order 升序；空态 []。"""
+    clues = await exploration_service.list_clues(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return [ClueResponse.model_validate(c) for c in clues]
+
+
+@router.post(
+    "/{project_id}/explore/free/clues",
+    response_model=ClueResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_custom_clue(
+    project_id: uuid.UUID,
+    payload: ClueCreateRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> ClueResponse:
+    """新增自定义故事线索（AC3）：201，display_order 取本会话现有最大值 +1。"""
+    clue = await exploration_service.create_custom_clue(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        label=payload.label,
+        value=payload.value,
+    )
+    return ClueResponse.model_validate(clue)
+
+
+@router.patch(
+    "/{project_id}/explore/free/clues/{clue_id}",
+    response_model=ClueResponse,
+)
+async def edit_clue(
+    project_id: uuid.UUID,
+    clue_id: uuid.UUID,
+    payload: ClueEditRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> ClueResponse:
+    """编辑线索（AC3）：置 user_edited=true（AC5「用户编辑优先」的写入侧）。value 允许空串
+    （代表清空为「尚未确定」，占位逻辑在前端）；label 提供时才改名并校验非空有界——但 preset
+    线索的 label 不可改（400 preset_label_immutable，其固定中文标签是整理端点匹配键）。
+    """
+    clue = await exploration_service.edit_clue(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        clue_id=clue_id,
+        value=payload.value,
+        label=payload.label,
+    )
+    return ClueResponse.model_validate(clue)
+
+
+@router.delete(
+    "/{project_id}/explore/free/clues/{clue_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_clue(
+    project_id: uuid.UUID,
+    clue_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> None:
+    """删除自定义线索（AC3）：仅限 kind="custom"，preset 尝试删除返 400 clue_not_deletable
+    （同 delete_project/byok 既有约定，204 无响应体）。
+    """
+    await exploration_service.delete_clue(
+        session, user_id=current_user.id, project_id=project_id, clue_id=clue_id
+    )
+
+
+@router.post(
+    "/{project_id}/explore/free/clues/refresh",
+    response_model=list[ClueResponse],
+)
+async def refresh_clues(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> list[ClueResponse]:
+    """Agent 依对话自动整理线索（AC5，硬 AC）：同步端点、非 ARQ——一次性结构化提炼，非长时生成。
+
+    只更新未被用户编辑（user_edited=false）的预设槙位；自定义线索永不被本端点触碰。无副作用地
+    反复调用是安全的（重复调用幂等收敛）。触发时机（每轮对话后自动调用还是用户点按钮）是前端
+    编排决定，defer 至前端集成切片——本端点只交付可被随时安全调用的整理原语。
+
+    返回整理后的完整线索列表（而非仅更新的槙位映射）：前端据此一次性刷新整个线索区，无需
+    再额外调 GET clues。
+    """
+    await free_explorer_agent.extract_clues(
+        user_id=current_user.id, project_id=project_id
+    )
+    clues = await exploration_service.list_clues(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return [ClueResponse.model_validate(c) for c in clues]
+

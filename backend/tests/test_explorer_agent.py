@@ -32,6 +32,13 @@ from tests.conftest import requires_db
 _client = TestClient(app, raise_server_exceptions=False)
 
 
+def _guided_project() -> MagicMock:
+    """假 project 对象：只需支持 `.mode == "guided"`（承 2.6 AC7 加的 mode 守卫）。"""
+    p = MagicMock()
+    p.mode = "guided"
+    return p
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _client_lifespan() -> "object":
     """上下文管理器模式跑 TestClient：所有请求共享同一持久事件循环（与 test_exploration 同源）。"""
@@ -61,7 +68,7 @@ async def test_interpret_yields_content_only_drops_reasoning_and_usage() -> None
         patch.object(
             explorer_agent.project_repo,
             "get_owned_project",
-            new=AsyncMock(return_value=MagicMock()),
+            new=AsyncMock(return_value=_guided_project()),
         ),
         patch.object(explorer_agent.usage_service, "check_quota", new=AsyncMock()),
         patch.object(
@@ -95,7 +102,7 @@ async def test_interpret_quota_exceeded_blocks_before_provider() -> None:
         patch.object(
             explorer_agent.project_repo,
             "get_owned_project",
-            new=AsyncMock(return_value=MagicMock()),
+            new=AsyncMock(return_value=_guided_project()),
         ),
         patch.object(
             explorer_agent.usage_service,
@@ -165,7 +172,7 @@ async def test_interpret_builds_messages_with_system_prompt_and_free_text() -> N
         patch.object(
             explorer_agent.project_repo,
             "get_owned_project",
-            new=AsyncMock(return_value=MagicMock()),
+            new=AsyncMock(return_value=_guided_project()),
         ),
         patch.object(explorer_agent.usage_service, "check_quota", new=AsyncMock()),
         patch.object(

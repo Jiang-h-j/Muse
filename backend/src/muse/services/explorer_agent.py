@@ -86,11 +86,14 @@ async def preflight_interpret(
 
     - 租户守卫（陷阱③，承 2.2 二义合一 404）：project 不属当前 user 即 404，不区分「不属于我」
       与「不存在」、不写 403，复用 exploration_service 的 404，勿新造 code。
+    - mode 守卫（AC7，2.4 code review defer 至 2.6 定档）：project.mode 须为 guided，否则 409
+      mode_mismatch——自由探索项目调引导专属端点直接拦，不再静默放行。
     - 护栏（陷阱②，承 2.1 AC6）：托管触顶抛 429 不进生成、BYOK 短路放行。
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
         raise exploration_service._exploration_not_found()
+    exploration_service._require_project_mode(project, "guided")
     await usage_service.check_quota(session, user_id)
 
 
@@ -119,6 +122,7 @@ async def interpret_guided_answer(
         project = await project_repo.get_owned_project(session, project_id, user_id)
         if project is None:
             raise exploration_service._exploration_not_found()
+        exploration_service._require_project_mode(project, "guided")
 
         # 2. 护栏（陷阱②）：**必须在构造/调用 provider 之前**。托管触顶抛 429 不进生成。
         await usage_service.check_quota(session, user_id)

@@ -2,7 +2,8 @@
 
 enter_exploration 是「进入探索」的 get-or-create 编排：先校验 project 属当前 user
 （越权=不存在，统一 404），已有会话直接返回（AC1 幂等 / AC3 mode 不改写），否则以
-project.mode 建会话（AC2 单一事实源）并 commit。
+project.mode 建会话（AC2 单一事实源）并 commit；若新建会话且 mode=free，同一事务内额外
+播种 4 个预设线索槙位（Story 2.6 AC3）。
 
 并发竞态（陷阱②）：两请求同时 miss→双 insert，第二条撞 (user_id, project_id) 唯一约束
 IntegrityError；此层 rollback 后重查返回已存在会话——只靠应用层「先查后建」在并发下必漏
@@ -23,7 +24,19 @@ from muse.core.errors import ErrorEnvelope
 from muse.core.settings import get_settings
 from muse.models.exploration_message import ExplorationMessage
 from muse.models.exploration_session import ExplorationSession
-from muse.repositories import exploration_repo, project_repo
+from muse.models.project import Project
+from muse.models.story_clue import StoryClue
+from muse.repositories import exploration_repo, project_repo, story_clue_repo
+
+# 4 个预设线索槙位：(clue_key, 中文标签)，进入自由探索首次建会话时播种（AC3）。
+# 顺序即 display_order 0-3，与 free_explorer_agent.PRESET_CLUE_KEYS 定义一致（勿改动顺序，
+# 两处各自维护但语义须对齐——见 Dev Agent Record 说明本 story 在何处保证一致）。
+_PRESET_CLUES: list[tuple[str, str]] = [
+    ("opening", "最初的念头"),
+    ("protagonist", "主角"),
+    ("conflict", "核心冲突"),
+    ("world", "世界与氛围"),
+]
 
 
 def _exploration_not_found() -> ErrorEnvelope:
@@ -35,6 +48,25 @@ def _exploration_not_found() -> ErrorEnvelope:
         message="作品不存在。",
         http_status=404,
     )
+
+
+def _require_project_mode(project: Project, expected_mode: str) -> None:
+    """mode 边界守卫（AC7，2.4 code review defer 至本 story 定档）。
+
+    guided/free 两模式端点互相串门时拦下：project 确实存在、确实属于我，只是这个操作
+    与当前探索模式不匹配——是「模式不匹配」的领域事实，不是「不存在/不属于我」，故不复用
+    404 二义合一（那是租户/存在性语义），改用 409（幂等性冲突语义，仿 REST 惯例）。
+
+    直接查 `project.mode`（单一事实源，2.2 AC2/AC3 建后不可改写）而非 `exploration_session.mode`
+    ——省一次查询，也规避「会话尚未创建时如何判断 mode」的假问题；调用方已持有 `get_owned_project`
+    查出的 project，本函数零额外 IO。
+    """
+    if project.mode != expected_mode:
+        raise ErrorEnvelope(
+            code="mode_mismatch",
+            message="该操作与当前探索模式不匹配。",
+            http_status=409,
+        )
 
 
 async def enter_exploration(
@@ -58,6 +90,16 @@ async def enter_exploration(
         created = await exploration_repo.create_session(
             session, user_id=user_id, project_id=project_id, mode=project.mode
         )
+        # 新建会话且 mode=free：同一事务内额外播种 4 个预设线索槙位（AC3）。已存在会话
+        # 走上面第 2 步直接 return，不会重复播种（幂等，同 AC1 既有精神）。
+        if project.mode == "free":
+            await story_clue_repo.seed_preset_clues(
+                session,
+                user_id=user_id,
+                project_id=project_id,
+                session_id=created.id,
+                presets=_PRESET_CLUES,
+            )
         await session.commit()
         return created
     except IntegrityError:
@@ -84,14 +126,16 @@ async def save_guided_answer(
     """保存/更新某题位引导答案（AC5）。纯 CRUD——不调 LLM、不涉护栏、不触发整理态。
 
     1. 租户守卫（陷阱①）：get_owned_project → None 抛 404 project_not_found（二义合一，不 403）。
-    2. get-or-create session（陷阱④）：复用 enter_exploration 幂等编排拿 session_id——作答隐含
+    2. mode 守卫（AC7）：project.mode 须为 guided，否则 409 mode_mismatch。
+    3. get-or-create session（陷阱④）：复用 enter_exploration 幂等编排拿 session_id——作答隐含
        探索已开始，前端即使没先调 enter 也不失败；别自造 get 判空建会话（会漏并发兜底 + mode
        单一事实源）。
-    3. upsert 定点写该题位（重选覆盖同题位）→ commit → 返回资源。
+    4. upsert 定点写该题位（重选覆盖同题位）→ commit → 返回资源。
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
         raise _exploration_not_found()
+    _require_project_mode(project, "guided")
 
     exploration_session = await enter_exploration(
         session, user_id=user_id, project_id=project_id
@@ -116,12 +160,14 @@ async def list_guided_answers(
     """列出该作品本会话全部已答，按题位升序（AC5 恢复查询）。get-only，不 create。
 
     1. 租户守卫同上（get_owned_project → None 抛 404）。
-    2. get session（不 create，陷阱⑨）：无会话（还没进探索/没答过）返回 []（自然空态，非 404）。
-    3. 有会话则按题位升序列出。
+    2. mode 守卫（AC7）：project.mode 须为 guided，否则 409 mode_mismatch。
+    3. get session（不 create，陷阱⑨）：无会话（还没进探索/没答过）返回 []（自然空态，非 404）。
+    4. 有会话则按题位升序列出。
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
         raise _exploration_not_found()
+    _require_project_mode(project, "guided")
 
     existing = await exploration_repo.get_session_by_project(session, user_id, project_id)
     if existing is None:
@@ -142,10 +188,11 @@ async def trigger_guided_settle(
 
     1. 租户守卫（陷阱①）：get_owned_project → None 抛 project_not_found 404（二义合一，不 403、
        不区分「不属于我」与「不存在」，消除 IDOR 侦察面 NFR3）。复用 _exploration_not_found()。
-    2. taskId = uuid4 hex（不可枚举，陷阱⑤，与 tasks.py:38 同款）。
-    3. register_task_owner **必须在 enqueue_job 之前**（陷阱②，tasks.py:43-47 已论证）：否则
+    2. mode 守卫（AC7）：project.mode 须为 guided，否则 409 mode_mismatch。
+    3. taskId = uuid4 hex（不可枚举，陷阱⑤，与 tasks.py:38 同款）。
+    4. register_task_owner **必须在 enqueue_job 之前**（陷阱②，tasks.py:43-47 已论证）：否则
        worker 可能在属主键写入前就发首个事件、SSE 端点鉴权读不到属主而对合法属主误返 404。
-    4. ARQ pool 每次 create_pool + aclose（照搬 tasks.py:41-49 spike 范式，应用级复用池待需要
+    5. ARQ pool 每次 create_pool + aclose（照搬 tasks.py:41-49 spike 范式，应用级复用池待需要
        时再优化）；user_id/project_id 以 str 位置参数传给 worker（任务自己读答案凝练）。
 
     **不做**（受控决策 B/C）：不 check_quota（skeleton 任务无 LLM 调用、无成本，护栏随 3.3 真实
@@ -154,6 +201,7 @@ async def trigger_guided_settle(
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
         raise _exploration_not_found()
+    _require_project_mode(project, "guided")
 
     settings = get_settings()
     task_id = uuid.uuid4().hex
@@ -171,3 +219,158 @@ async def trigger_guided_settle(
     finally:
         await pool.aclose()
     return task_id
+
+
+async def list_free_messages(
+    session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
+) -> list[ExplorationMessage]:
+    """列出该作品本会话全部自由对话消息，按创建时间升序（AC6 恢复查询）。get-only，不 create。
+
+    1. 租户守卫（get_owned_project → None 抛 404）。
+    2. mode 守卫（AC7）：project.mode 须为 free，否则 409 mode_mismatch。
+    3. get session（不 create，同 list_guided_answers 陷阱⑨范式）：无会话返回 []（自然空态）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    existing = await exploration_repo.get_session_by_project(session, user_id, project_id)
+    if existing is None:
+        return []
+    return await exploration_repo.list_free_messages_by_session(
+        session, user_id=user_id, project_id=project_id, session_id=existing.id
+    )
+
+
+async def list_clues(
+    session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
+) -> list[StoryClue]:
+    """列出该作品本会话全部故事线索，按 display_order 升序（AC3/AC6）。get-only，不 create。
+
+    无会话（未进入自由探索）返回 []（自然空态，同 list_free_messages 范式）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    existing = await exploration_repo.get_session_by_project(session, user_id, project_id)
+    if existing is None:
+        return []
+    return await story_clue_repo.list_clues_by_session(
+        session, user_id=user_id, project_id=project_id, session_id=existing.id
+    )
+
+
+async def create_custom_clue(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    label: str,
+    value: str,
+) -> StoryClue:
+    """新增自定义线索（AC3）：未进入自由探索无从新增，写操作先 get-or-create 会话
+    （同「先 enter 后写」既有约定，仿 save_guided_answer 对 guided 会话的处理）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    exploration_session = await enter_exploration(
+        session, user_id=user_id, project_id=project_id
+    )
+    clue = await story_clue_repo.create_custom_clue(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        session_id=exploration_session.id,
+        label=label,
+        value=value,
+    )
+    await session.commit()
+    return clue
+
+
+async def edit_clue(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    clue_id: uuid.UUID,
+    value: str,
+    label: str | None = None,
+) -> StoryClue:
+    """编辑线索（AC3/AC5）：置 user_edited=true（写入侧核心约束，保证后续 Agent 整理不覆盖）。
+
+    线索不存在/不属于我 → 复用 _exploration_not_found()（二义合一 404，不新造 code——线索
+    本身也挂在 project 下，越权语义与探索资源一致）。
+
+    **preset 的 label 不可改（2026-07-29 code review 裁定）**：preset 槙位的中文标签
+    （最初的念头/主角/核心冲突/世界与氛围）是 free_explorer_agent 整理端点组 prompt 的固定
+    匹配键（PRESET_CLUE_KEYS）——若允许用户改 preset label，会导致「用户看到的新 label」与
+    「整理端点用的旧固定 label」语义分裂。故对 preset 传 label 直接拒绝（400
+    preset_label_immutable）；custom 线索 label 可自由改（无匹配键约束）。value 两类均可改。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    clue = await story_clue_repo.get_clue_by_id(
+        session, clue_id, user_id=user_id, project_id=project_id
+    )
+    if clue is None:
+        raise _exploration_not_found()
+    if label is not None and clue.kind == "preset":
+        raise _preset_label_immutable()
+
+    updated = await story_clue_repo.update_clue(session, clue, value=value, label=label)
+    await session.commit()
+    return updated
+
+
+def _clue_not_deletable() -> ErrorEnvelope:
+    # 预设槙位不可删除（AC3）：线索存在只是不允许这个操作，不用 404（那是存在性语义）。
+    return ErrorEnvelope(
+        code="clue_not_deletable",
+        message="预设线索不可删除。",
+        http_status=400,
+    )
+
+
+def _preset_label_immutable() -> ErrorEnvelope:
+    # 预设槙位标签不可改（P7）：preset label 是整理端点组 prompt 的固定匹配键，改了会语义分裂。
+    # 线索存在、value 可改，只是 label 这个操作不允许——同 _clue_not_deletable 用 400 而非 404。
+    return ErrorEnvelope(
+        code="preset_label_immutable",
+        message="预设线索的名称不可修改。",
+        http_status=400,
+    )
+
+
+async def delete_clue(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    clue_id: uuid.UUID,
+) -> None:
+    """删除自定义线索（AC3）：仅限 kind="custom"，preset 尝试删除抛 400 clue_not_deletable。"""
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _exploration_not_found()
+    _require_project_mode(project, "free")
+
+    clue = await story_clue_repo.get_clue_by_id(
+        session, clue_id, user_id=user_id, project_id=project_id
+    )
+    if clue is None:
+        raise _exploration_not_found()
+    if clue.kind != "custom":
+        raise _clue_not_deletable()
+
+    await story_clue_repo.delete_custom_clue(session, clue)
+    await session.commit()

@@ -23,6 +23,13 @@ _NonBlankText = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
 ]
 
+# 可空但有界文本：允许空串（min_length=0），仅设长度上界——用于线索 value（空串=前端「尚未
+# 确定」占位），拦超长内容（单请求塞 1MB value 落库 TEXT、后续被整理端点塞进 prompt 挤爆
+# max_tokens），超长即 422 挡在入库前。max_length 与 _NonBlankText 同取保守上界 2000。
+_BoundedText = Annotated[
+    str, StringConstraints(strip_whitespace=True, max_length=2000)
+]
+
 
 class ExplorationSessionResponse(CamelModel):
     """探索会话响应：进入探索（get-or-create）返回的会话根视图（AC1）。
@@ -80,3 +87,65 @@ class GuidedAnswerResponse(CamelModel):
     answer: str
     answer_type: str
     updated_at: UTCDateTime
+
+
+class FreeMessageRequest(CamelModel):
+    """自由对话消息请求（Story 2.6 AC2）：用户发送的一条消息正文。
+
+    边界 camelCase：content。复用既有 _NonBlankText（strip + 1≤len≤2000，空/纯空白/超长 → 422）。
+    """
+
+    content: _NonBlankText
+
+
+class FreeMessageResponse(CamelModel):
+    """自由对话消息资源视图（Story 2.6 AC6）：恢复列表元素。
+
+    边界自动 camelCase：id/role/content/createdAt。对话是追加式流，用创建时间排序展示，不像
+    引导答案那样有"更新时间"语义，故用 created_at 而非 updated_at。
+    """
+
+    id: uuid.UUID
+    role: str
+    content: str
+    created_at: UTCDateTime
+
+
+class ClueResponse(CamelModel):
+    """故事线索资源视图（Story 2.6 AC3/AC5/AC6）：预设槙位或自定义线索的统一响应形态。
+
+    边界自动 camelCase：id/clueKey/kind/label/value/userEdited/displayOrder/updatedAt。
+    clue_key 仅 preset 有值，custom 恒 None。
+    """
+
+    id: uuid.UUID
+    clue_key: str | None
+    kind: str
+    label: str
+    value: str
+    user_edited: bool
+    display_order: int
+    updated_at: UTCDateTime
+
+
+class ClueEditRequest(CamelModel):
+    """线索编辑请求（Story 2.6 AC3/AC5）：编辑后置 user_edited=true。
+
+    边界 camelCase：value/label。value 用 `_BoundedText`（允许空串=清空为「尚未确定」，占位
+    逻辑在前端；但设长度上界拦超长内容——防单请求塞 1MB value 挤爆整理端点 prompt）；
+    label 用 `_NonBlankText | None`（**不可用裸 `str | None`**——会绕开创建路径
+    ClueCreateRequest.label 的非空约束，允许把线索改名为空字符串）：不提供（None）则不改名，
+    提供则必须非空有界，不因 kind 强制拒绝（统一代码路径，YAGNI）。
+    """
+
+    value: _BoundedText
+    label: _NonBlankText | None = None
+
+
+class ClueCreateRequest(CamelModel):
+    """自定义线索新增请求（Story 2.6 AC3）：边界 camelCase：label/value。value 用 `_BoundedText`
+    （允许空串，设长度上界拦超长，同 ClueEditRequest）。"""
+
+    label: _NonBlankText
+    value: _BoundedText = ""
+
