@@ -11,6 +11,10 @@
   revision 不变，返 200 + 新卡。
 - POST  /{project_id}/story-profile/revise：反馈升版本（Story 3.4 AC3/AC4）——真实同一凝练 Agent
   按反馈重生成、revision 递增、标变化字段，返 200 + 新卡。
+- POST  /{project_id}/story-profile/confirm：确认设定（Story 3.5 AC1）——pending 卡翻 confirmed 只读
+  圣经 + 作品 phase explore→chapter（同一事务），返 200 + confirmed 卡。
+- POST  /{project_id}/story-profile/discard：回到探索丢弃（Story 3.5 AC3）——删 pending 行，返 204；
+  幂等（无卡可丢也 204）。
 
 **非流式**（受控决策 3/2）：文风抽取、候选卡编辑/反馈升版本都是一次性结构化操作、非长时生成，
 同步端点即可（同 free/clues/refresh，exploration.py），不引入 Redis/worker/SSE。settle（ARQ）是
@@ -159,3 +163,47 @@ async def revise_story_profile(
         feedback=payload.feedback,
     )
     return StoryProfileCardResponse.model_validate(bible)
+
+
+@router.post(
+    "/{project_id}/story-profile/confirm", response_model=StoryProfileCardResponse
+)
+async def confirm_story_profile(
+    project_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> StoryProfileCardResponse:
+    """确认设定 → 只读设定圣经 + phase 推进（Story 3.5 AC1/AC2/AC5）：返 200 + confirmed 卡。
+
+    **无请求体**（幂等动作，作用对象由 path project_id + 会话 user_id 唯一确定）。POST（有副作用：
+    翻 status='confirmed' + 推 project.phase explore→chapter，两处同一事务）。确认后 GET 恢复端点
+    自然返 204（待确认态已清）；编辑/反馈端点对 confirmed 行天然返 404（只读性，AC2）。
+
+    租户 404 / 无 pending 卡 → 404 no_pending_card 由 service 抛 ErrorEnvelope 交全局 handler；
+    project_id 非法 UUID 由 FastAPI 自动 422。
+    """
+    bible = await story_settle_agent.confirm_profile_card(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return StoryProfileCardResponse.model_validate(bible)
+
+
+@router.post("/{project_id}/story-profile/discard", status_code=204)
+async def discard_story_profile(
+    project_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> Response:
+    """回到探索页面 → 丢弃待确认设定（Story 3.5 AC3）：删 pending 行，返 204。
+
+    **无请求体**（对应原型二次确认「确定返回」）。POST（有副作用：删 pending 行）。**幂等**：无
+    pending 卡可丢时也返 204（用户意图=回到探索，卡在不在都达成）。只删 pending 行——confirmed
+    只读圣经 / draft 半成品行不受影响。越权/不存在 project → service 抛 404（二义合一）。
+
+    二次确认弹窗 + 「取消」保留是纯前端交互（AC4）——「取消」不触后端、无对应端点；仅「确定返回」
+    调本端点。
+    """
+    await story_settle_agent.discard_profile_card(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return Response(status_code=204)

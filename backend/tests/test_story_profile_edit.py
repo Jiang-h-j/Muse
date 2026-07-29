@@ -18,6 +18,15 @@
   - 租户越权 404（先于一切）。
 - API 端到端（@requires_db，provider mock）：GET 恢复（有卡 200 / 无 204）、PATCH 编辑落库、
   POST revise 升版本、schema 校验（空反馈 422）、鉴权 401、越权 404。
+
+Story 3.5 追加（确认设定 → 只读圣经 + 回到探索丢弃）：
+- repo 单元（@requires_db）：confirm_pending_card（pending→confirmed 只翻 status / 无 pending 返
+  None）、delete_pending_card（删 pending 返 True / 无卡 False / 不误删 confirmed）、
+  project_repo.advance_phase（explore→chapter）。
+- service 单元（@requires_db）：confirm_profile_card happy（confirmed + phase=chapter 同事务）、
+  无 pending 卡 404 且 phase 不变、租户越权 404、discard happy 删卡、discard 幂等（无卡不报错）。
+- API 端到端（@requires_db）：POST confirm 200 + GET 204 + phase=chapter、confirm 无卡 404、
+  POST discard 204 + GET 204、discard 幂等 204、只读契约（confirmed 后 PATCH/revise → 404）。
 """
 
 import time
@@ -801,3 +810,471 @@ def test_revise_no_pending_card_404_e2e(
     )
     assert resp.status_code == 404
     assert resp.json()["code"] == "no_pending_card"
+
+
+# ========== Story 3.5：confirm / discard / advance_phase ==========
+
+
+def _confirm_url(project_id: object) -> str:
+    return f"/api/projects/{project_id}/story-profile/confirm"
+
+
+def _discard_url(project_id: object) -> str:
+    return f"/api/projects/{project_id}/story-profile/discard"
+
+
+def _phase_of(db_engine: Engine, project_id: uuid.UUID) -> str:
+    with Session(db_engine) as s:
+        return s.scalar(select(Project.phase).where(Project.id == project_id))
+
+
+def _status_of(db_engine: Engine, project_id: uuid.UUID) -> str | None:
+    with Session(db_engine) as s:
+        return s.scalar(
+            select(StoryBible.status).where(StoryBible.project_id == project_id)
+        )
+
+
+# ---------- repo 单元（@requires_db）----------
+
+
+@requires_db
+async def test_confirm_pending_card_flips_status_only(db_engine: Engine) -> None:
+    """confirm_pending_card：pending → confirmed，只翻 status，12 字段/revision 不动。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(genre="修仙"),
+            status="pending",
+            revision=2,
+            changed_fields=["genre"],
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        bible = await story_bible_repo.confirm_pending_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        await session.commit()
+        assert bible is not None
+        assert bible.status == "confirmed"
+        assert bible.genre == "修仙"  # 内容不动
+        assert bible.revision == 2  # 版本不动
+        assert bible.changed_fields == ["genre"]  # 不动
+
+    # 再 confirm → 无 pending 行 → None（已确认无待确认卡）。
+    async with async_session_maker() as session:
+        again = await story_bible_repo.confirm_pending_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        assert again is None
+
+
+@requires_db
+async def test_confirm_pending_card_no_pending_returns_none(db_engine: Engine) -> None:
+    """无 pending 行（只有 draft）→ confirm_pending_card 返 None。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        # draft 行（只锚文风）。
+        await story_bible_repo.upsert_style_profile(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            style_profile="人称：第三人称",
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        assert (
+            await story_bible_repo.confirm_pending_card(
+                session, user_id=user_id, project_id=project_id
+            )
+            is None
+        )
+    # draft 行未被误翻 confirmed。
+    assert _status_of(db_engine, project_id) == "draft"
+
+
+@requires_db
+async def test_delete_pending_card_removes_row(db_engine: Engine) -> None:
+    """delete_pending_card：删 pending 行返 True，行消失。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(),
+            status="pending",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        deleted = await story_bible_repo.delete_pending_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        await session.commit()
+        assert deleted is True
+
+    with Session(db_engine) as s:
+        row = s.scalar(select(StoryBible).where(StoryBible.project_id == project_id))
+        assert row is None
+
+
+@requires_db
+async def test_delete_pending_card_no_row_returns_false(db_engine: Engine) -> None:
+    """无 pending 卡 → delete_pending_card 返 False（幂等）。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        deleted = await story_bible_repo.delete_pending_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        assert deleted is False
+
+
+@requires_db
+async def test_delete_pending_card_does_not_touch_confirmed(db_engine: Engine) -> None:
+    """confirmed 只读圣经不被 delete_pending_card 误删。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(),
+            status="confirmed",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        deleted = await story_bible_repo.delete_pending_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        await session.commit()
+        assert deleted is False  # confirmed 不匹配 pending
+
+    assert _status_of(db_engine, project_id) == "confirmed"  # 仍在
+
+
+@requires_db
+async def test_advance_phase_explore_to_chapter(db_engine: Engine) -> None:
+    """advance_phase：project.phase explore → chapter，flush 后持久化。"""
+    from muse.core.db import async_session_maker
+    from muse.repositories import project_repo
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    assert _phase_of(db_engine, project_id) == "explore"  # 建行初始
+    async with async_session_maker() as session:
+        project = await project_repo.get_owned_project(session, project_id, user_id)
+        await project_repo.advance_phase(session, project, phase="chapter")
+        await session.commit()
+    assert _phase_of(db_engine, project_id) == "chapter"
+
+
+# ---------- service 单元（@requires_db）----------
+
+
+@requires_db
+async def test_confirm_profile_card_confirms_and_advances_phase(
+    db_engine: Engine,
+) -> None:
+    """confirm_profile_card happy：status=confirmed + phase=chapter 同一事务。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(genre="修仙"),
+            status="pending",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        bible = await story_settle_agent.confirm_profile_card(
+            session, user_id=user_id, project_id=project_id
+        )
+        assert bible.status == "confirmed"
+    # 两处都落库。
+    assert _status_of(db_engine, project_id) == "confirmed"
+    assert _phase_of(db_engine, project_id) == "chapter"
+
+
+@requires_db
+async def test_confirm_no_pending_card_404_phase_unchanged(db_engine: Engine) -> None:
+    """confirm 无 pending 卡 → 404 no_pending_card，phase 保持 explore（事务未提交）。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        with pytest.raises(ErrorEnvelope) as exc:
+            await story_settle_agent.confirm_profile_card(
+                session, user_id=user_id, project_id=project_id
+            )
+    assert exc.value.code == "no_pending_card"
+    assert exc.value.http_status == 404
+    assert _phase_of(db_engine, project_id) == "explore"  # 未推进
+
+
+@requires_db
+async def test_confirm_tenant_guard_404(db_engine: Engine) -> None:
+    """confirm 他人 project_id → 404 project_not_found（租户守卫先于一切）。
+
+    seed owner 的 pending 卡 + 断言 code=project_not_found（而非只断 404）：确保租户守卫真被
+    验证——若删掉 service 层 get_owned_project 守卫，attacker user_id 过滤不到 pending 会抛
+    no_pending_card（也是 404）掩盖回归，故必须断到 code 区分「越权」与「无卡」。
+    """
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    other_user, _ = _seed_user_and_project(db_engine)
+    # owner 有一张 pending 卡：若租户守卫被删，attacker 会因过滤不到而返 no_pending_card。
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(),
+            status="pending",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        with pytest.raises(ErrorEnvelope) as exc:
+            await story_settle_agent.confirm_profile_card(
+                session, user_id=other_user, project_id=project_id
+            )
+    assert exc.value.http_status == 404
+    assert exc.value.code == "project_not_found"  # 租户守卫，非 no_pending_card
+
+
+@requires_db
+async def test_discard_profile_card_deletes(db_engine: Engine) -> None:
+    """discard_profile_card happy：删 pending 卡。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(),
+            status="pending",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        await story_settle_agent.discard_profile_card(
+            session, user_id=user_id, project_id=project_id
+        )
+    assert _status_of(db_engine, project_id) is None  # 行已删
+
+
+@requires_db
+async def test_discard_idempotent_no_card(db_engine: Engine) -> None:
+    """discard 无 pending 卡 → 幂等不报错。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        # 不抛异常即通过。
+        await story_settle_agent.discard_profile_card(
+            session, user_id=user_id, project_id=project_id
+        )
+
+
+@requires_db
+async def test_discard_tenant_guard_404(db_engine: Engine) -> None:
+    """discard 他人 project_id → 404。"""
+    from muse.core.db import async_session_maker
+
+    user_id, project_id = _seed_user_and_project(db_engine)
+    other_user, _ = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        with pytest.raises(ErrorEnvelope) as exc:
+            await story_settle_agent.discard_profile_card(
+                session, user_id=other_user, project_id=project_id
+            )
+    assert exc.value.http_status == 404
+
+
+# ---------- API 端到端（@requires_db）----------
+
+
+@requires_db
+def test_confirm_e2e_then_get_204_phase_chapter(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
+) -> None:
+    """POST confirm → 200 + confirmed 卡；随后 GET → 204、project phase=chapter。"""
+    user = make_user("sp-confirm@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    _seed_pending_card(db_engine, user.id, uuid.UUID(project_id), genre="修仙")
+    resp = _client.post(_confirm_url(project_id), headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "confirmed"
+    assert body["genre"] == "修仙"
+    # 确认后待确认态已清。
+    assert _client.get(_profile_url(project_id), headers=headers).status_code == 204
+    # phase 已推进。
+    assert _phase_of(db_engine, uuid.UUID(project_id)) == "chapter"
+
+
+@requires_db
+def test_confirm_e2e_no_pending_404(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    user = make_user("sp-confirm404@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    resp = _client.post(_confirm_url(project_id), headers=headers)
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "no_pending_card"
+
+
+@requires_db
+def test_discard_e2e_then_get_204(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
+) -> None:
+    """POST discard → 204；随后 GET → 204（回到探索态）。"""
+    user = make_user("sp-discard@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    _seed_pending_card(db_engine, user.id, uuid.UUID(project_id))
+    resp = _client.post(_discard_url(project_id), headers=headers)
+    assert resp.status_code == 204
+    assert _client.get(_profile_url(project_id), headers=headers).status_code == 204
+
+
+@requires_db
+def test_discard_e2e_idempotent(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """discard 无卡也 204（幂等）；重复 discard 仍 204。"""
+    user = make_user("sp-discard-idem@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    assert _client.post(_discard_url(project_id), headers=headers).status_code == 204
+    assert _client.post(_discard_url(project_id), headers=headers).status_code == 204
+
+
+@requires_db
+def test_confirmed_card_is_readonly_patch_and_revise_404(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
+) -> None:
+    """只读契约（AC2）：confirm 后 PATCH 编辑 / POST revise 均 404（confirmed 不可改）。"""
+    user = make_user("sp-readonly@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    _seed_pending_card(db_engine, user.id, uuid.UUID(project_id))
+    assert _client.post(_confirm_url(project_id), headers=headers).status_code == 200
+    # confirmed 后编辑 → 404 no_pending_card。
+    patch_resp = _client.patch(
+        _profile_url(project_id), json={"genre": "都市"}, headers=headers
+    )
+    assert patch_resp.status_code == 404
+    assert patch_resp.json()["code"] == "no_pending_card"
+    # confirmed 后反馈升版本 → 404（不动 provider）。
+    revise_resp = _client.post(
+        _revise_url(project_id), json={"feedback": "改改"}, headers=headers
+    )
+    assert revise_resp.status_code == 404
+    assert revise_resp.json()["code"] == "no_pending_card"
+
+
+def test_confirm_without_token_401() -> None:
+    resp = _client.post(_confirm_url(uuid.uuid4()))
+    assert resp.status_code == 401
+
+
+@requires_db
+def test_confirm_cross_tenant_404(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
+) -> None:
+    """他人作品 confirm → 404 project_not_found（越权二义合一）。
+
+    owner 有 pending 卡：attacker 请求须因租户守卫返 project_not_found，而非因过滤不到卡返
+    no_pending_card——断到 code 才能保护 service 层租户守卫不被回归掉。
+    """
+    owner = make_user("sp-owner@example.com")
+    owner_headers = auth_headers(owner)
+    project_id = _create_project(owner_headers)
+    _seed_pending_card(db_engine, owner.id, uuid.UUID(project_id))
+    attacker = make_user("sp-attacker@example.com")
+    attacker_headers = auth_headers(attacker)
+    resp = _client.post(_confirm_url(project_id), headers=attacker_headers)
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "project_not_found"
+
+
+@requires_db
+async def test_settle_blocked_after_confirm_guards_confirmed_card(
+    db_engine: Engine,
+) -> None:
+    """code review High-1 修复：确认后（phase=chapter）重发 settle → 409 already_settled。
+
+    确认设定推进 phase=chapter；此后 trigger_guided_settle 须在 mode 守卫后被 phase 门禁拦下，
+    否则 worker settle 会把 confirmed 行覆写回 pending、绕过 AC2 只读。断言 409 发生在建 Redis
+    池/入队之前（本测试不依赖 Redis），且 confirmed 行未被触碰。
+    """
+    from muse.core.db import async_session_maker
+    from muse.services import exploration_service
+
+    user_id, project_id = _seed_user_and_project(db_engine)  # mode=guided
+    # 落 pending 卡并确认 → phase=chapter、status=confirmed。
+    async with async_session_maker() as session:
+        await story_bible_repo.upsert_profile_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            card=_card(genre="修仙"),
+            status="pending",
+            revision=1,
+            changed_fields=None,
+        )
+        await session.commit()
+    async with async_session_maker() as session:
+        await story_settle_agent.confirm_profile_card(
+            session, user_id=user_id, project_id=project_id
+        )
+    assert _phase_of(db_engine, project_id) == "chapter"
+    # 确认后重发 settle → 409 already_settled（门禁先于建 Redis 池）。
+    async with async_session_maker() as session:
+        with pytest.raises(ErrorEnvelope) as exc:
+            await exploration_service.trigger_guided_settle(
+                session, user_id=user_id, project_id=project_id
+            )
+    assert exc.value.http_status == 409
+    assert exc.value.code == "already_settled"
+    # confirmed 行原封不动（未被覆写回 pending）。
+    assert _status_of(db_engine, project_id) == "confirmed"

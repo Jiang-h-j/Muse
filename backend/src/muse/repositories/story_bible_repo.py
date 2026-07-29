@@ -6,7 +6,9 @@ service。所有查询显式绑定 user_id 租户守卫（NFR3）——不提供
 方法分层：
 - get_by_project / upsert_style_profile（3.2）：文风锚点落 style_profile 一列。
 - upsert_profile_card / get_pending_by_project / update_card_fields（3.4）：候选卡的凝练落库、
-  待确认态恢复、字段直接编辑。确认写 status='confirmed'（3.5）、丢弃删行（3.5）不在本 repo。
+  待确认态恢复、字段直接编辑。
+- confirm_pending_card / delete_pending_card（3.5）：确认（pending→confirmed 只读圣经）、
+  回到探索丢弃（删 pending 行）。均只作用 status='pending' 行——confirmed 圣经不被误改/误删。
 """
 
 import uuid
@@ -180,3 +182,58 @@ async def update_card_fields(
     await session.flush()
     await session.refresh(bible)
     return bible
+
+
+async def confirm_pending_card(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> StoryBible | None:
+    """确认待确认候选卡为只读设定圣经（Story 3.5 AC1）：pending 行 status→'confirmed'。
+
+    - 仅作用 status='pending' 行（get_pending_by_project 过滤）：无 pending 行 → None
+      （调用方转 404 no_pending_card——不能确认不存在的卡；已 confirmed 再确认也返 None）。
+    - **只翻 status**：12 内容字段 / revision / style_profile / changed_fields 全不动——确认是
+      「冻结当前 pending 卡为只读」、非重写内容（pending→confirmed 同行状态流转，不产生第二行、
+      不拷贝，零竞态）。冻结后编辑/反馈端点（update_card_fields/revise）因只认 pending 行天然失效，
+      confirmed 圣经由此只读（Story 3.5 AC2）。
+
+    **不 commit**（事务边界归 service——确认与 project.phase 推进须在同一事务，见
+    story_settle_agent.confirm_profile_card）。flush 后 refresh 回填 updated_at（避免
+    MissingGreenlet，同 update_card_fields）。
+    """
+    bible = await get_pending_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        return None
+    bible.status = "confirmed"
+    await session.flush()
+    await session.refresh(bible)
+    return bible
+
+
+async def delete_pending_card(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> bool:
+    """删除待确认候选卡（Story 3.5 AC3「回到探索页面」丢弃）：删 status='pending' 行。
+
+    - 仅删 status='pending' 行（get_pending_by_project 过滤）：**confirmed 只读圣经绝不被误删**
+      （不匹配 pending where）、draft 半成品行（只锚文风未 settle）也不在丢弃范围（只有 pending
+      才是「当前待确认设定」）。删后用户可重新探索/整理再出新卡（settle get-or-create 新行）。
+    - 返 True=删了一张 pending 卡；返 False=无 pending 卡可删（调用方按幂等处理，回探索仍成立）。
+
+    **不 commit**（事务边界归 service，延续 project_repo.delete_project 只 delete 约定）。
+    """
+    bible = await get_pending_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        return False
+    await session.delete(bible)
+    await session.flush()
+    return True

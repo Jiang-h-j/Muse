@@ -61,3 +61,21 @@ async def get_owned_project(
 async def delete_project(session: AsyncSession, project: Project) -> None:
     """删除给定 Project（只 delete、不 commit）；事务边界归 service，延续 repo 只 flush 约定。"""
     await session.delete(project)
+
+
+async def advance_phase(
+    session: AsyncSession, project: Project, *, phase: str
+) -> Project:
+    """推进作品创作阶段 phase（Story 3.5 AC1：确认设定后 explore→chapter）。
+
+    Story 1.6 以来的首个 phase 写入点——此前 phase 仅在建行时写 _INITIAL_PHASE='explore'。
+    接收已取到的 Project 实例（service 用 get_owned_project 取，租户守卫已在取行时完成，同
+    delete_project 的入参风格）：置 phase、flush，事务边界归 service（不 commit）。
+
+    Story 1.6 据 phase 路由「继续创作」到当前步骤（explore=探索/设定、chapter=章节创作、
+    archive=归档）；确认设定即从探索阶段推进到章节创作。V1 不做 phase 状态机校验（无回退
+    需求，原型确认后直接进章节、无回退入口）。
+    """
+    project.phase = phase
+    await session.flush()
+    return project

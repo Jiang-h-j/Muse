@@ -69,6 +69,27 @@ def _require_project_mode(project: Project, expected_mode: str) -> None:
         )
 
 
+def _require_not_settled(project: Project) -> None:
+    """确认后不可重新整理守卫（Story 3.5 code review High-1 修复，选项 1）。
+
+    确认设定后 project.phase 推进到 chapter（story_settle_agent.confirm_profile_card），设定圣经
+    成 status='confirmed' 的只读依据（AC2）。但 settle 触发端点（trigger_*_settle）只校验 mode、
+    upsert_profile_card 又不带 status 过滤——若确认后重发 settle（前端 bug / 重放 / 双击），会把
+    confirmed 行静默覆写回 pending，绕过 AC2 只读保护。此门禁在 mode 守卫后拦下：phase 已离开
+    explore（即已确认进入创作）时不允许再整理，抛 409（与 _require_project_mode 同族冲突语义——
+    「当前阶段不允许该操作」，非不存在/不属于我）。
+
+    判据是 phase != 'explore'（而非 == 'chapter'）：只有仍在探索/设定阶段才允许触发整理，
+    对未来 archive 等阶段同样拦下。
+    """
+    if project.phase != "explore":
+        raise ErrorEnvelope(
+            code="already_settled",
+            message="故事设定已确认，无法重新整理探索内容。",
+            http_status=409,
+        )
+
+
 def _exploration_not_ready() -> ErrorEnvelope:
     """自由探索「整理为故事设定」门禁未满足（2.7 AC4）：本会话尚无用户消息。
 
@@ -221,6 +242,7 @@ async def trigger_guided_settle(
     if project is None:
         raise _exploration_not_found()
     _require_project_mode(project, "guided")
+    _require_not_settled(project)
 
     settings = get_settings()
     task_id = uuid.uuid4().hex
@@ -269,6 +291,7 @@ async def trigger_free_settle(
     if project is None:
         raise _exploration_not_found()
     _require_project_mode(project, "free")
+    _require_not_settled(project)
 
     # 门禁硬校验（AC4）：无会话 → 无消息 → 门禁不通过；有会话则判是否有 free 用户消息。
     exploration_session = await exploration_repo.get_session_by_project(

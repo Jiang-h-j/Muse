@@ -81,6 +81,10 @@ _SPECIALIZED_FIELDS: list[tuple[str, str]] = [
 _LLM_FIELDS: list[tuple[str, str]] = _BACKBONE_FIELDS + _SPECIALIZED_FIELDS
 _BACKBONE_KEYS = {key for key, _ in _BACKBONE_FIELDS}
 
+# 确认设定后作品推进到的创作阶段（Story 3.5 AC1）：explore（探索/设定）→ chapter（章节创作）。
+# 对齐 project_service._INITIAL_PHASE 与 models/project.py 的 explore/chapter/archive 枚举。
+_CONFIRMED_PHASE = "chapter"
+
 
 def _settle_empty() -> ErrorEnvelope:
     """探索材料为空、不足以凝练成设定（前置条件未满足 → 400）。
@@ -590,3 +594,67 @@ async def get_pending_card(
     return await story_bible_repo.get_pending_by_project(
         session, user_id=user_id, project_id=project_id
     )
+
+
+async def confirm_profile_card(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> StoryBible:
+    """确认设定 → 只读设定圣经 + phase 推进（Story 3.5 AC1/AC2/AC5）。
+
+    无 LLM、无护栏（纯状态流转，不调 provider）——用请求注入 session（同 edit_profile_card）。
+    流程：租户守卫 → confirm_pending_card（pending→confirmed）→ advance_phase（explore→chapter）
+    → **同一 commit**。
+
+    **确认与 phase 推进原子性**（关键）：status='confirmed' 与 project.phase='chapter' 在同一
+    事务提交——避免「确认了 status 但 phase 没进（用户卡探索页）/ phase 进了但没 confirmed
+    （进了章节却无圣经可注入）」的半成品态。无 pending 卡 → 404 no_pending_card（先于 phase 推进，
+    此时事务未提交、phase 保持 explore）。越权/不存在 project → 404 二义合一（NFR3）。
+
+    确认后 get_pending_card 自然返 None（AC6：确认后无待确认卡）；编辑/反馈端点因只认 pending
+    行天然对 confirmed 失效（AC2 只读性）。返回 confirmed 的 bible（router 序列化成只读圣经）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise exploration_service._exploration_not_found()
+
+    bible = await story_bible_repo.confirm_pending_card(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        raise _no_pending_card()
+
+    await project_repo.advance_phase(session, project, phase=_CONFIRMED_PHASE)
+    await session.commit()
+    return bible
+
+
+async def discard_profile_card(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> None:
+    """回到探索页面 → 丢弃待确认设定（Story 3.5 AC3）：删 pending 行、回可继续探索的状态。
+
+    无 LLM、无护栏——用请求注入 session（同 edit_profile_card）。流程：租户守卫 →
+    delete_pending_card（删 pending 行）→ commit。
+
+    **幂等**（受控决策 2）：无 pending 卡可丢时不报错——「确定返回」的用户意图是「回到探索」，
+    卡在不在都应达成该意图（重复丢弃/网络重试均视作成功）。故 delete 返 False 时静默、不抛。
+    越权/不存在 project → 404 二义合一（NFR3，先于删除）。
+
+    丢弃只作用 pending 卡（confirm 前的待确认态，phase 仍是 explore），故不动 phase——已 confirmed
+    后想改设定属 Epic 4「回到设定」场景（V1 无，见受控决策 4）。style_profile 随 pending 行一并
+    删除（一作品一行，丢弃=彻底重来，见受控决策 1）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise exploration_service._exploration_not_found()
+
+    await story_bible_repo.delete_pending_card(
+        session, user_id=user_id, project_id=project_id
+    )
+    await session.commit()
