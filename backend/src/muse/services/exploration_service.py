@@ -203,7 +203,7 @@ async def trigger_guided_settle(
 
     异步模型二分（epics.md:457）：凝练走 ARQ 后台任务（POST→taskId→GET /events），非交互式
     流式（那是 2.3 interpret）。本函数只「触发」——登记属主 + 入队，任务体在 worker
-    settle_guided_exploration 跑（读答案 + 推 progress + 占位 result）。
+    settle_exploration 跑（真实 LLM 12 字段凝练，Story 3.3 已接入；guided 材料=引导答案）。
 
     1. 租户守卫（陷阱①）：get_owned_project → None 抛 project_not_found 404（二义合一，不 403、
        不区分「不属于我」与「不存在」，消除 IDOR 侦察面 NFR3）。复用 _exploration_not_found()。
@@ -231,9 +231,9 @@ async def trigger_guided_settle(
     try:
         # 先登记属主（SSE 鉴权依据），再入队——顺序保证 SSE 端点总能读到属主（陷阱②）。
         await sse.register_task_owner(pool, task_id, uid)
-        # _job_id=task_id：stable id 作 pubsub 频道键；user_id/project_id 传给 worker 供读答案。
+        # _job_id=task_id：stable id 作 pubsub 频道键；user_id/project_id 传给 worker 供凝练。
         await pool.enqueue_job(
-            "settle_guided_exploration", task_id, uid, pid, _job_id=task_id
+            "settle_exploration", task_id, uid, pid, _job_id=task_id
         )
     finally:
         await pool.aclose()
@@ -257,10 +257,10 @@ async def trigger_free_settle(
     4. task_id = uuid4 hex（不可枚举，陷阱⑤）。
     5. register_task_owner **必须在 enqueue_job 之前**（陷阱②）：否则 worker 可能在属主键写入前
        发首个事件、SSE 端点鉴权读不到属主而对合法属主误返 404。
-    6. **复用既有 `settle_guided_exploration` 任务**（worker.py，mode-agnostic skeleton）：free 会话
-       无 guided 答案 → answeredCount=0，任务仍跑通推 progress×3 + 占位 result（陷阱⑨空态兜底）。
-       V1 两者产出都是占位、无消费者、跑完即弃；真实凝练（读 free 对话/线索 → LLM → 12 字段候选卡）
-       归 Story 3.3（epics.md:715-717「接 2.5/2.7 的 ARQ 任务」），届时若逻辑分叉再由 3.3 决定拆分。
+    6. **复用 `settle_exploration` 任务**（worker.py，mode-aware，Story 3.3）：任务体调
+       story_settle_agent.settle_into_profile，按会话 mode 自取材料——free 会话取对话历史 +
+       有效线索（非空 preset 槽 + custom）凝练成 12 字段候选卡（epics.md:715-717「接 2.5/2.7
+       的 ARQ 任务」）。guided/free 凝练逻辑共享单任务（YAGNI，不拆两个任务体，受控决策 3）。
 
     **不做**（受控决策 B/C）：不 check_quota（skeleton 无 LLM 调用、无成本，护栏随 3.3 落地）、
     不生成设定卡（Epic 3）。
@@ -291,9 +291,9 @@ async def trigger_free_settle(
     try:
         # 先登记属主（SSE 鉴权依据），再入队——顺序保证 SSE 端点总能读到属主（陷阱②）。
         await sse.register_task_owner(pool, task_id, uid)
-        # 复用 settle_guided_exploration（mode-agnostic skeleton，free 会话空 guided 答案照跑）。
+        # 复用 settle_exploration（mode-aware：free 会话由凝练 service 自取对话+线索，3.3）。
         await pool.enqueue_job(
-            "settle_guided_exploration", task_id, uid, pid, _job_id=task_id
+            "settle_exploration", task_id, uid, pid, _job_id=task_id
         )
     finally:
         await pool.aclose()

@@ -22,8 +22,8 @@ from muse.core import sse
 from muse.core.errors import ErrorEnvelope
 from muse.core.settings import get_settings
 from muse.providers.factory import get_provider_for_user
-from muse.repositories import exploration_repo
-from muse.services import usage_service
+from muse.schemas.story import StoryProfileCard
+from muse.services import story_settle_agent, usage_service
 
 logger = logging.getLogger("muse")
 
@@ -115,67 +115,56 @@ def _settle_progress(step: int) -> dict[str, object]:
     return {"step": step, "percent": round(step / _SETTLE_TOTAL_STEPS * 100)}
 
 
-async def settle_guided_exploration(
+async def settle_exploration(
     ctx: dict, task_id: str, user_id: str, project_id: str
 ) -> dict[str, object]:
-    """引导收尾「整理为故事设定」任务——**V1 是管道 skeleton，非真实凝练**（Story 2.5，AC2）。
+    """探索「整理为故事设定」任务——真实 LLM 12 字段凝练（Story 3.3，FR12）。
 
-    本任务打通「触发→ARQ→SSE」异步链：分 step 推 progress、以独立 session 读本会话引导答案
-    （证明整理任务能拿到 2.4 落库的答案）、末推**占位 result**（不调 LLM）、异常推 error。
+    承 Story 2.5（引导收尾）/ 2.7（自由整理）触发的 ARQ 任务：2.5/2.7 打通「触发→ARQ→worker
+    →SSE」链、step 2 是占位凝练（受控决策 B）；本 story 把占位替换为真实凝练——调
+    `story_settle_agent.settle_into_profile`（mode-aware 取材料 → check_quota → LLM → 12 字段
+    候选卡），末推真实 profile 的 result 事件。
 
-    **⚠️ 真实调用 LLM 把引导答案凝练成 12 字段设定候选卡（FR12）是 Story 3.3**（epics.md:715-717
-    「接 Epic 2 Story 2.5/2.7 的 ARQ 任务」）——3.3 在下方 **step 2 替换占位为真实凝练**：喂本任务
-    读到的引导答案 → LLM → 12 字段设定候选卡，result 从占位换成 profile payload，并在调 provider
-    **之前** check_quota（护栏，承 2.1 AC6 / demo_generate step 1 范式）、接设定卡持久化/恢复
-    （Epic 3 边界 epics.md:456）。本 story 的占位 result 无消费者、跑完即弃、零副作用（前端全
-    defer、Epic 3 未实现），只为验证管道可端到端跑（受控决策 B/C）。
+    **mode-aware**：凝练服务按会话 mode 自取材料（guided=引导答案；free=对话+线索），故本任务
+    对 guided/free 两条触发链通用（2.5/2.7 共用同一任务名 settle_exploration）——任务体不再只读
+    guided 答案，材料读取下沉到 service。
 
-    陷阱④：worker 独立进程/事件循环，从 ctx 取 session_maker/pub_redis（on_startup 备好），
-    **绝不复用 web 请求 session**。陷阱⑨：读答案空态（无会话/无答案）不失败，仍推 progress +
-    占位 result（answeredCount=0）——前端契约保证只在收尾态触发，但任务本身不因空答案脆弱。
+    **emit-only（受控决策 1）**：候选卡经 SSE result 返回即止，本 story 不写 story_bible——
+    待确认卡持久化归 3.4、确认写圣经归 3.5。
+
+    陷阱④：worker 独立进程/事件循环，凝练服务内自管独立 session（不复用本 worker ctx 的
+    session）。陷阱⑧：任何异常都推 error 事件（护栏 429 / 空态 400 / 空产 502 经 ErrorEnvelope
+    透传 code/message，其余泛化 settle_failed）。
     """
     pub: Redis = ctx["pub_redis"]
-    session_maker: async_sessionmaker = ctx["session_maker"]
-    uid = uuid.UUID(user_id)
-    pid = uuid.UUID(project_id)
     try:
-        # ---- step 1：读本会话引导答案（证明能拿到 2.4 落的答案，供 3.3 喂 LLM）----
+        # ---- step 1：开始凝练（推 progress，驱动前端过渡态）----
         await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(1))
-        async with session_maker() as session:
-            # get-only（不 create/不 commit）：skeleton 零副作用（受控决策 B）。session 为 None
-            # （还没进探索/没答过）→ answers=[]，任务仍跑通（陷阱⑨）。repo 的 where 带 user_id
-            # 天然租户隔离（属主已在触发端点校验）。
-            exploration_session = await exploration_repo.get_session_by_project(
-                session, uid, pid
-            )
-            if exploration_session is None:
-                answers = []
-            else:
-                answers = await exploration_repo.list_guided_answers_by_session(
-                    session,
-                    user_id=uid,
-                    project_id=pid,
-                    session_id=exploration_session.id,
-                )
-        answered_count = len(answers)
 
-        # ---- step 2：占位凝练（**3.3 在此替换为真实 LLM 12 字段凝练**，受控决策 B）----
-        # 不调 provider、不调 LLM、不 check_quota（skeleton 无成本，受控决策 C）；仅构造占位
-        # payload 证明管道跑通。3.3 换成：check_quota → provider 凝练 answers → profile payload。
+        # ---- step 2：真实 LLM 12 字段凝练（Story 3.3）----
+        # service 自管独立 session、按 mode 取材料、check_quota → provider → 解析 → 组装候选卡。
+        # 空态 400 / 触顶 429 / 空产 502 均由 service 抛 ErrorEnvelope，走下方 except 透传 SSE。
         await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(2))
+        card = await story_settle_agent.settle_into_profile(
+            user_id=uuid.UUID(user_id),
+            project_id=uuid.UUID(project_id),
+        )
 
-        # ---- step 3：完成，推占位 result（camelCase，陷阱⑦）----
+        # ---- step 3：完成，推真实候选卡 result（camelCase，陷阱⑦）----
         await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _settle_progress(3))
+        # profile 转 camelCase（StoryProfileCard 契约，by_alias）。SSE payload 必须已 camelCase
+        # （format_sse_event 不转换）。status 从 skeleton 的占位 settle_pending 换为 settle_ready。
+        profile = StoryProfileCard.model_validate(card).model_dump(by_alias=True)
         payload: dict[str, object] = {
             "taskId": task_id,
-            "status": "settle_pending",  # 3.3 就绪后换为真实 profile 状态/字段
-            "answeredCount": answered_count,
+            "status": "settle_ready",
+            "profile": profile,
         }
         await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
         return payload
     except ErrorEnvelope as exc:
-        # 受控业务错误（3.3 引入 check_quota 后触顶 429 等）：透传面向用户的 code/message
-        # （照 demo_generate worker.py:87-93）。本 story skeleton 不主动抛 ErrorEnvelope。
+        # 受控业务错误（护栏触顶 429 / 空态 400 / 空产 502）：透传面向用户的 code/message
+        # （照 demo_generate worker.py:87-93）。
         await sse.publish_event(
             pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
         )
@@ -184,7 +173,7 @@ async def settle_guided_exploration(
         # 原始异常仅落日志（可能含 DB 连接串/驱动错误/内部路径）；对外 error 只用固定泛化文案，
         # 避免内部实现细节经 SSE 外泄（承 demo_generate worker.py:94-105）。
         logger.exception(
-            "settle_guided_exploration 任务失败：task_id=%s", task_id, exc_info=exc
+            "settle_exploration 任务失败：task_id=%s", task_id, exc_info=exc
         )
         await sse.publish_event(
             pub,
@@ -222,7 +211,7 @@ class WorkerSettings:
     worker 独立的 DB/Redis 连接生命周期（陷阱⑦）。
     """
 
-    functions = [demo_generate, settle_guided_exploration]
+    functions = [demo_generate, settle_exploration]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     on_startup = on_startup
     on_shutdown = on_shutdown

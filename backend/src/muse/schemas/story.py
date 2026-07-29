@@ -69,3 +69,35 @@ class StyleSampleResponse(CamelModel):
     name: str
     note: str
     excerpt: str
+
+
+class StoryProfileCard(CamelModel):
+    """12 字段故事设定候选卡（Story 3.3，FR12）：探索凝练产物的数据契约。
+
+    边界 camelCase（如 core_appeal↔coreAppeal、style_profile↔styleProfile）。是 3.4 编辑/
+    3.5 确认/前端弹卡渲染消费候选卡的**单一契约**。字段对齐 story_bible 12 列与 [[project_
+    muse_setting_fields]] 的 ①-⑫ 编号：
+    - 主干 7（`str`，缺料为空串，对齐 story_bible 主干列 server_default="" 语义）。
+    - 题材特化 4（`str | None`，按 genre 激活、不匹配为 None，对齐 story_bible 特化列 NULL）。
+    - ⑫ style_profile（`str | None`，读 3.2 抽取值，未锚定为 None）。
+
+    本 story emit-only：候选卡经 worker SSE result 返回、**不落 story_bible**（持久化归 3.4/
+    3.5）。revision/变化项是 3.4 待确认卡持久化的概念，不在本 schema（故无 revision 字段）。
+    """
+
+    # 通用主干 7（必填语义，缺料空串）
+    genre: str
+    core_appeal: str
+    protagonist: str
+    main_conflict: str
+    world_rules: str
+    overall_tone: str
+    opening_hook: str
+    # 题材特化 4（按 genre 激活，不匹配 None）
+    power_system: str | None = None
+    golden_finger: str | None = None
+    romance_line: str | None = None
+    faction_landscape: str | None = None
+    # Muse 独有 1（读 3.2 style_profile，未锚定 None）
+    style_profile: str | None = None
+

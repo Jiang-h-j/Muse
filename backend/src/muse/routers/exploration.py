@@ -8,8 +8,8 @@ free_explorer_agent）。
 - POST /{project_id}/explore/guided/answers：保存/更新某题位引导答案（Story 2.4，幂等 upsert 200）。
 - GET  /{project_id}/explore/guided/answers：恢复本会话全部已答（Story 2.4，题位升序，空态 []）。
 - POST /{project_id}/explore/guided/settle：引导收尾触发「整理为故事设定」ARQ 后台任务（Story 2.5
-  AC2）——租户守卫 + 登记属主 + 入队 settle_guided_exploration，返 taskId，前端连 2.1 的
-  GET /api/tasks/{taskId}/events 消费 SSE（progress/占位 result/error）。非流式提交（非 interpret
+  AC2）——租户守卫 + 登记属主 + 入队 settle_exploration，返 taskId，前端连 2.1 的
+  GET /api/tasks/{taskId}/events 消费 SSE（progress/result/error）。非流式提交（非 interpret
   的 EventSourceResponse）——异步模型二分 epics.md:457：settle 走 ARQ 后台任务、interpret 走流式。
 - POST /{project_id}/explore/free/messages：自由对话一轮，流式 SSE（Story 2.6 AC2/AC6）——真实
   Free Explorer Agent 多轮对话，delta→done→error，用户消息与 Agent 回复均真实落库。
@@ -21,7 +21,7 @@ free_explorer_agent）。
   ——同步调用，只更新未被用户编辑的预设槙位。
 - POST /{project_id}/explore/free/settle：自由探索触发「整理为故事设定」ARQ 后台任务（Story 2.7
   AC3/AC4）——租户守卫 + **门禁硬校验**（本会话须至少 1 条 free 用户消息，否则 400
-  exploration_not_ready）+ 登记属主 + 入队 settle_guided_exploration，返 taskId，前端连 2.1 的
+  exploration_not_ready）+ 登记属主 + 入队 settle_exploration，返 taskId，前端连 2.1 的
   GET /api/tasks/{taskId}/events 消费 SSE。非流式提交（同 guided/settle，异步模型二分见 epics）。
   门禁硬校验是本 story 相对 2.5 的差异（FR10「补足信息才开放」+ 2.6「不止于前端」先例）。
 
@@ -450,7 +450,7 @@ async def settle_free_exploration(
 
     无 body（触发即整理，凝练所需数据由任务自己从库读；project_id 已在路径）；project_id 非法
     UUID 由 FastAPI 自动 422。越权/不存在在 service 统一 404（陷阱①，先于门禁）。整理任务体复用
-    settle_guided_exploration skeleton（占位 result），真实 12 字段凝练是 Story 3.3（受控决策 B）。
+    settle_exploration 任务（真实 12 字段凝练，Story 3.3 已接入；free 材料=对话+线索）。
     """
     task_id = await exploration_service.trigger_free_settle(
         session, user_id=current_user.id, project_id=project_id

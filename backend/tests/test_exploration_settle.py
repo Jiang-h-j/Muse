@@ -1,8 +1,9 @@
-"""Story 2.5 验证：引导收尾「整理为故事设定」触发端点 + skeleton settle 任务（AC2）。
+"""Story 2.5 验证：引导收尾「整理为故事设定」触发端点 + settle 任务触发链（AC2）。
 
-本 story 是**后端 only**切片（受控决策 A：前端接线 defer）+ **管道 skeleton**（受控决策 B：
-step 2 占位凝练、真实 LLM 12 字段凝练归 3.3）+ 护栏 defer（受控决策 C：skeleton 无 LLM 成本、
-不 check_quota、测试不需 @requires_deepseek）。
+本 story 是**后端 only**切片（受控决策 A：前端接线 defer）。触发端点的真实凝练任务体（12 字段
+凝练）由 Story 3.3 接入（settle_exploration → story_settle_agent），故 worker 任务体的凝练/
+payload 断言归 test_story_settle.py；本文件聚焦触发端点契约（属主登记 / 租户 / 非法入参）+
+真实 ARQ 入队消费链路（陷阱⑤ functions 注册）。
 
 - 离线（不需容器）：触发端点鉴权缺失 401（CurrentUser 前置）。
 - HTTP 触发 + 属主登记（@requires_db @requires_redis，仿 test_tasks_sse.py）：
@@ -12,12 +13,8 @@ step 2 占位凝练、真实 LLM 12 字段凝练归 3.3）+ 护栏 defer（受�
   - 非法 UUID 422（FastAPI 路径解析）
   - settle 产出的 taskId 走 2.1 GET /api/tasks/{taskId}/events、非属主 404
     （坐实 taskId 复用 2.1 IDOR 守卫；属主正向消费归 2.1 event_stream 用例 + 下方 ARQ 端到端用例）
-- skeleton 任务逻辑（@requires_db @requires_redis，直调 worker 函数 + _drain_pubsub）：
-  - happy：progress×3 + result；answeredCount == 落的答案数（证明读到 2.4 落库的答案）
-  - 空答案跑通管道：未落任何答案 → 仍 progress + result（answeredCount==0，陷阱⑨）
-  - error 路径：任务内异常 → error（含 code/message）、失败后无 result（陷阱⑧）
-- ARQ 真实入队→消费（@requires_db @requires_redis，burst worker）：坐实真实 ARQ 链路 +
-  functions 注册（陷阱⑤），非仅直调函数。
+- ARQ 真实入队→消费（@requires_db @requires_redis，burst worker，凝练服务 mock）：坐实真实 ARQ
+  链路 + functions 注册（陷阱⑤），非仅直调函数。
 """
 
 import json
@@ -33,7 +30,6 @@ from muse.core import sse
 from muse.core.settings import get_settings
 from muse.main import app
 from muse.models.account import User
-from muse.repositories import exploration_repo
 from muse.tasks import worker as worker_mod
 from tests.conftest import requires_db, requires_redis
 
@@ -92,11 +88,6 @@ async def _drain_pubsub(pubsub, *, until_terminal: bool = True) -> list[tuple[st
         if until_terminal and payload["event"] in (sse.EVENT_RESULT, sse.EVENT_ERROR):
             saw_terminal = True
     return events
-
-
-def _make_ctx(session_maker, pub_redis: Redis) -> dict:
-    """构造 settle 任务 ctx（模拟 worker on_startup 备好的 session_maker + pub_redis）。"""
-    return {"session_maker": session_maker, "pub_redis": pub_redis}
 
 
 def _cleanup_enqueued_job(task_id: str) -> None:
@@ -271,141 +262,6 @@ async def _post_answer(
     assert resp.status_code == 200
 
 
-@requires_db
-@requires_redis
-async def test_settle_task_happy_reads_answers_and_publishes(
-    make_user: Callable[..., User],
-    auth_headers: Callable[[User], dict[str, str]],
-) -> None:
-    # happy：直调 settle_guided_exploration → progress×3 + result；answeredCount == 落的答案数
-    # （证明整理任务能读到 2.4 落库的答案，是 3.3 真实凝练的前提）。
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    user = make_user("settle-happy@example.com")
-    headers = auth_headers(user)
-    project_id = _create_project(user, headers)
-    # 经 HTTP 落 3 条答案（真实 2.4 路径）。
-    await _post_answer(project_id, headers, index=0, answer="答案0")
-    await _post_answer(project_id, headers, index=1, answer="答案1")
-    await _post_answer(project_id, headers, index=2, answer="答案2")
-
-    task_id = uuid.uuid4().hex
-    engine = create_async_engine(get_settings().database_url)
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    pub = _redis()
-    sub = _redis()
-    pubsub = await _subscribe(sub, sse.task_channel(task_id))
-    try:
-        await worker_mod.settle_guided_exploration(
-            _make_ctx(session_maker, pub), task_id, str(user.id), project_id
-        )
-        events = await _drain_pubsub(pubsub)
-    finally:
-        await pubsub.unsubscribe(sse.task_channel(task_id))
-        await pubsub.aclose()
-        await sub.aclose()
-        await pub.delete(sse.task_snapshot_key(task_id))
-        await pub.aclose()
-        await engine.dispose()
-
-    kinds = [e for e, _ in events]
-    assert kinds == ["progress", "progress", "progress", "result"]
-    # progress payload camelCase {step, percent}。
-    progress_data = [d for e, d in events if e == "progress"]
-    assert all("step" in d and "percent" in d for d in progress_data)
-    # result 占位 payload camelCase；answeredCount == 落的 3 条（证明读到 2.4 答案）。
-    result_data = [d for e, d in events if e == "result"][0]
-    assert result_data["taskId"] == task_id
-    assert result_data["status"] == "settle_pending"
-    assert result_data["answeredCount"] == 3
-
-
-@requires_db
-@requires_redis
-async def test_settle_task_empty_answers_still_runs(
-    make_user: Callable[..., User],
-    auth_headers: Callable[[User], dict[str, str]],
-) -> None:
-    # 陷阱⑨：未落任何答案（连探索会话都没建）→ 任务仍推 progress + result（answeredCount==0），
-    # skeleton 不因空答案失败（前端契约保证只在收尾态触发，但任务本身不脆弱）。
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    user = make_user("settle-empty@example.com")
-    project_id = _create_project(user, auth_headers(user))
-
-    task_id = uuid.uuid4().hex
-    engine = create_async_engine(get_settings().database_url)
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    pub = _redis()
-    sub = _redis()
-    pubsub = await _subscribe(sub, sse.task_channel(task_id))
-    try:
-        await worker_mod.settle_guided_exploration(
-            _make_ctx(session_maker, pub), task_id, str(user.id), project_id
-        )
-        events = await _drain_pubsub(pubsub)
-    finally:
-        await pubsub.unsubscribe(sse.task_channel(task_id))
-        await pubsub.aclose()
-        await sub.aclose()
-        await pub.delete(sse.task_snapshot_key(task_id))
-        await pub.aclose()
-        await engine.dispose()
-
-    kinds = [e for e, _ in events]
-    assert kinds == ["progress", "progress", "progress", "result"]
-    result_data = [d for e, d in events if e == "result"][0]
-    assert result_data["answeredCount"] == 0
-
-
-@requires_db
-@requires_redis
-async def test_settle_task_error_path_publishes_error(
-    make_user: Callable[..., User],
-    auth_headers: Callable[[User], dict[str, str]],
-) -> None:
-    # 陷阱⑧：任务内异常（mock repo 抛错）→ 推 error（含 code/message、泛化文案）、失败后无 result。
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    user = make_user("settle-error@example.com")
-    project_id = _create_project(user, auth_headers(user))
-
-    task_id = uuid.uuid4().hex
-    engine = create_async_engine(get_settings().database_url)
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    pub = _redis()
-    sub = _redis()
-    pubsub = await _subscribe(sub, sse.task_channel(task_id))
-    try:
-        # 让读会话步骤抛错，验证 error 事件经同一链路推达（step 1 之后）。
-        with patch.object(
-            exploration_repo,
-            "get_session_by_project",
-            side_effect=RuntimeError("模拟读答案失败"),
-        ):
-            with pytest.raises(RuntimeError):
-                await worker_mod.settle_guided_exploration(
-                    _make_ctx(session_maker, pub), task_id, str(user.id), project_id
-                )
-        events = await _drain_pubsub(pubsub)
-    finally:
-        await pubsub.unsubscribe(sse.task_channel(task_id))
-        await pubsub.aclose()
-        await sub.aclose()
-        await pub.delete(sse.task_snapshot_key(task_id))
-        await pub.aclose()
-        await engine.dispose()
-
-    kinds = [e for e, _ in events]
-    # step 1 progress 已推，读答案抛错 → error；无 result。
-    assert kinds == ["progress", "error"]
-    error_data = [d for e, d in events if e == "error"][0]
-    assert error_data["code"] == "settle_failed"
-    assert "message" in error_data
-    # 泛化文案，不外泄原始异常细节（陷阱⑧）。
-    assert "模拟读答案失败" not in error_data["message"]
-
-
 # ========== 端到端：ARQ 真实入队 → 消费 → SSE（burst worker，陷阱⑤ functions 注册）==========
 
 
@@ -415,20 +271,38 @@ async def test_settle_arq_enqueue_consume_publishes_events(
     make_user: Callable[..., User],
     auth_headers: Callable[[User], dict[str, str]],
 ) -> None:
-    # 真 ARQ 入队 → burst worker 消费 settle_guided_exploration → 发布 progress×3 + result。
+    # 真 ARQ 入队 → burst worker 消费 settle_exploration → 发布 progress×3 + result。
     # 坐实真实 ARQ 链路 + WorkerSettings.functions 注册（陷阱⑤：漏注册则无 handler 静默失败）。
+    # 凝练服务 mock（burst worker 在同进程/事件循环跑，patch 可见）——不打真实 LLM，只验 ARQ 链路。
+    from unittest.mock import AsyncMock, patch
+
     from arq import create_pool
     from arq.connections import RedisSettings
     from arq.worker import Worker
 
     # 前置断言：settle 任务确在 WorkerSettings.functions（生产注册表）内——否则本用例
     # 无从坐实注册（若手搭 functions=[settle_...] 则即便生产漏注册也照样绿，见陷阱⑤）。
-    assert worker_mod.settle_guided_exploration in worker_mod.WorkerSettings.functions
+    assert worker_mod.settle_exploration in worker_mod.WorkerSettings.functions
 
     user = make_user("settle-arq@example.com")
     headers = auth_headers(user)
     project_id = _create_project(user, headers)
     await _post_answer(project_id, headers, index=0, answer="arq答案")
+
+    fake_card = {
+        "genre": "修仙",
+        "core_appeal": "逆袭",
+        "protagonist": "林凡",
+        "main_conflict": "对抗",
+        "world_rules": "灵气复苏",
+        "overall_tone": "热血",
+        "opening_hook": "觉醒",
+        "power_system": None,
+        "golden_finger": None,
+        "romance_line": None,
+        "faction_landscape": None,
+        "style_profile": None,
+    }
 
     task_id = uuid.uuid4().hex
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
@@ -437,27 +311,33 @@ async def test_settle_arq_enqueue_consume_publishes_events(
 
     pool = await create_pool(redis_settings)
     try:
-        await pool.enqueue_job(
-            "settle_guided_exploration",
-            task_id,
-            str(user.id),
-            project_id,
-            _job_id=task_id,
-        )
-        # burst=True：消费完队列即退出；handle_signals=False：不装信号处理器（避免与 pytest 冲突）。
-        # functions 直接取自生产 WorkerSettings.functions——若有人从注册表移除 settle 任务，
-        # 此处 handler 缺失、任务静默不执行、SSE 收不到事件、下方断言失败（真正回归陷阱⑤）。
-        wk = Worker(
-            functions=worker_mod.WorkerSettings.functions,
-            redis_settings=redis_settings,
-            on_startup=worker_mod.on_startup,
-            on_shutdown=worker_mod.on_shutdown,
-            burst=True,
-            handle_signals=False,
-            poll_delay=0.1,
-        )
-        await wk.async_run()
-        events = await _drain_pubsub(pubsub)
+        with patch.object(
+            worker_mod.story_settle_agent,
+            "settle_into_profile",
+            new=AsyncMock(return_value=fake_card),
+        ):
+            await pool.enqueue_job(
+                "settle_exploration",
+                task_id,
+                str(user.id),
+                project_id,
+                _job_id=task_id,
+            )
+            # burst=True：消费完队列即退出；handle_signals=False：不装信号处理器
+            # （避免与 pytest 冲突）。functions 直接取自生产 WorkerSettings.functions——
+            # 若有人从注册表移除 settle 任务，此处 handler 缺失、任务静默不执行、SSE 收不到
+            # 事件、下方断言失败（真正回归陷阱⑤）。
+            wk = Worker(
+                functions=worker_mod.WorkerSettings.functions,
+                redis_settings=redis_settings,
+                on_startup=worker_mod.on_startup,
+                on_shutdown=worker_mod.on_shutdown,
+                burst=True,
+                handle_signals=False,
+                poll_delay=0.1,
+            )
+            await wk.async_run()
+            events = await _drain_pubsub(pubsub)
     finally:
         await pubsub.unsubscribe(sse.task_channel(task_id))
         await pubsub.aclose()
@@ -470,4 +350,5 @@ async def test_settle_arq_enqueue_consume_publishes_events(
     kinds = [e for e, _ in events]
     assert kinds == ["progress", "progress", "progress", "result"]
     result_data = [d for e, d in events if e == "result"][0]
-    assert result_data["answeredCount"] == 1
+    assert result_data["status"] == "settle_ready"
+    assert result_data["profile"]["genre"] == "修仙"

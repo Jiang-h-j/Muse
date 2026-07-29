@@ -1,7 +1,8 @@
 """Story 2.7 验证：自由探索——「整理为故事设定」开放门禁（AC3/AC4）。
 
-本 story 是**后端 only**切片（受控决策 A：前端接线 defer）+ 复用 2.5 skeleton
-`settle_guided_exploration` 任务（受控决策 B：真实凝练归 3.3）+ 护栏 defer（C：skeleton 无成本）。
+本 story 是**后端 only**切片（受控决策 A：前端接线 defer）+ 复用 2.5 的 settle skeleton
+任务（真实凝练归 3.3——Story 3.3 已把该任务接入真实 LLM 凝练并改名 `settle_exploration`）+
+护栏 defer（C：skeleton 无成本）。
 本 story 相对 2.5 的**净新增**是 AC4 后端门禁硬校验（≥1 条 free 用户消息才放行）。
 
 - 离线（不需容器）：触发端点鉴权缺失 401（CurrentUser 前置）。
@@ -11,8 +12,9 @@
   Redis 登记属主；收尾清孤儿 ARQ job。
 - mode 守卫 409（AC4/2.6 AC7）：guided-mode project 调 free/settle → 409 mode_mismatch。
 - 租户隔离 404（他人 project）/ 不存在 404（随机 UUID）/ 非法 UUID 422。
-- worker 端到端：复用 2.5 已坐实的 settle_guided_exploration 真实入队消费链路，本文件只验证 free
-  settle 触发入口正确，不重测 worker 内部（同一任务体，链路等价）。
+- worker 端到端：复用 `settle_exploration` 真实入队消费链路（3.3 已接真实凝练），本文件只验证
+  free settle 触发入口正确，不重测 worker 内部（同一任务体，链路等价；凝练本体断言归
+  test_story_settle）。
 """
 
 import uuid
