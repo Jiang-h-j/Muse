@@ -216,6 +216,10 @@ let projectsLoadState = "loading";
 // 当前登录用户邮箱：GET /api/auth/me 拉取后缓存，header 展示（替换硬编码 creator@example.com）。
 // 邮箱不变，缓存即可；me 失败降级为空串、不阻断作品列表。
 let currentUserEmail = "";
+// 列表拉取代次：每次 loadProjects 自增并捕获快照，回调时校验代次未变才写状态/DOM。
+// 防「离开 #/projects 又回来」两次拉取并发时旧回调覆盖新数据（hashPath 校验只防切走、
+// 不防往返；跨账号登出→登录后 hash 仍是 #/projects 同理需代次兜住）。
+let projectsLoadSeq = 0;
 
 // phase → 展示文案 + 继续路由的单一数据源（键须与后端英文枚举逐字一致）
 const PHASE_META = {
@@ -505,15 +509,20 @@ function paintProjects() {
 // 401 由 apiFetch 兜底（自动刷新重放 / 失效跳登录），不在此重复处理。
 async function loadProjects() {
   const startedHash = hashPath();
+  const seq = ++projectsLoadSeq; // 捕获本次拉取代次
   // 并发拉列表 + 邮箱；邮箱失败不阻断列表（受控决策 3，降级为不显示邮箱）。
   const [listResult, meResult] = await Promise.allSettled([
     projectApi.list(),
     authApi.me(),
   ]);
-  if (hashPath() !== startedHash) return; // 已切走，丢弃本次结果
-  if (meResult.status === "fulfilled" && meResult.value) {
-    currentUserEmail = meResult.value.email || "";
-  }
+  // 代次校验：期间又发起过新的 loadProjects（往返/切账号）则本次作废，不写状态/DOM。
+  // 兼顾 hash 校验（切到别的页）与代次校验（离开又回来的同页并发）。
+  if (seq !== projectsLoadSeq || hashPath() !== startedHash) return;
+  // me 成功写邮箱、失败清空（防跨账号残留：A 登出→B 登录 me 偶发失败时不显 A 邮箱）。
+  currentUserEmail =
+    meResult.status === "fulfilled" && meResult.value
+      ? meResult.value.email || ""
+      : "";
   if (listResult.status === "fulfilled") {
     projects = Array.isArray(listResult.value) ? listResult.value : [];
     projectsLoadState = projects.length ? "ready" : "empty";
@@ -1075,7 +1084,7 @@ function renderExploration() {
     <div class="explore-page">
       <header class="explore-header">
         <a class="explore-back" href="#/projects">← 作品</a>
-        <div class="explore-project"><strong>${explorationTitle}</strong><span>${isGuided ? "引导探索" : "自由探索"}</span></div>
+        <div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>${isGuided ? "引导探索" : "自由探索"}</span></div>
         <div class="save-state"><i></i> 已保存</div>
       </header>
       <main class="explore-workbench${isGuided ? " is-guided" : ""}">
@@ -1364,7 +1373,7 @@ function renderChapterCreation() {
     );
   }
   app.innerHTML = `<div class="chapter-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${explorationTitle}</strong><span>章节创作</span></div><div class="save-state"><i></i> ${chapterFinalized ? "本章已定稿" : chapterCreationState === "reading" ? "草稿已保存" : "已保存"}</div></header>
+    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节创作</span></div><div class="save-state"><i></i> ${chapterFinalized ? "本章已定稿" : chapterCreationState === "reading" ? "草稿已保存" : "已保存"}</div></header>
     <main class="chapter-workbench"><div class="chapter-main">${mainContent}</div>${chapterContextMarkup(stagePlan)}</main>
   </div>`;
   bindChapterCreationInteractions();
@@ -1721,7 +1730,7 @@ function renderChapterArchive() {
   );
   document.title = `章节归档 · ${explorationTitle}`;
   app.innerHTML = `<div class="chapter-archive-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects">← 作品</a><div class="explore-project"><strong>${explorationTitle}</strong><span>章节归档</span></div><div class="save-state"><i></i> ${String(completedCount).padStart(2, "0")} 章已归档</div></header>
+    <header class="explore-header"><a class="explore-back" href="#/projects">← 作品</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节归档</span></div><div class="save-state"><i></i> ${String(completedCount).padStart(2, "0")} 章已归档</div></header>
     <main class="chapter-archive-main">
       <header class="chapter-archive-heading"><div><span>Chapter archive</span><h1>已经写下的故事</h1><p>章节按阶段分行归档，每个阶段直接呈现已经写下的故事记忆。</p></div></header>
       ${archiveStoryProfileMarkup()}
@@ -1951,6 +1960,12 @@ function bindProjectInteractions() {
     event.preventDefault();
     (async () => {
       await authApi.logout();
+      // 重置作品库模块态，防下一账号登录看到上一账号残留（列表/邮箱）；自增代次作废
+      // 任何在途 loadProjects 回调（防旧账号数据回写新会话）。
+      projects = [];
+      currentUserEmail = "";
+      projectsLoadState = "loading";
+      projectsLoadSeq++;
       location.hash = "#/login";
     })();
   });
@@ -1996,6 +2011,16 @@ function bindProjectInteractions() {
             mode,
             title: titleInput || undefined,
           });
+          // 响应必须含真实 id 才能进探索页；缺 id（后端 bug/代理裁字段）则当作失败，
+          // 不跳 #/projects/undefined/explore 污染后续操作。
+          if (!project || !project.id) {
+            throw new ApiError(
+              "invalid_response",
+              "创建返回缺少作品标识。",
+              undefined,
+              undefined,
+            );
+          }
           // 保留原型「新建即进全新探索」语义：以真实 title 起头 + 重置探索/章节全局态，
           // 再按真实作品 id 进探索页（替换固定 demo）。
           explorationTitle = project.title || titleInput || "未命名小说";
@@ -2111,15 +2136,14 @@ function bindInlineProjectActions(row) {
       (async () => {
         try {
           await projectApi.remove(projectId);
-          // 真实删除成功（204）→ 从本地列表移除 + 重绘（空则自动转 empty 态）。
-          projects = projects.filter((item) => item.id !== projectId);
-          projectsLoadState = projects.length ? "ready" : "empty";
+          // 真实删除成功（204）→ 重拉列表（与改名一致，过 loadProjects 的 hash+代次
+          // 校验、并反映后端最新状态；空列表自动转 empty 态）。
+          projectsLoadState = "loading";
           renderProjects();
         } catch (err) {
-          // project_not_found 视为已删（幂等友好）：同样从列表移除刷新。
+          // project_not_found 视为已删（幂等友好）：同样重拉刷新。
           if (err && err.code === "project_not_found") {
-            projects = projects.filter((item) => item.id !== projectId);
-            projectsLoadState = projects.length ? "ready" : "empty";
+            projectsLoadState = "loading";
             renderProjects();
             return;
           }
@@ -2288,7 +2312,7 @@ function readthroughPages(chapter) {
 function renderStageDirection() {
   document.title = `下一段方向 · ${explorationTitle} · Muse`;
   app.innerHTML = `<div class="stage-direction-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/chapters/1">← 返回创作</a><div class="explore-project"><strong>${explorationTitle}</strong><span>阶段交界</span></div><div class="save-state"><i></i> 上一阶段已写完</div></header>
+    <header class="explore-header"><a class="explore-back" href="#/projects/demo/chapters/1">← 返回创作</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>阶段交界</span></div><div class="save-state"><i></i> 上一阶段已写完</div></header>
     <main class="stage-direction-main">
       <section class="stage-direction-card">
         <div class="stage-direction-overline">Between stages / 阶段交界</div>
@@ -2421,7 +2445,7 @@ function renderReadthrough() {
     .join("");
   document.title = `通读 · ${chapter.title} · Muse`;
   app.innerHTML = `<div class="readthrough-page">
-    <header class="explore-header readthrough-header"><a class="explore-back" href="#/projects/demo/archive">← 故事档案</a><div class="explore-project"><strong>${explorationTitle}</strong><span>通读</span></div></header>
+    <header class="explore-header readthrough-header"><a class="explore-back" href="#/projects/demo/archive">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>通读</span></div></header>
     <main class="readthrough-main">
       <article class="readthrough-reader" aria-live="polite">
         <div class="readthrough-chapter-meta"><span>第 ${chapterNo} 章</span><i></i><span>共 ${String(totalChapters).padStart(2, "0")} 章</span></div>
@@ -2490,7 +2514,7 @@ function renderStyleAnchor() {
     : Boolean(activeSample);
   document.title = "锚定文风 · Muse";
   app.innerHTML = `<div class="style-anchor-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${explorationTitle}</strong><span>文风锚点</span></div><div class="save-state"><i></i> ${anchored ? "文风已锚定" : "尚未锚定"}</div></header>
+    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>文风锚点</span></div><div class="save-state"><i></i> ${anchored ? "文风已锚定" : "尚未锚定"}</div></header>
     <main class="style-anchor-main">
       <section class="style-anchor-intro">
         <div class="style-anchor-overline">Style anchor / 文风锚点</div>
