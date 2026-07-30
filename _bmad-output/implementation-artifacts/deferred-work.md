@@ -212,3 +212,15 @@
 ## Deferred from: code review of story-3.5 (2026-07-29)
 
 - **并发 confirm/discard 可删除已 confirmed 圣经** [backend/src/muse/repositories/story_bible_repo.py `delete_pending_card`] — `delete_pending_card` 读取时按 `status='pending'` 过滤，但删除走 ORM「读→改内存对象→flush」，PK 删除不带 status 谓词。READ COMMITTED 下：请求 A（confirm）读到 pending 行、改 status='confirmed' flush（未 commit）；请求 B（discard）另一 session 读到同一行（仍见 pending，因 A 未提交）排队 session.delete；A 提交后行变 confirmed，B 的 delete 按 PK 删掉已 confirmed 圣经。docstring 声称「confirmed 绝不被误删」仅在单请求视图成立。单用户 + 前端 disable 按钮无真实并发面，与 3.4 revise（本文件 story-3.4 defer）、1.5 rename/delete、1.7 byok upsert 一路 check-then-act last-write-wins defer 同风险级。**归开放注册/多端并发前并发加固批次**：改条件式 `DELETE ... WHERE id=? AND status='pending'` 检查 rowcount，或乐观锁版本列 / `SELECT ... FOR UPDATE` 锁定 (user_id, project_id) 行，与既有并发类 defer 统一处理。（code review Blind + Edge Case Hunter 独立指出，Low）
+
+
+## Deferred from: Story 7.1 统一请求工具地基（token / 401 跳转 / error envelope / camelCase 边界）(2026-07-30)
+
+> Epic 7 全 epic 硬前置。本 story 交付连接底座 `prototype/app/api.js`（apiFetch/ApiError/token 存取/401 单例刷新重放/redirectToLogin/authApi）+ 后端 dev CORS + 真实往返冒烟；index.html 于 app.js 前引入 api.js。受控决策 8 项已定档（见 story Dev Notes）。**边界内明确 defer 的下游接线**：
+
+- **登录/注册页完整交互接线未做 → 归 Story 7.2** [prototype/app/app.js:1710-1728 `bindAuthInteractions`] — 本 story 只交付 `authApi` 调用函数 + 冒烟，**未接 UI**：登录/注册表单 submit 仍是假延迟 `setTimeout`（app.js:1717）跳 `#/projects`，未调 `authApi.login/register`；expired/invalid/locked 状态位仍靠 `data-auth-state` 预览按钮手动切（app.js:1721-1728）而非真实 error envelope 映射；退出按钮未调 `authApi.logout`。**归 7.2**：把 `authApi` 接到表单 submit（注册成功后串接 login，因注册不签发 token——受控决策 8）、据 `ApiError.code`/`detail` 布尔位映射三态、接登出按钮。
+- **作品库/探索/设定各页接线未做 → 归 7.3–7.7** [prototype/app/app.js 各业务页 mock 常量如 `projects` app.js:209-240] — 本 story 未接任何业务页，各页数据源仍是硬编码 mock 常量。7.3 作品库、7.4 BYOK/用量、7.5 引导探索、7.6 自由探索、7.7 设定卡/文风锚点各自用 `apiFetch`/`authApi` 逐页替换 mock（后端契约 2.x/3.x 已 done，可零改动对接）。此为 1.7→3.5 一路 defer 的「探索前端集成切片」承接点。
+- **路由级鉴权守卫未做 → 归 7.2/7.3 按页 401 处理** [prototype/app/app.js `render` dispatcher] — 本 story 未改 `render` 加「未登录访问受保护路由的全局拦截」，只提供 `redirectToLogin` 能力。V1 由各页在拿到 401（走 apiFetch 自动跳登录）时被动处理，全局守卫按需在 7.2/7.3 落地。
+- **生产 CORS/同源策略须部署 story 复核** [backend/src/muse/core/settings.py `cors_allow_origins`、backend/src/muse/main.py CORSMiddleware] — 本 story 选方案①后端 dev CORS（受控决策 6），默认放行原型两个本地 origin（127.0.0.1/localhost:4173），`.env` 可覆盖。生产的同源部署/网关/CORS 域策略（是否走反代同源、是否收紧 allow_methods/headers）**归部署 story 复核**，勿把 dev 默认值带进生产。
+- **冒烟临时入口 `window.__museApiSmoke` 在 7.2 接 UI 后移除** [prototype/app/api.js 末尾 `__museApiSmoke`] — 该入口是地基「对接真实后端可用」的活体证明（devtools console 手动调），不接任何 UI、不进 `bindAuthInteractions`/`render`。**归 7.2**：登录/注册页真实接线后，此临时入口可整段删除。
+- **localStorage 存 token 的 XSS 暴露面待开放注册前复核**（承受控决策 7 待确认项）[prototype/app/api.js `ACCESS_TOKEN_KEY`/`REFRESH_TOKEN_KEY`] — V1 单人 MVP、无第三方脚本，localStorage 存 token 可接受。**归安全加固批次**：开放注册前若引入第三方脚本/CDN，须复核是否改用 httpOnly cookie（与 1.2「开放注册前重新评估」邮箱枚举等安全项同批）。

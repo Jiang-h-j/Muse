@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # Redis：ARQ broker + SSE/缓存 + 登录失败限流（Story 1.3 起）
     redis_url: str = "redis://localhost:6379/0"
 
+    # CORS 允许来源（Story 7.1 AC6，联调前置）：原型静态站 :4173 与后端 :8000 跨域，
+    # 浏览器会在预检/响应阶段拦截所有跨域请求（含 401），地基无从验证。此处按环境放开
+    # 允许来源，**不无脑 `*`**（architecture.md:181 分环境）：默认列原型两个本地 origin
+    # （127.0.0.1 与 localhost 是不同 origin，须都列），.env 可用逗号分隔覆盖为生产网关域。
+    # 生产的同源/网关策略按部署 story 复核（deferred-work 已登记）。
+    cors_allow_origins: str = "http://127.0.0.1:4173,http://localhost:4173"
+
     # JWT 双 token（Story 1.3）：签名密钥 + access/refresh 有效期（秒）。
     jwt_secret: str = _DEFAULT_JWT_SECRET
     # TTL 必须为正：0 或负值会签发出「签发即过期」的 token，登录后立刻 401 不可用。
@@ -120,6 +127,15 @@ class Settings(BaseSettings):
                 f"（AES-256-GCM 要求），当前为 {len(decoded)} 字节，拒绝启动。"
             )
         return self
+
+    @property
+    def cors_allow_origins_list(self) -> list[str]:
+        """把逗号分隔的 CORS 来源字符串解析为 list（供 CORSMiddleware 消费，Story 7.1 AC6）。
+
+        逐项 strip 去空白、剔除空串，避免尾随逗号/多余空格产出空 origin。空配置返回空列表
+        （等价于不放开任何跨域，浏览器一律拦截——生产若走同源/网关则应显式清空此项）。
+        """
+        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
 
 
 @lru_cache

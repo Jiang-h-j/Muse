@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-29 (Story 3-5 code review 通过 + 4 patch 修复：review → done)
+# last_updated: 2026-07-30 (Correct Course：前后端节奏转向，新增 Epic 7 前端集成 backlog)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,10 +41,13 @@
 #   盲测依赖 Epic 2 的 LLM 底座（2-1）+ Epic 3 的 style_profile（3-2）+ 去 AI 味词表。
 # - 跨 epic 受控依赖：Story 1-8 额度护栏「真正生效」依赖 Epic 2 Provider 层埋点（AR14），
 #   本 story 只建表+校验框架+展示；须追踪衔接不留空窗。
+# - 前端集成（Epic 7，2026-07-30 Correct Course 新增）：执行时序介于 E3/E4 之间——
+#   先还清 E1-3 接线债跑通「注册登录→作品库→探索→设定圣经」闭环，再进 E4 创作。
+#   与 4-1 盲测门禁（纯后端评测）互不阻塞、可并行。7.1 统一请求工具地基为全 epic 硬前置。
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-07-29 (Story 3-5 code review 通过 + 4 patch 修复：review → done；Epic 3 全 5 story done)
+last_updated: 2026-07-30 (Story 7.1 完成 → review：api.js 连接底座 + 后端 dev CORS + 真实往返冒烟)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -109,3 +112,15 @@ development_status:
   6-1-全本连续通读视图全新页面: backlog
   6-2-AI辅助生成标识合规: backlog
   epic-6-retrospective: optional
+
+  # ---------- Epic 7: 前端真实接线与端到端集成（2026-07-30 Correct Course 新增）----------
+  # 执行时序介于 E3/E4 之间：偿还 E1-3 接线债，跑通闭环。7.1 地基为硬前置。
+  epic-7: in-progress
+  7-1-统一请求工具地基token-401跳转-errorenvelope-camelCase边界: review
+  7-2-登录注册接线真实会话替换mock: backlog
+  7-3-作品库接线列表-新建-重命名-删除-空失败态-继续创作跳转: backlog
+  7-4-BYOK设置页-托管用量入口接线含UX-DR2新增UI: backlog
+  7-5-引导探索接线SSE问答-翻页持久化-整理中过渡-设定卡弹出: backlog
+  7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: backlog
+  7-7-设定卡-文风锚点接线12字段-编辑升版本-确认圣经-回到探索丢弃含UX-DR1新增UI: backlog
+  epic-7-retrospective: optional
