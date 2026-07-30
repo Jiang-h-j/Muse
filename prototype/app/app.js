@@ -1743,11 +1743,14 @@ function bindAuthInteractions() {
       submit.disabled = false;
       submitLabel.textContent = originalLabel;
     };
-    const showError = (err) => {
+    const showError = (err, errorMode = mode) => {
       // 严格按后端 code 映射状态位（AC6），不臆造分支；未知错误落 failed 中性兜底。
+      // errorMode 决定呈现哪一页/哪套文案：注册阶段本身失败用 register；注册成功后
+      // 串接 login 失败改用 login——账号已建成、不该再回注册页（否则用户换码重注册撞
+      // 「邀请码已使用」死循环），应引导去登录页用刚建的账号登录（Story 7.2 Task 2 边界情形）。
       const state = authStateFromError(err);
       restoreSubmit();
-      const base = mode === "register" ? "#/register" : "#/login";
+      const base = errorMode === "register" ? "#/register" : "#/login";
       const target = `${base}?state=${state}`;
       // 同 hash 不会触发 render，此时按钮已手动复位、错误文案已在页面呈现，无需额外处理。
       location.hash = target;
@@ -1757,20 +1760,33 @@ function bindAuthInteractions() {
     const password = form.querySelector("#password").value;
 
     (async () => {
-      try {
-        if (mode === "register") {
-          const inviteCode = form.querySelector("#invite").value;
-          // 注册不签发 token（受控决策 1）：register 成功后串接一次 login 拿会话 token。
+      if (mode === "register") {
+        const inviteCode = form.querySelector("#invite").value;
+        // 注册不签发 token（受控决策 1）：register 成功后串接一次 login 拿会话 token。
+        // 两阶段错误分开呈现：register 失败留注册页（邀请码等问题）；register 成功但
+        // 串接 login 失败按 login 呈现（账号已建成，引导去登录页，勿回注册页死循环）。
+        try {
           await authApi.register({ inviteCode, email, password });
-          await authApi.login({ email, password });
-        } else {
-          // login 内部已 setTokens 落 localStorage（api.js），此处勿重复存 token。
-          await authApi.login({ email, password });
+        } catch (err) {
+          showError(err, "register");
+          return;
         }
-        location.hash = "#/projects";
-      } catch (err) {
-        showError(err);
+        try {
+          await authApi.login({ email, password });
+        } catch (err) {
+          showError(err, "login");
+          return;
+        }
+      } else {
+        // login 内部已 setTokens 落 localStorage（api.js），此处勿重复存 token。
+        try {
+          await authApi.login({ email, password });
+        } catch (err) {
+          showError(err, "login");
+          return;
+        }
       }
+      location.hash = "#/projects";
     })();
   });
   document.querySelectorAll("[data-auth-state]").forEach((button) => {

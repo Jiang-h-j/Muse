@@ -3,7 +3,7 @@ baseline_commit: 077f50d
 ---
 # Story 7.2: 登录 / 注册接线（真实会话，替换 mock）
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -65,6 +65,17 @@ so that 我的会话与身份由后端真实签发，而非前端假数据。
   - [x] 更新 `_bmad-output/implementation-artifacts/deferred-work.md`：勾除 / 更新 7.1 登记的「① 登录/注册页完整接线」「⑤ 冒烟临时入口移除」为已完成；确认作品库列表 / 邮箱展示等仍 defer 至 7.3。
   - [x] 更新 `sprint-status.yaml`：`7-2-登录注册接线真实会话替换mock` 状态 `ready-for-dev` → `review`（dev 完成后）。
   - [x] 按 story 边界提交（`feat: 实现 Story 7.2 登录注册接线...`），[[feedback_timely_commit]]。
+
+## Review Findings (2026-07-30，三层对抗审查，子 agent 用 Sonnet 独立于实现 Opus)
+
+> Blind Hunter（仅 diff）+ Edge Case Hunter（diff + 项目只读，已核实 api.js 契约/前端锚点）完成；**Acceptance Auditor 子 agent 因 API 敏感词过滤中途报错终止（failed_layer）**，由主 agent 补做 AC 对照：AC1–6 + 4 受控决策全 PASS、未越界（未接业务页/未改 api.js 逻辑/header 邮箱未改/未加路由守卫/冒烟入口已移除）。去重后 1 patch + 3 defer + 5 dismiss。
+
+- [x] [Review][Patch] 注册成功后串接 login 失败被误判为注册错误（显示「邀请码无效」并死循环）[prototype/app/app.js:1746-1765] — `mode` 在 handler 入口一次性捕获为 `register`；register 成功（账号已建、邀请码已耗）后 login 失败时，`showError` 仍按 register 模式跳 `#/register?state=invalid`、`stateMessage` 显示「邀请码无效、已使用或已过期」，用户去换码重注册撞「已使用」死循环。**违反 spec Task 2 边界情形**（「注册成功但串接 login 失败——按 login 的错误分支处理、不重复注册」）。blind#3 + edge。**✅ 已修**：`showError(err, errorMode)` 加呈现模式参数，注册流程拆两段 try——register 阶段失败 `showError(err,"register")` 留注册页；串接 login 阶段失败 `showError(err,"login")` 跳登录页（账号已建成，引导用新账号登录，不回注册页死循环）。playwright 针对性验证 10 项全绿（拦截 login 返 401 → 确认跳 `#/login?state=invalid` 显示「邮箱或密码错误」而非「邀请码无效」；注册阶段失败仍留注册页；账号确实建成可登录）。
+- [x] [Review][Defer] 退出按钮无 loading/超时保护，网络卡死时无反馈且 token 未清 [prototype/app/app.js:1794-1800 + api.js apiFetch 无 timeout] — deferred，apiFetch 全局无超时属 7.1 既有（与 2.3/4.4 provider 超时 defer 同源）、logout 幂等且正常瞬时、低概率。blind#1（"throws 卡死"部分为假阳性，edge 已证 logout 内部 try/finally 不抛）+ edge。
+- [x] [Review][Defer] `authApi.login` 未校验响应必需 token 字段，后端 200 缺字段则「登录成功」后立即被踢 expired [prototype/app/api.js:239-250] — deferred，7.1 地基防御缺口（doRefresh 有 patch#3 字段校验、login 无对等），后端契约保证 200 必带双 token（dev-story curl 已证）、低概率；改动须动 api.js 地基（spec 边界须记录后再动）。edge。
+- [x] [Review][Defer] 在途登录/注册 async 完成时无条件写 location.hash，用户提交期间切页被强制导航 [prototype/app/app.js:1759-1770] — deferred，低概率并发类加固（与项目既有 check-then-act defer 同批）；登录成功跳 `#/projects` 本身合理（用户已鉴权），仅「失败回落 stale mode 甩回原页」为真边界。blind#4 + edge。
+
+**Dismissed（噪声/假阳性，5 条）**：① blind#2「重复同错不触发 hashchange」——首次错误已 hashchange 渲染正确文案且常驻屏幕，`restoreSubmit` 已复位按钮，重复同错时消息仍正确显示，非缺陷；② blind/edge「Enter 双发污染 originalLabel」——`submit.disabled=true` 正常拦截隐式提交，仅浏览器违规才触发、极低；③ blind「token_invalid→expired 映射误导」——本就是 spec error code 映射表明列项（「7.1 已处理跳转，本 story 只呈现」），login/register auth=false 请求不产生此 code，dead-but-harmless；④ blind「detail vs code 优先级」——设计说明非缺陷；⑤ blind「成功路径不 restoreSubmit」——成功跳 `#/projects` 触发 hashchange 重绘全新页面，按钮态随旧 DOM 回收，非缺陷。
 
 ## Dev Notes
 
@@ -192,3 +203,4 @@ Claude Opus 4.8 (claude-opus-4.8)
 ## Change Log
 
 - 2026-07-30：实现 Story 7.2 登录/注册接线（替换 mock）。submit handler 改真实 async 调用（登录直调 login、注册 register→串接 login）；新增 `authStateFromError` 按后端 error code 映射 invalid/locked/expired/failed；退出按钮改调 `authApi.logout`；移除 7.1 临时冒烟入口。Tasks 1–6 全部完成，AC1–6 满足。验证：纯逻辑 16 项 + 后端契约 curl 9 场景 + playwright UI 13 项全绿，后端全量回归 340 passed 零回归。
+- 2026-07-30：三层对抗 code review（子 agent 用 Sonnet，Acceptance Auditor 因 API 敏感词过滤终止、主 agent 补做 AC 对照全 PASS）。1 patch 就地修复：注册成功后串接 login 失败改按 login 模式呈现（跳登录页而非注册页），解除「误报邀请码无效→换码重注册」死循环——playwright 针对性验证 10 项全绿。3 defer 登记 deferred-work（退出无超时/login 响应字段校验/在途 async 导航），5 噪声 dismiss。review → done。
