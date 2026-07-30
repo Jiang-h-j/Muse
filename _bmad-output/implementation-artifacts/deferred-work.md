@@ -224,3 +224,11 @@
 - **生产 CORS/同源策略须部署 story 复核** [backend/src/muse/core/settings.py `cors_allow_origins`、backend/src/muse/main.py CORSMiddleware] — 本 story 选方案①后端 dev CORS（受控决策 6），默认放行原型两个本地 origin（127.0.0.1/localhost:4173），`.env` 可覆盖。生产的同源部署/网关/CORS 域策略（是否走反代同源、是否收紧 allow_methods/headers）**归部署 story 复核**，勿把 dev 默认值带进生产。
 - **冒烟临时入口 `window.__museApiSmoke` 在 7.2 接 UI 后移除** [prototype/app/api.js 末尾 `__museApiSmoke`] — 该入口是地基「对接真实后端可用」的活体证明（devtools console 手动调），不接任何 UI、不进 `bindAuthInteractions`/`render`。**归 7.2**：登录/注册页真实接线后，此临时入口可整段删除。
 - **localStorage 存 token 的 XSS 暴露面待开放注册前复核**（承受控决策 7 待确认项）[prototype/app/api.js `ACCESS_TOKEN_KEY`/`REFRESH_TOKEN_KEY`] — V1 单人 MVP、无第三方脚本，localStorage 存 token 可接受。**归安全加固批次**：开放注册前若引入第三方脚本/CDN，须复核是否改用 httpOnly cookie（与 1.2「开放注册前重新评估」邮箱枚举等安全项同批）。
+
+## Deferred from: code review of story-7.1 (2026-07-30)
+
+> 三层对抗审查（Blind/Edge/Auditor，子 agent 用 Sonnet 独立于实现 Opus）。AC1-6 + 8 决策全 PASS、无越界。以下 3 条 defer；2 patch 已就地修复（见 story Review Findings）；2 decision-needed 交用户裁定；4 条噪声/假阳性 dropped（Starlette 1.3.1 实测 CORS methods 展开正确 / logout 无需 Bearer / 空串拒跨域是刻意设计 / 后端 code 恒字符串）。
+
+- **refresh 与 logout 并发竞态 →「静默重登录」** [prototype/app/api.js `doRefresh`:166-191 vs `authApi.logout`:226-245] — 时序：业务 401 触发 doRefresh（refresh=R0 在途）→ 用户点登出读到 R0 发 logout → logout 响应先到 `finally clearTokens` 清本地 → refresh 响应后到 `setTokens(A1,R1)` 回填。结果用户以为已登出、本地却留着有效 A1/R1，下次开页面自动"登录"回原账号。单用户 + 前端登出后立即跳登录页无真实并发面，与既有 check-then-act 并发类 defer 同风险级。**归开放注册/多端并发前加固批次**：logout 期间禁 setTokens（如 logout 先置 `inflightRefresh=null` + setTokens 改为「若期间发生过 clearTokens 则丢弃 refresh 结果」的 CAS）。（Edge Case Hunter F4，Med）
+- **CORS origin 未规范化，尾斜杠/scheme 大小写配置静默不匹配** [backend/src/muse/core/settings.py:131-138 `cors_allow_origins_list`] — 仅 strip 首尾空白，不去尾斜杠、不归一化 scheme 大小写。`.env` 写 `http://localhost:4173/`（尾斜杠）或 `HTTP://...`（大小写）时浏览器 Origin 头逐字比对失配，启动无报错、只在跨域时暴露。属部署配置健壮性。**归部署 story**：origin 规范化（去尾斜杠 + scheme 小写）或启动期校验。（Edge Case Hunter F5，Low）
+- **`API_BASE` 生产未注入时静默打本机 127.0.0.1:8000** [prototype/app/api.js:16-18] — 兜底值为 `http://127.0.0.1:8000`，预览/生产打包若忘注入 `window.__MUSE_API_BASE`，前端请求全打向用户本机 → `ERR_CONNECTION_REFUSED`，构建期无校验告警。**归部署/7.2 接线**：非本地环境 `window.__MUSE_API_BASE` 未定义时构建/启动期报错，或命中兜底时 `console.warn`。（Blind Hunter #8，Low）

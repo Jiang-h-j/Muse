@@ -3,7 +3,7 @@ baseline_commit: 332168e
 ---
 # Story 7.1: 统一请求工具地基（token / 401 跳转 / error envelope / camelCase 边界）
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -84,6 +84,21 @@ so that 后续所有页面接线（7.2–7.7）都建立在一致、可复用的
   - [x] **登记 `deferred-work.md`**（对齐既有「问题+位置+影响+归属批次」格式）：① 登录/注册页完整接线（表单提交调 authApi、expired/invalid/locked 状态位真实映射、登出按钮调 logout）→ 7.2；② 作品库/探索/设定各页接线 → 7.3–7.7；③ 路由级鉴权守卫（未登录访问受保护路由的全局拦截）→ 按页 401 处理，V1 归 7.2/7.3；④ 若最终选方案②同源反代而非后端 CORS，则生产部署的同源/网关方案须在部署 story 复核；⑤ 冒烟临时入口在 7.2 接 UI 后移除。
   - [x] 更新 `_bmad-output/implementation-artifacts/sprint-status.yaml`：`7-1-统一请求工具地基token-401跳转-errorenvelope-camelCase边界` 状态 `backlog` → `review`（dev 完成后）。
   - [x] 按 story 边界提交（`feat: 实现 Story 7.1 统一请求工具地基...`），前端 + 后端 CORS 一并纳入本次提交（[[feedback_timely_commit]]）。
+
+### Review Findings (2026-07-30，三层对抗审查，子 agent 用 Sonnet 独立于实现 Opus)
+
+> 三层：Blind Hunter（仅 diff）+ Edge Case Hunter（diff + 项目只读，已核实前端锚点/后端契约）+ Acceptance Auditor（对照 spec，AC1-6 + 8 决策全 PASS、无越界）。去重后 2 decision-needed + 2 patch + 3 defer + 4 dismiss。
+
+- [x] [Review][Decision] 401 刷新后仍失败 / 无 refresh 的 401 → 不清 token 不跳登录，留「僵尸登录态」 [prototype/app/api.js:127-134] — **已修（决策 1 选 A）**：在 apiFetch 加「无法救回的业务 401 统一 clearTokens+redirectToLogin('expired')」收敛分支，把跳登录彻底收进工具层。blind#1 + edge F1/F2。
+- [x] [Review][Decision] `doRefresh` 把 5xx/网络错误也当会话过期强制登出 [prototype/app/api.js:166-191] — **已修（决策 2 选 A）**：只对明确 401（refresh 真失效）清 token 跳登录；5xx/网络/CORS/解析失败视为瞬时错误，保留 token 抛错让上层重试。blind#5。
+- [x] [Review][Patch] 成功响应体非 JSON → `JSON.parse` 抛裸 SyntaxError 绕过 ApiError 抽象 [prototype/app/api.js:140] — **已修**：`JSON.parse` 包 try/catch，失败转 `ApiError('invalid_response')`。blind#2 + edge F3。
+- [x] [Review][Patch] `setTokens` 部分写入：轮转缺 refreshToken 字段时静默留旧（已作废）refresh [prototype/app/api.js:47-52] — **已修**：doRefresh 校验 accessToken+refreshToken 双字段齐全，缺任一即 clearTokens+跳登录，不半写。blind#4 + edge。
+- [x] [Review][Defer] refresh 与 logout 并发竞态 → 「静默重登录」 [prototype/app/api.js:166-191 vs 226-245] — deferred，属并发类加固（与既有 check-then-act defer 同批）。
+- [x] [Review][Defer] CORS origin 未规范化（尾斜杠/大小写）→ 配置陷阱静默不匹配 [backend/src/muse/core/settings.py:131-138] — deferred，属部署配置健壮性（归部署 story）。
+- [x] [Review][Defer] `API_BASE` 生产未注入 `window.__MUSE_API_BASE` 时静默打本机 127.0.0.1:8000 [prototype/app/api.js:16-18] — deferred，属生产构建期注入（归部署/7.2 接线）。
+
+**Dismissed（噪声/假阳性，4 条，已核实）**：① blind#3/edge L3「CORS `allow_methods=["*"]` credentialed 下被浏览器拒」——Starlette 1.3.1 真实预检展开为具体方法（curl 实测 `DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT`），假阳性；② blind#6「logout 应带 Bearer」——后端 logout 无 CurrentUser 依赖、只认 body refreshToken，假阳性；③ blind#7「空串→`[]`拒所有跨域」——注释已明写此语义，是刻意设计（生产走同源时清空）；④ edge L2「后端返数字 code」——`core/errors.py` code 恒字符串，臆测。
+
 
 ## Dev Notes
 
@@ -211,3 +226,4 @@ Claude Opus 4.8 (claude-opus-4.8)
 ## Change Log
 
 - 2026-07-30：实现 Story 7.1 统一请求工具地基（`api.js` 连接底座 + 后端 dev CORS + 真实往返冒烟），Tasks 1–7 全部完成，AC1–6 满足。
+- 2026-07-30：三层对抗 code review（子 agent 用 Sonnet 独立于实现 Opus）。AC1-6 + 8 决策全 PASS。2 decision-needed（均选 A）+ 2 patch 就地修复：① 无法救回的业务 401 统一 clearTokens+跳登录（收敛进工具层）；② refresh 遇 5xx/网络错误不踢人、仅真失效登出；③ 成功响应非 JSON 转 ApiError；④ 轮转缺字段不半写。3 defer 登记 deferred-work，4 噪声 dismiss。修复后 20 项 mock 验证全绿。review → done。

@@ -129,6 +129,16 @@ async function apiFetch(path, { method = "GET", body, auth = true, _retried = fa
     return apiFetch(path, { method, body, auth, _retried: true });
   }
 
+  // 无法救回的业务 401（review 决策 1）：①重放后仍 401（新 access 也无权/账号已失效）；
+  // ②本地无 refresh 可换。两者都表示会话已不可用——在此统一 clearTokens + 跳登录，把「跳登录」
+  // 彻底收敛进本工具（AC3「全 epic 唯一跳登录入口」的完整落地），不散给各页各写一遍。
+  // 注意仅业务请求（auth=true）走此收敛：auth=false 的 login/refresh 401 是凭证错误，照常抛出。
+  if (res.status === 401 && auth) {
+    clearTokens();
+    redirectToLogin("expired");
+    throw await toApiError(res);
+  }
+
   if (!res.ok) {
     throw await toApiError(res);
   }
@@ -137,7 +147,13 @@ async function apiFetch(path, { method = "GET", body, auth = true, _retried = fa
   if (res.status === 204) return null;
   const text = await res.text();
   if (!text) return null;
-  return JSON.parse(text);
+  // 成功响应体理应是 JSON；若遇 200 返 HTML 错误页/空格/代理拦截等非法 JSON（review patch#2），
+  // 转成结构化 ApiError 而非抛裸 SyntaxError——守住「调用方只需 catch ApiError」的契约。
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ApiError("invalid_response", "服务器返回了无法解析的响应。", undefined, res.status);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -162,7 +178,9 @@ function ensureRefresh() {
 }
 
 // 用 refresh token 换新 access + 轮转后的新 refresh，存回本地。
-// 失败（401 / token_invalid）→ clearTokens + 跳 #/login?state=expired，并抛错让原请求链终止。
+// 失败区分处理（review 决策 2）：只有 refresh 真失效（后端 401 / token_invalid）才清 token 跳登录；
+// 网络中断 / 后端 5xx / CORS 失败等**瞬时错误**不清 token、不踢人——原 refresh 仍有效，抛错让上层
+// 稍后重试即可（避免 wifi 抖一下就被迫重新登录）。
 async function doRefresh() {
   const refreshToken = getRefreshToken();
   if (!refreshToken) {
@@ -170,24 +188,36 @@ async function doRefresh() {
     redirectToLogin("expired");
     throw new ApiError("token_invalid", "会话已过期，请重新登录。", { expired: true }, 401);
   }
+  let bundle;
   try {
     // auth=false：refresh 请求自身不注入 access、其 401 不再触发刷新（受控决策 4）。
-    const bundle = await apiFetch("/api/auth/refresh", {
+    bundle = await apiFetch("/api/auth/refresh", {
       method: "POST",
       body: { refreshToken },
       auth: false,
     });
-    setTokens({
-      accessToken: bundle.accessToken,
-      refreshToken: bundle.refreshToken,
-    });
-    return bundle;
   } catch (err) {
-    // refresh 亦失效：清本地态并跳登录，原请求链终止。
-    clearTokens();
-    redirectToLogin("expired");
+    // 只有明确的鉴权失败（401，refresh 真失效）才登出；其余（5xx/网络/CORS/解析失败）视为瞬时错误，
+    // 保留 token 抛错让上层重试（review 决策 2）。ApiError.status 由 toApiError 透传 HTTP 码。
+    if (err instanceof ApiError && err.status === 401) {
+      clearTokens();
+      redirectToLogin("expired");
+    }
     throw err;
   }
+  // refresh 一次性轮转：新 access + 新 refresh 必须成对下发。若响应意外缺任一字段（后端 bug/代理裁剪），
+  // 不能只写一半——旧 refresh 已被后端作废，半更新会让本地 token 处于必然失败态（review patch#3）。
+  // 缺字段即视为会话不可续，清 token 跳登录。
+  if (!bundle || !bundle.accessToken || !bundle.refreshToken) {
+    clearTokens();
+    redirectToLogin("expired");
+    throw new ApiError("token_invalid", "会话已过期，请重新登录。", { expired: true }, 401);
+  }
+  setTokens({
+    accessToken: bundle.accessToken,
+    refreshToken: bundle.refreshToken,
+  });
+  return bundle;
 }
 
 // ---------------------------------------------------------------------
