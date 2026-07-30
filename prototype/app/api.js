@@ -316,6 +316,48 @@ const projectApi = {
 };
 
 // ---------------------------------------------------------------------
+// BYOK API 薄封装（Story 7.4）：模型接入页绑定/查询/解绑自有 API Key。
+// 全部经 apiFetch（默认 auth=true）——token 注入、401 刷新重放、error envelope
+// 解包、跳登录收敛均由地基处理，本封装只拼 path/method/body。
+// 后端契约（backend/src/muse/routers/byok.py，Story 1.7 已 done）：
+//   GET    /api/byok  → 200 ByokStatusResponse {bound, provider, maskedKey}
+//   PUT    /api/byok  → 200 ByokStatusResponse（body {apiKey, provider}，幂等 upsert 覆盖）
+//   DELETE /api/byok  → 204 无体（解绑，幂等）
+// provider 枚举：deepseek/claude/custom；maskedKey = …+尾4位（≤4 全打码），绝不回显明文。
+const byokApi = {
+  status() {
+    return apiFetch("/api/byok");
+  },
+  // 绑定/替换：PUT 幂等，已绑定时覆盖旧 Key。apiKey 后端 min_length=1（空串→422）、
+  // service strip 判空（纯空白→byok_invalid_key 400）；前端在非空白前 disable 按钮即可。
+  bind({ apiKey, provider }) {
+    return apiFetch("/api/byok", {
+      method: "PUT",
+      body: { apiKey, provider },
+    });
+  },
+  unbind() {
+    return apiFetch("/api/byok", {
+      method: "DELETE",
+    });
+  },
+};
+
+// ---------------------------------------------------------------------
+// 用量 API 薄封装（Story 7.4）：托管免费额度用量展示。
+// 后端契约（backend/src/muse/routers/usage.py，Story 1.8 已 done）：
+//   GET /api/usage → 200 UsageViewResponse
+//     托管用户：{billingPath:"hosted", quotaApplies:true, used, quota, remaining, resetAt}
+//     BYOK 用户：{billingPath:"byok", quotaApplies:false, used/quota/remaining=null}
+// 计量单位为 tokens（默认 quota 200000）；resetAt 恒 null（累计总量护栏，不做每日重置）。
+// 只读接口，永不返 429（触顶护栏在生成链路、非本接口）——前端无需处理触顶分支。
+const usageApi = {
+  view() {
+    return apiFetch("/api/usage");
+  },
+};
+
+// ---------------------------------------------------------------------
 // 全局暴露（受控决策 1：全局脚本，非 module）。app.js 及 7.2–7.7 直接引用这些符号。
 // ---------------------------------------------------------------------
 if (typeof window !== "undefined") {
@@ -323,6 +365,8 @@ if (typeof window !== "undefined") {
   window.ApiError = ApiError;
   window.authApi = authApi;
   window.projectApi = projectApi;
+  window.byokApi = byokApi;
+  window.usageApi = usageApi;
   window.getAccessToken = getAccessToken;
   window.getRefreshToken = getRefreshToken;
   window.setTokens = setTokens;

@@ -153,6 +153,13 @@ let styleAnchorPasteText = "";
 let styleAnchorResult = null;
 let byokTab = "hosted";
 let byokKeyDraft = "";
+// Story 7.4 接线态：绑定状态与用量由后端驱动（替换原写死占位）。
+let byokBinding = null; // {bound, provider, maskedKey} | null（未拉取/未绑定）
+let usageView = null; // {billingPath, quotaApplies, used, quota, remaining, resetAt} | null
+let byokLoadState = "loading"; // loading | ready | error
+let byokLoadSeq = 0; // 拉取代次，防在途赛跑（仿 7.3 projectsLoadSeq）
+let byokReplaceMode = false; // 已绑定态点「更换 Key」后进入重填态（UI 态）
+let byokSelectedProvider = "deepseek"; // byok tab 当前选中的 provider（写入用）
 let stageDirectionText = "";
 // 通读视图分页：章内按页翻阅（每页若干段），翻过本章末页进入下一章。
 let readthroughChapterIndex = 0;
@@ -490,7 +497,7 @@ function paintProjects() {
       <header class="library-header">
         <a class="wordmark" href="#/projects"><span class="wordmark-mark">M</span><span>Muse</span></a>
         <nav class="library-nav" aria-label="主导航"><a aria-current="page" href="#/projects">作品</a></nav>
-        <div class="account"><span>${email}</span><a href="#/login" data-logout>退出</a></div>
+        <div class="account"><span>${email}</span><a href="#/settings/model-access">设置</a><a href="#/login" data-logout>退出</a></div>
       </header>
       <main class="library-main">
         <div class="library-heading">
@@ -1966,6 +1973,15 @@ function bindProjectInteractions() {
       currentUserEmail = "";
       projectsLoadState = "loading";
       projectsLoadSeq++;
+      // 同步重置 BYOK 模块态（Story 7.4）：防 A 绑定 Key 登出后 B 进设置页闪现 A 的
+      // 绑定态；自增 byokLoadSeq 作废在途 loadByok 回调。
+      byokBinding = null;
+      usageView = null;
+      byokKeyDraft = "";
+      byokReplaceMode = false;
+      byokSelectedProvider = "deepseek";
+      byokLoadState = "loading";
+      byokLoadSeq++;
       location.hash = "#/login";
     })();
   });
@@ -2350,37 +2366,167 @@ function bindStageDirectionInteractions() {
   });
 }
 
+// 模型接入页错误文案（仿 projectErrorText，按 err.code 出可读中文 + 中性兜底）。
+function byokErrorText(err) {
+  const code = err && err.code;
+  if (code === "byok_invalid_key") return "API Key 不能为空，且长度需在限制内。";
+  if (code === "byok_invalid_provider") return "不支持的模型提供方。";
+  if (code === "validation_error") return "请检查 API Key 与模型提供方后重试。";
+  return "操作未能完成，请检查网络后稍后重试。";
+}
+
+// provider 英文枚举 → 中文标签（后端 deepseek/claude/custom）。
+function providerLabel(provider) {
+  if (provider === "claude") return "Claude";
+  if (provider === "custom") return "自定义";
+  return "DeepSeek";
+}
+
 function renderByok() {
-  const usedChapters = 3;
-  const quotaChapters = 5;
-  const usedPercent = Math.round((usedChapters / quotaChapters) * 100);
   document.title = "模型接入 · Muse";
+  paintByok();
+  bindByokInteractions();
+  // 进入即拉真实绑定状态 + 用量（首帧 loading，回填后重绘）。
+  if (byokLoadState === "loading") {
+    loadByok();
+  }
+}
+
+// 异步拉取 BYOK 绑定状态 + 托管用量（AC3/AC4/AC6）。
+// 时序防护（承 7.3 受控决策 4）：hash + 代次双校验，防用户快速切走 / 往返并发覆盖。
+// 401 由 apiFetch 兜底（自动刷新重放 / 失效跳登录），不在此重复处理。
+async function loadByok() {
+  const startedHash = hashPath();
+  const seq = ++byokLoadSeq;
+  // 并发拉绑定态 + 用量；任一失败置 error 态（展示查询只读、GET /api/usage 永不 429）。
+  const [statusResult, usageResult] = await Promise.allSettled([
+    byokApi.status(),
+    usageApi.view(),
+  ]);
+  if (seq !== byokLoadSeq || hashPath() !== startedHash) return;
+  if (statusResult.status === "fulfilled" && usageResult.status === "fulfilled") {
+    byokBinding = statusResult.value || { bound: false };
+    usageView = usageResult.value || null;
+    // 绑定态回填时，把选中的 provider 同步为后端已绑定值（重填/展示一致）。
+    byokSelectedProvider =
+      byokBinding && byokBinding.bound && byokBinding.provider
+        ? byokBinding.provider
+        : "deepseek";
+    byokReplaceMode = false;
+    byokLoadState = "ready";
+  } else {
+    byokLoadState = "error";
+  }
+  renderByok();
+}
+
+// 同步绘制当前态。三层：byokLoadState(loading/error/ready) × byokTab(hosted/byok)
+//   × byokBinding(已绑定/未绑定)。数据来自 loadByok 回填的 byokBinding / usageView。
+function paintByok() {
+  const bound = !!(byokBinding && byokBinding.bound);
+  const headState =
+    byokLoadState === "error"
+      ? "加载失败"
+      : bound
+        ? "BYOK 已就绪"
+        : byokTab === "byok"
+          ? "绑定自有 Key"
+          : "托管额度";
+
+  let panel;
+  if (byokLoadState === "loading") {
+    panel = `<section class="byok-panel" aria-busy="true"><p class="byok-usage-note">正在读取你的模型接入状态…</p></section>`;
+  } else if (byokLoadState === "error") {
+    panel = `<section class="byok-panel">
+        <p class="byok-usage-note">暂时无法读取模型接入状态。</p>
+        <div class="style-anchor-actions"><button class="primary-button" type="button" data-byok-reload>重新加载 <span>→</span></button></div>
+      </section>`;
+  } else if (byokTab === "hosted") {
+    panel = paintHostedPanel(bound);
+  } else {
+    panel = paintByokPanel(bound);
+  }
+
   app.innerHTML = `<div class="byok-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects">← 作品库</a><div class="explore-project"><strong>模型接入</strong><span>设置</span></div><div class="save-state"><i></i> ${byokTab === "byok" ? "BYOK 已就绪" : "托管额度"}</div></header>
+    <header class="explore-header"><a class="explore-back" href="#/projects">← 作品库</a><div class="explore-project"><strong>模型接入</strong><span>设置</span></div><div class="save-state"><i></i> ${headState}</div></header>
     <main class="byok-main">
       <section class="byok-intro">
         <div class="byok-overline">Model access / 模型接入</div>
         <h1>用谁的算力，由你定</h1>
-        <p>默认走 Muse 托管，进来就能写，每天有免费额度。想不受额度限制、或用自己的模型，就绑定一把自己的 API Key，成本自付、额度解绑。</p>
+        <p>默认走 Muse 托管，进来就能写，有免费额度。想不受额度限制、或用自己的模型，就绑定一把自己的 API Key，成本自付、额度解绑。</p>
       </section>
       <div class="tabs" role="tablist" aria-label="模型接入方式">
         <button class="tab" role="tab" aria-selected="${byokTab === "hosted"}" data-byok-tab="hosted">Muse 托管（默认）</button>
         <button class="tab" role="tab" aria-selected="${byokTab === "byok"}" data-byok-tab="byok">绑定自有 Key</button>
       </div>
-      ${byokTab === "hosted" ? `<section class="byok-panel">
-        <div class="byok-usage-head"><span>今日免费额度</span><strong>${usedChapters} / ${quotaChapters} 章</strong></div>
-        <div class="byok-usage-bar"><i style="width: ${usedPercent}%"></i></div>
-        <p class="byok-usage-note">免费额度每天重置。额度上限会在盲测跑出单章真实成本后定档（当前为线框占位值）。写作过程中不会弹付费墙。</p>
-        <div class="byok-tip">重度创作、或想换用更强的模型？切到「绑定自有 Key」解除额度限制。</div>
-      </section>` : `<section class="byok-panel">
-        <div class="field"><div class="field-head"><label for="byok-key">API Key</label><span class="field-note">仅本地演示，不会上传</span></div><input class="input" id="byok-key" type="password" placeholder="sk-..." value="${escapeHtml(byokKeyDraft)}" autocomplete="off" /></div>
-        <div class="byok-provider"><span>模型提供方</span><div class="byok-provider-options"><button type="button" class="byok-provider-option is-current">DeepSeek</button><button type="button" class="byok-provider-option">Claude</button><button type="button" class="byok-provider-option">自定义</button></div></div>
-        <p class="byok-usage-note">绑定后，该账户的生成走你自己的 Key，成本由你与模型方结算，Muse 不再计免费额度。密钥在真实环境会加密存储。</p>
-        <div class="style-anchor-actions"><button class="primary-button" type="button" data-byok-save ${byokKeyDraft.trim() ? "" : "disabled"}>保存并启用 <span>→</span></button></div>
-      </section>`}
+      ${panel}
     </main>
   </div>`;
-  bindByokInteractions();
+}
+
+// 托管 tab：展示真实 tokens 用量（AC4）。口径对齐（受控决策 1）：
+//   后端按 tokens 计（非「章」）、resetAt 恒 null（累计总量护栏、非每日重置）——
+//   故展示「已用 X / Y tokens」、文案改「累计免费额度」，不再显「N 章 / 每天重置」。
+// BYOK 用户（quotaApplies=false）：额度不适用，展示「走自有 Key、不占免费额度」。
+function paintHostedPanel(bound) {
+  const usage = usageView;
+  const isByokBilling = bound || (usage && usage.quotaApplies === false);
+  if (isByokBilling) {
+    return `<section class="byok-panel">
+        <div class="byok-usage-head"><span>免费额度</span><strong>不适用</strong></div>
+        <p class="byok-usage-note">你已绑定自有 API Key，生成走你自己的 Key、成本自付，Muse 不再计免费额度。</p>
+        <div class="byok-tip">想回到托管免费额度？切到「绑定自有 Key」解绑当前 Key。</div>
+      </section>`;
+  }
+  const used = usage && typeof usage.used === "number" ? usage.used : 0;
+  const quota = usage && typeof usage.quota === "number" ? usage.quota : 0;
+  const remaining =
+    usage && typeof usage.remaining === "number"
+      ? usage.remaining
+      : Math.max(0, quota - used);
+  const percent = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+  return `<section class="byok-panel">
+        <div class="byok-usage-head"><span>免费额度（tokens）</span><strong>${formatTokens(used)} / ${formatTokens(quota)}</strong></div>
+        <div class="byok-usage-bar"><i style="width: ${percent}%"></i></div>
+        <p class="byok-usage-note">剩余 ${formatTokens(remaining)} tokens（累计免费额度）。额度上限会在盲测跑出单章真实成本后定档（当前为占位值）。写作过程中不会弹付费墙。</p>
+        <div class="byok-tip">重度创作、或想换用更强的模型？切到「绑定自有 Key」解除额度限制。</div>
+      </section>`;
+}
+
+// 千分位格式化 tokens 数（展示可读）。
+function formatTokens(n) {
+  const value = typeof n === "number" && isFinite(n) ? n : 0;
+  return value.toLocaleString("en-US");
+}
+
+// 绑定 tab：未绑定→输入 Key + provider 三选 + 保存；已绑定→掩码回显 + 更换 / 解绑（AC2/AC3/AC5）。
+function paintByokPanel(bound) {
+  // 已绑定且未进入「更换」态：展示掩码 + provider + 更换/解绑。
+  if (bound && !byokReplaceMode) {
+    return `<section class="byok-panel">
+        <div class="field"><div class="field-head"><label>已绑定 API Key</label><span class="field-note">仅回显掩码，明文已加密存储</span></div><div class="byok-usage-head"><span>${escapeHtml(providerLabel(byokBinding.provider))}</span><strong>${escapeHtml(byokBinding.maskedKey || "已绑定")}</strong></div></div>
+        <p class="byok-usage-note">该账户的生成走你自己的 Key，成本由你与模型方结算，Muse 不再计免费额度。</p>
+        <div class="style-anchor-actions"><button class="secondary-button" type="button" data-byok-replace>更换 Key</button><button class="primary-button" type="button" data-byok-unbind>解绑</button></div>
+      </section>`;
+  }
+  // 未绑定 / 更换态：输入框 + provider 三选（带 data-provider）+ 保存。
+  const providers = [
+    { value: "deepseek", label: "DeepSeek" },
+    { value: "claude", label: "Claude" },
+    { value: "custom", label: "自定义" },
+  ];
+  const providerButtons = providers
+    .map(
+      (p) =>
+        `<button type="button" class="byok-provider-option${byokSelectedProvider === p.value ? " is-current" : ""}" data-provider="${p.value}">${p.label}</button>`,
+    )
+    .join("");
+  return `<section class="byok-panel">
+        <div class="field"><div class="field-head"><label for="byok-key">API Key</label><span class="field-note">提交后加密存储，仅回显掩码</span></div><input class="input" id="byok-key" type="password" placeholder="sk-..." value="${escapeHtml(byokKeyDraft)}" autocomplete="off" /></div>
+        <div class="byok-provider"><span>模型提供方</span><div class="byok-provider-options">${providerButtons}</div></div>
+        <p class="byok-usage-note">绑定后，该账户的生成走你自己的 Key，成本由你与模型方结算，Muse 不再计免费额度。密钥经 AES-GCM 加密存储、绝不回显明文。</p>
+        <div class="style-anchor-actions">${bound ? `<button class="secondary-button" type="button" data-byok-replace-cancel>取消</button>` : ""}<button class="primary-button" type="button" data-byok-save ${byokKeyDraft.trim() ? "" : "disabled"}>保存并启用 <span>→</span></button></div>
+      </section>`;
 }
 
 function bindByokInteractions() {
@@ -2389,6 +2535,11 @@ function bindByokInteractions() {
       byokTab = button.getAttribute("data-byok-tab");
       renderByok();
     });
+  });
+  // error 态重新加载：重置 loading 触发重拉（仿作品库 data-reload）。
+  document.querySelector("[data-byok-reload]")?.addEventListener("click", () => {
+    byokLoadState = "loading";
+    renderByok();
   });
   const key = document.querySelector("#byok-key");
   key?.addEventListener("input", () => {
@@ -2402,13 +2553,95 @@ function bindByokInteractions() {
         .querySelectorAll(".byok-provider-option")
         .forEach((other) => other.classList.remove("is-current"));
       button.classList.add("is-current");
+      byokSelectedProvider = button.getAttribute("data-provider") || "deepseek";
     });
   });
-  document.querySelector("[data-byok-save]")?.addEventListener("click", () => {
-    const save = document.querySelector("[data-byok-save]");
-    save.querySelector("span").textContent = "✓";
-    save.childNodes[0].textContent = "已启用自有 Key ";
+  // 「更换 Key」：已绑定态切到重填态（显输入框 + provider）。
+  document.querySelector("[data-byok-replace]")?.addEventListener("click", () => {
+    byokReplaceMode = true;
+    byokKeyDraft = "";
+    renderByok();
+  });
+  // 「取消更换」：回到已绑定展示态。
+  document
+    .querySelector("[data-byok-replace-cancel]")
+    ?.addEventListener("click", () => {
+      byokReplaceMode = false;
+      byokKeyDraft = "";
+      renderByok();
+    });
+  bindByokSave();
+  bindByokUnbind();
+}
+
+// 保存/替换：真实 PUT /api/byok（AC2）。成功→回填绑定态显掩码；失败→恢复按钮 + 可读提示。
+function bindByokSave() {
+  document.querySelector("[data-byok-save]")?.addEventListener("click", (event) => {
+    const save = event.currentTarget;
+    if (save.disabled) return;
+    const input = document.querySelector("#byok-key");
+    const apiKey = input ? input.value : "";
+    // 空白前端软校验（后端 min_length=1 + strip 判空兜底，此处防无意义请求）。
+    if (!apiKey.trim()) {
+      save.disabled = true;
+      return;
+    }
+    const provider = byokSelectedProvider || "deepseek";
     save.disabled = true;
+    const labelNode = save.childNodes[0];
+    labelNode.textContent = "保存中… ";
+    (async () => {
+      try {
+        const result = await byokApi.bind({ apiKey, provider });
+        // 成功：更新绑定态、清草稿、退出更换态，切回 byok tab 展示掩码 + 重拉用量。
+        byokBinding = result || { bound: true, provider };
+        byokKeyDraft = "";
+        byokReplaceMode = false;
+        byokSelectedProvider = (result && result.provider) || provider;
+        // 用量口径随之变（转 BYOK 豁免态）：重拉一次 usage 保持展示一致。
+        try {
+          usageView = await usageApi.view();
+        } catch {
+          usageView = null; // 用量刷新失败不阻断绑定成功呈现。
+        }
+        renderByok();
+      } catch (err) {
+        // 失败恢复按钮 + 提示（error code 映射，不臆造分支）。401 已被 apiFetch 兜住。
+        save.disabled = false;
+        labelNode.textContent = "保存并启用 ";
+        window.alert(byokErrorText(err));
+      }
+    })();
+  });
+}
+
+// 解绑：真实 DELETE /api/byok（AC5）。成功→回未绑定空态 + 重拉用量（hosted 额度重新适用）。
+function bindByokUnbind() {
+  document.querySelector("[data-byok-unbind]")?.addEventListener("click", (event) => {
+    const btn = event.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = "解绑中…";
+    (async () => {
+      try {
+        await byokApi.unbind();
+        // 成功：清绑定态、重拉用量（从 BYOK 豁免态切回 hosted 真实额度）。
+        byokBinding = { bound: false };
+        byokKeyDraft = "";
+        byokReplaceMode = false;
+        byokSelectedProvider = "deepseek";
+        try {
+          usageView = await usageApi.view();
+        } catch {
+          usageView = null;
+        }
+        renderByok();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = "解绑";
+        window.alert(byokErrorText(err));
+      }
+    })();
   });
 }
 
@@ -2600,7 +2833,11 @@ function render() {
     renderProjects();
   } else if (hashPath() === "#/projects/demo/style-anchor") renderStyleAnchor();
   else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
-  else if (hashPath() === "#/settings/model-access") renderByok();
+  else if (hashPath() === "#/settings/model-access") {
+    // 每次进入设置页都重拉最新绑定态 + 用量（绑定/解绑后返回、跨账号都能看到变化）。
+    byokLoadState = "loading";
+    renderByok();
+  }
   else if (hashPath() === "#/projects/demo/stage-direction")
     renderStageDirection();
   else if (exploreMatch) renderExploration();
