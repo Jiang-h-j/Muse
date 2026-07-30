@@ -3,7 +3,7 @@ baseline_commit: 3080785
 ---
 # Story 7.4: BYOK 设置页 + 托管用量入口接线（含 UX-DR2 须新增 UI）
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -277,6 +277,29 @@ Claude Opus 4.8 (claude-opus-4-8)
 - `prototype/app/app.js`（修改）— 新增模块级 BYOK 接线态（byokBinding/usageView/byokLoadState/byokLoadSeq/byokReplaceMode/byokSelectedProvider）；renderByok 拆 paintByok（三层态）+ loadByok（异步并发拉取 + hash/代次时序防护）；新增 paintHostedPanel/paintByokPanel/byokErrorText/providerLabel/formatTokens/bindByokSave/bindByokUnbind；bindByokInteractions 真实接线（PUT 绑定/DELETE 解绑/更换态/provider data-provider/error 重载）；作品库 header .account 补设置入口链接；render dispatcher 进设置页重置 loading 重拉；logout 追加 BYOK 模块态重置防跨账号残留
 - `_bmad-output/implementation-artifacts/deferred-work.md`（修改）— 标注 1.7「renderByok 未接线 + 作品库无设置入口」已由 7.4 兑现；新增 7.4 段登记 3 条 defer（custom base_url/model、tokens→章折算、异步 abort）
 - `_bmad-output/implementation-artifacts/sprint-status.yaml`（修改）— 7-4 状态 backlog → ready-for-dev → in-progress → review
+
+## Review Findings (2026-07-30，三层对抗审查，子 agent 用 Sonnet 独立于实现 Opus)
+
+> Blind Hunter（仅 diff，17 条）+ Edge Case Hunter（diff + 项目只读 + 前后端契约核实，12 条）+ Acceptance Auditor（diff + spec，**AC1-6 全 PASS、边界严守、5 受控决策全落地、无越界无谎报**）。三层完整无 failed_layer。去重合并后：0 decision-needed + 4 patch + 1 defer + 24 dismiss（噪声/假阳性/已处理/设计取舍）。
+
+- [ ] [Review][Patch] 保存/解绑成功/失败回调 `renderByok()` 无 hash+代次守卫 → 跨页覆盖 DOM [prototype/app/app.js:2578 bindByokSave / :2619 bindByokUnbind] — blind#1 + edge#1/#2 三层收敛。`bindByokSave`/`bindByokUnbind` 的 async IIFE 在 `await byokApi.bind/unbind` + `usageApi.view()` 完成后**无条件** `renderByok()`（→ `paintByok` → `app.innerHTML=`）。触发：用户点「保存并启用」/「解绑」后立即点顶部「← 作品库」跳 `#/projects`，作品库渲染完后 PUT/DELETE 回调把整页替换成 BYOK 页。`loadByok`（:2450 附近）有 `startedHash + byokLoadSeq` 双校验，这两条写路径完全没有。**与 7.3 review P2 同源教训**（异步回调须过时序校验）。**顺带修 blind#2**：logout 重置（:1976-1984）漏清 `byokTab`（纯 UI tab 位置，A 切到 byok tab 登出后 B 进设置页仍停 byok tab），一并加 `byokTab="hosted"`。
+- [ ] [Review][Patch] 保存/解绑 401 后跳登录页仍弹 `alert("操作未能完成")` [prototype/app/app.js:2612 / :2642 catch 分支] — edge#5/#6。核实 api.js `apiFetch`：不可救回的业务 401 会 `clearTokens()`+`redirectToLogin("expired")` 后 **`throw`**（api.js:136-140），前端 catch 执行 `window.alert(byokErrorText(err))` → 已跳登录页却盖一个突兀弹窗。**承 7.3「401 由地基兜底、本页不重复处理」**：catch 里加 `if (err && err.status === 401) return`（不弹 alert，跳转已由地基完成）。
+- [ ] [Review][Patch] `usageView` 为 null/缺字段时 hosted 面板画「0 / 0 tokens」假额度 [prototype/app/app.js:2471 paintHostedPanel] — blind#8 + edge#3 收敛。`usageApi.view()` 失败静默吞（bindByokSave/Unbind 的 `catch { usageView = null }` :2604/:2634）后，`paintHostedPanel` 的 `used/quota/remaining` 全兜底取 0，用户看到「免费额度 0 / 0 tokens」「剩余 0 tokens」误以为额度耗尽。须加 `if (!usage) 显示「用量暂不可用」占位`，与「展示查询不误导」一致。
+- [ ] [Review][Patch] PUT 成功 `result` 缺字段时兜底假绑定 `{bound:true,provider}` [prototype/app/app.js:2597 bindByokSave] — blind#10 + edge#7。`byokBinding = result || {bound:true, provider}`：若后端 200 但 body 空/缺 `bound`/`maskedKey`（反代截断等边缘），显假绑定态（「provider / 已绑定」无掩码）。**与 7.3 review P4「新建响应缺 id」完全同源**（当时选 patch：缺关键字段抛错而非用假态）。改为 `if (!result || !result.bound) throw new ApiError("invalid_response",...)` 走统一失败分支，不显假绑定。
+- [x] [Review][Defer] `providerLabel` 未知 provider 静默兜底「DeepSeek」，掩盖后端契约漂移 [prototype/app/app.js:2513 providerLabel] — deferred。blind#4/#12 + edge#8。后端将来加 `gemini/openai` 而前端未同步时，已绑定新 provider 的用户看到误标「DeepSeek」。**当前后端 provider 枚举锁定 `deepseek/claude/custom`**（1.7 `ByokBindRequest.provider` Literal，已核实），无触发面。**归「后端 provider 扩展时」同步**：届时 providerLabel 加新分支或未知值降级为原文 + 提示，与前端 provider 三选按钮一并扩展。
+
+**Dismissed（噪声/假阳性/已处理/设计取舍，24 条）**：① blind#5 空 Key 死锁（**假阳性**：核实 input handler :2545-2548 每次输入同步 `save.disabled = !key.value.trim()`，删光→disabled、再输入→恢复，不死锁）；② blind#6/edge(未列) `childNodes[0]`/`btn.textContent` 按钮结构脆性（原型按钮结构稳定 `保存并启用 <span>→</span>`，与 7.3 dismiss 同类）；③ blind#11 render 强制 loading 打断输入（前提「hash 不变的 render 调用」当前不存在，render 仅由 hashchange/load 驱动，进设置页=hash 变=本就该重拉）；④ edge#4 loadByok 期间反复点 tab 发并发请求（seq 已截结果、内测期无性能面）；⑤ blind#9 headState loading 时按 tab 显文案（loading 分支 panel 已显「正在读取」，header 文案次要）；⑥ blind#3/#13-17 alert 无障碍/孤儿节点写/事件语义（原型阶段可接受、低优无副作用）；⑦ edge#10/#11/#12 error 保留 tab/空白无反馈/已被 if(save) 兜住（低概率或已处理）；⑧ blind#7/#14-16 provider 兜底 deepseek/loadByok 部分降级（当前枚举稳定、局部降级属 UX 精细化非缺陷）；⑨ 其余 UX 偏好项（解绑后停 byok tab、null 消毒等，与 patch 修复重叠或低优）。
+
+## Review Findings（2026-07-30 第二轮·修复后复审，三层对抗审查，子 agent 独立于实现）
+
+> 复审范围 = 7.4 原始提交（2d2bea4）+ 上一轮 4 patch 的未提交修复合并 diff（api.js +44 / app.js +316/-23）。Blind Hunter（仅 diff，6 条）+ Edge Case Hunter（diff + 项目只读 + 前后端契约核实，5 条）+ Acceptance Auditor（diff + spec，**AC1-6 全 PASS、5 受控决策全落地、上一轮 4 patch 真实修复到位、边界零越界、File List/Completion Notes 无谎报**）。三层完整无 failed_layer。去重合并后：0 decision-needed + 3 patch + 1 defer + 其余 dismiss。
+
+- [x] [Review][Patch] 保存 in-flight 时在输入框继续打字可再次点「保存」触发并发双 PUT [prototype/app/app.js:2555-2558 input handler / :2588-2600 bindByokSave] — edge#1（唯一命中，已核实属实）。`bindByokSave` 进入时 `save.disabled=true`，但**面板未重绘**、`#byok-key` 输入框仍在 DOM，其 input handler（:2558）每次输入执行 `save.disabled = !key.value.trim()` → 在途期间把按钮**重新 enable** → 用户再点「保存」，`if(save.disabled)return` 判 false → 第二次 `byokApi.bind` 发出。两个并发 PUT 回调各写 `byokBinding` + `renderByok()`，第一个 resolve 后 `save`/`labelNode` 已成脱离节点，第二个回调再操作脱离节点并二次重绘 → 掩码态闪烁/「保存中…」错乱。**对照 7.3 命名输入监听只改 textContent、从不碰 disabled**，本 diff 是新引入的在途放行面。**已修复**：新增模块级 `byokSaving` 标志，提交时置 true、finally 解除；input handler 改 `if (save && !byokSaving)`，在途不重新 enable；logout 一并重置。
+- [x] [Review][Patch] usage GET 瞬时失败把整页锁成 error，连已绑定用户都无法解绑 [prototype/app/app.js:2403-2420 loadByok] — blind#1 + edge#2 两层独立收敛。`Promise.allSettled([byokApi.status(), usageApi.view()])` 后**要求两者都 fulfilled 才 ready，否则整页 error**（只剩「重新加载」）。当 status 成功、`GET /api/usage` 因 DB SUM 抖动 5xx 时，绑定/解绑面板完全不可达——把只读、非核心的 usage 抬成和 status 同级的致命依赖。**偏离 7.3 loadProjects 范式**（me() 失败降级为不显邮箱、仅 list 失败才 error）。且 usage 对绑定管理并非必需（bound 时 hosted 面板本就显「不适用」）。**已修复**：改为 status 成功即 ready，usage 单独失败降级 `usageView=null`（paintHostedPanel 已有「用量暂不可用」占位兜底），仅 status 失败才 error。
+- [x] [Review][Patch] byokReplaceMode 切 tab 未复位造成状态残留 [prototype/app/app.js:2543-2548 tab 切换 / :2570 data-byok-replace] — blind#3（已核实属实）。已绑定用户点「更换 Key」进 `byokReplaceMode=true`，再切「Muse 托管」tab、又切回「绑定自有 Key」→ `paintByokPanel(bound=true, replaceMode=true)` 仍显重填表单而非「已绑定摘要」。用户预期切 tab 回来看到已绑定态，实际停在半途编辑态。**已修复**：data-byok-tab 切换 handler 里重置 `byokReplaceMode=false` + 清 byokKeyDraft。
+- [x] [Review][Defer] providerLabel 未知 provider 静默兜底「DeepSeek」，掩盖后端契约漂移 [prototype/app/app.js:2380-2384 providerLabel] — blind#5 + edge#5 + auditor 三层收敛，**与上一轮同一条 defer**。后端 `ByokBindRequest.provider` 当前锁定 `deepseek/claude/custom`（Literal，已核实），无触发面；仅后端未来扩枚举而前端未同步时才误标。归「后端 provider 扩展时」同步，与上一轮 defer 合并、不重复登记。
+
+**Dismissed（噪声/假阳性/设计取舍/已处理）**：① blind#6 空白 Key 死锁（**假阳性**：input handler :2558 每次输入同步 `save.disabled=!value.trim()`，删光→disabled、再输入→恢复，不死锁）；② blind#2 明文 draft 常驻全局 + 反复写 innerHTML（原型阶段：type=password + escapeHtml 防截断 + 提交成功即清 byokKeyDraft，前端不 log/不持久化 localStorage，属已知设计取舍，真实明文加密存储在后端）；③ blind#5 `save.childNodes[0]` 文本节点脆性（当前模板 `保存并启用 <span>→</span>` 成立，取到确为文本节点，与 7.3 dismiss 同类）；④ edge#3/blind#4 save/unbind 仅 hash 守卫缺代次（往返同页窄窗竞态，操作幂等同账户多为闪烁而非持久错值，且下一次 loadByok 会纠正，低优）；⑤ edge#4 tab 切换在途回调对脱离节点写 label/弹 alert（纯体验瑕疵，与 patch#1「并发双 PUT」修复方向部分重叠，低优）；⑥ auditor 两条偏差（P4 只校验 !result.bound 未查 maskedKey——后端契约保证 bound=true 必带 maskedKey，与商定 patch 逐字一致；loading 态 header 文案按 tab 计算——panel 已显「正在读取」，无功能影响）。
 
 ## Change Log
 

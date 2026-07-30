@@ -160,6 +160,7 @@ let byokLoadState = "loading"; // loading | ready | error
 let byokLoadSeq = 0; // 拉取代次，防在途赛跑（仿 7.3 projectsLoadSeq）
 let byokReplaceMode = false; // 已绑定态点「更换 Key」后进入重填态（UI 态）
 let byokSelectedProvider = "deepseek"; // byok tab 当前选中的 provider（写入用）
+let byokSaving = false; // 保存 PUT 在途标志：防 input 监听在途重新 enable 按钮致并发双 PUT
 let stageDirectionText = "";
 // 通读视图分页：章内按页翻阅（每页若干段），翻过本章末页进入下一章。
 let readthroughChapterIndex = 0;
@@ -1978,8 +1979,10 @@ function bindProjectInteractions() {
       byokBinding = null;
       usageView = null;
       byokKeyDraft = "";
+      byokTab = "hosted";
       byokReplaceMode = false;
       byokSelectedProvider = "deepseek";
+      byokSaving = false;
       byokLoadState = "loading";
       byokLoadSeq++;
       location.hash = "#/login";
@@ -2398,15 +2401,18 @@ function renderByok() {
 async function loadByok() {
   const startedHash = hashPath();
   const seq = ++byokLoadSeq;
-  // 并发拉绑定态 + 用量；任一失败置 error 态（展示查询只读、GET /api/usage 永不 429）。
+  // 并发拉绑定态 + 用量。status 是本页核心（决定绑定/解绑面板），usage 只读且非必需
+  // （bound 时 hosted 面板本就显「不适用」）——故仅 status 失败才整页 error；usage 单独
+  // 失败降级为 usageView=null（paintHostedPanel 显「用量暂不可用」占位），不锁死整页。
   const [statusResult, usageResult] = await Promise.allSettled([
     byokApi.status(),
     usageApi.view(),
   ]);
   if (seq !== byokLoadSeq || hashPath() !== startedHash) return;
-  if (statusResult.status === "fulfilled" && usageResult.status === "fulfilled") {
+  if (statusResult.status === "fulfilled") {
     byokBinding = statusResult.value || { bound: false };
-    usageView = usageResult.value || null;
+    usageView =
+      usageResult.status === "fulfilled" ? usageResult.value || null : null;
     // 绑定态回填时，把选中的 provider 同步为后端已绑定值（重填/展示一致）。
     byokSelectedProvider =
       byokBinding && byokBinding.bound && byokBinding.provider
@@ -2478,10 +2484,19 @@ function paintHostedPanel(bound) {
         <div class="byok-tip">想回到托管免费额度？切到「绑定自有 Key」解绑当前 Key。</div>
       </section>`;
   }
-  const used = usage && typeof usage.used === "number" ? usage.used : 0;
-  const quota = usage && typeof usage.quota === "number" ? usage.quota : 0;
+  // 用量拉取失败/数据缺失（usageView=null 或字段缺失）：显占位而非画「0 / 0 tokens」假额度，
+  // 避免用户误以为额度已耗尽（review P3：展示查询不误导）。
+  if (!usage || typeof usage.used !== "number" || typeof usage.quota !== "number") {
+    return `<section class="byok-panel">
+        <div class="byok-usage-head"><span>免费额度（tokens）</span><strong>用量暂不可用</strong></div>
+        <p class="byok-usage-note">暂时无法读取用量数据，请稍后重试。写作过程中不会弹付费墙。</p>
+        <div class="byok-tip">重度创作、或想换用更强的模型？切到「绑定自有 Key」解除额度限制。</div>
+      </section>`;
+  }
+  const used = usage.used;
+  const quota = usage.quota;
   const remaining =
-    usage && typeof usage.remaining === "number"
+    typeof usage.remaining === "number"
       ? usage.remaining
       : Math.max(0, quota - used);
   const percent = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
@@ -2533,6 +2548,10 @@ function bindByokInteractions() {
   document.querySelectorAll("[data-byok-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       byokTab = button.getAttribute("data-byok-tab");
+      // 切 tab 复位更换态（review 复审 patch#3）：防已绑定用户点「更换 Key」后切走再
+      // 切回仍停在半途重填表单，应回到已绑定摘要态。
+      byokReplaceMode = false;
+      byokKeyDraft = "";
       renderByok();
     });
   });
@@ -2545,7 +2564,9 @@ function bindByokInteractions() {
   key?.addEventListener("input", () => {
     byokKeyDraft = key.value;
     const save = document.querySelector("[data-byok-save]");
-    if (save) save.disabled = !key.value.trim();
+    // 保存在途（byokSaving）时不重新 enable，防在途打字把按钮放行触发并发双 PUT
+    // （review 复审 patch#1）。
+    if (save && !byokSaving) save.disabled = !key.value.trim();
   });
   document.querySelectorAll(".byok-provider-option").forEach((button) => {
     button.addEventListener("click", () => {
@@ -2588,28 +2609,51 @@ function bindByokSave() {
     }
     const provider = byokSelectedProvider || "deepseek";
     save.disabled = true;
+    byokSaving = true; // 提交中：阻止 input 监听在途重新 enable 按钮（review 复审 patch#1）。
     const labelNode = save.childNodes[0];
     labelNode.textContent = "保存中… ";
+    // 时序守卫（review P1）：记录发起时 hash，回调写 DOM 前校验仍在设置页，
+    // 防用户点保存后立即切走、回调把别的页面 innerHTML 覆盖成 BYOK 页。
+    const startedHash = hashPath();
     (async () => {
       try {
         const result = await byokApi.bind({ apiKey, provider });
+        // 缺关键字段兜底假绑定会误导（review P4，同 7.3 P4「响应缺 id」）：
+        // 后端契约保证 200 返完整 ByokStatusResponse，缺 bound 视为不可信响应，走失败分支。
+        if (!result || !result.bound) {
+          throw new ApiError(
+            "invalid_response",
+            "服务器返回了无法识别的绑定结果。",
+            undefined,
+            200,
+          );
+        }
         // 成功：更新绑定态、清草稿、退出更换态，切回 byok tab 展示掩码 + 重拉用量。
-        byokBinding = result || { bound: true, provider };
+        byokBinding = result;
         byokKeyDraft = "";
         byokReplaceMode = false;
-        byokSelectedProvider = (result && result.provider) || provider;
+        byokSelectedProvider = result.provider || provider;
         // 用量口径随之变（转 BYOK 豁免态）：重拉一次 usage 保持展示一致。
         try {
           usageView = await usageApi.view();
         } catch {
-          usageView = null; // 用量刷新失败不阻断绑定成功呈现。
+          usageView = null; // 用量刷新失败不阻断绑定成功呈现（paintHostedPanel 显占位）。
         }
+        // 切走则不写 DOM（回调竞态守卫）。
+        if (hashPath() !== startedHash) return;
         renderByok();
       } catch (err) {
-        // 失败恢复按钮 + 提示（error code 映射，不臆造分支）。401 已被 apiFetch 兜住。
+        // 401 已被 apiFetch 兜住（clearTokens + 跳登录），本页不重复弹窗（review P2）。
+        if (err && err.status === 401) return;
+        // 切走则不弹 alert / 不写已摘除按钮（回调竞态守卫，review P1）。
+        if (hashPath() !== startedHash) return;
+        // 失败恢复按钮 + 提示（error code 映射，不臆造分支）。
         save.disabled = false;
         labelNode.textContent = "保存并启用 ";
         window.alert(byokErrorText(err));
+      } finally {
+        // 无论成功/失败/切走早返，都解除在途标志（成功已重绘为绑定态、无输入框亦无害）。
+        byokSaving = false;
       }
     })();
   });
@@ -2622,6 +2666,7 @@ function bindByokUnbind() {
     if (btn.disabled) return;
     btn.disabled = true;
     btn.textContent = "解绑中…";
+    const startedHash = hashPath(); // 时序守卫（review P1）
     (async () => {
       try {
         await byokApi.unbind();
@@ -2635,8 +2680,11 @@ function bindByokUnbind() {
         } catch {
           usageView = null;
         }
+        if (hashPath() !== startedHash) return; // 切走则不写 DOM
         renderByok();
       } catch (err) {
+        if (err && err.status === 401) return; // 401 由 apiFetch 兜住，本页不重复弹窗（P2）
+        if (hashPath() !== startedHash) return; // 切走则不弹 alert（P1）
         btn.disabled = false;
         btn.textContent = "解绑";
         window.alert(byokErrorText(err));

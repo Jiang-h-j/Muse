@@ -1,5 +1,9 @@
 # Deferred Work
 
+## Deferred from: code review of 7-4-BYOK设置页-托管用量入口接线 (2026-07-30)
+
+- **`providerLabel` 未知 provider 静默兜底「DeepSeek」，掩盖后端契约漂移** [prototype/app/app.js:2513 `providerLabel` + `paintByokPanel` 已绑定分支] — 三层审查 blind#4/#12 + edge#8 独立指出。`providerLabel` 只识别 `deepseek/claude/custom`，其他一律返回「DeepSeek」；后端将来加 `gemini/openai` 等新 provider 而前端未同步时，已绑定新 provider 的用户在设置页看到误标「DeepSeek」的掩码 Key，可能误以为绑错去解绑重来。**当前无触发面**：后端 `ByokBindRequest.provider` 是 `Literal["deepseek","claude","custom"]`（1.7 已固定、已核实），前端三选与之对齐，不存在未知值。**归「后端 provider 扩展批次」**：后端加新 provider 时，同步 `providerLabel` 新分支（或未知值降级为 provider 原文 + 「未识别的提供方」提示）+ 前端 `paintByokPanel` provider 三选按钮 + `ByokBindRequest`（若 custom 类还需 base_url/model，与本文件 1.7 段「custom 数据模型不完整」defer 一并做）。code review Blind + Edge Case Hunter 独立指出，Low。（2026-07-30 第二轮修复后复审再次三层收敛 blind#5 + edge#5 + auditor，结论一致，仍 defer 不重复登记。）
+
 ## Deferred from: code review of 1-1-后端工程基座与本地开发环境 (2026-07-23)
 
 - JWT 弱密钥默认值 `dev-only-change-me` 缺生产 fail-fast 护栏 [backend/src/muse/core/settings.py:29] — 归 Story 1.3，JWT 实际签发时一并加「debug=False 时校验密钥非默认值」的启动断言。
