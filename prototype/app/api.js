@@ -358,6 +358,169 @@ const usageApi = {
 };
 
 // ---------------------------------------------------------------------
+// SSE 流式消费地基（Story 7.5 · AC1）
+// =====================================================================
+// 7.1 的 apiFetch 只处理一次性 JSON 响应（res.text() + JSON.parse），不支持
+// SSE 流。引导/自由探索有两类 SSE，且都靠 Authorization: Bearer 头鉴权——浏览器
+// 原生 EventSource 只支持 GET、无请求体、无法设自定义头，天然不可用。故本工具用
+// fetch + res.body.getReader() + TextDecoder 手动消费 SSE 帧。7.6 自由探索复用。
+//
+// 后端 SSE 事件（AR5 三事件族，backend/src/muse/core/sse.py + routers/exploration.py）：
+//   · interpret（POST /explore/guided/interpret）：delta {text} → done {text} → error {code,message}
+//   · settle 任务（GET /api/tasks/{taskId}/events）：progress {step,percent} → result {...} → error
+//
+// 建流前错误经 HTTP 状态（预检 401/404/429 在 fetch resolve 后即可判定）：非 2xx
+// 转 ApiError 抛出、不进流循环。401 语义与 apiFetch 完全一致（受控决策 1）：复用
+// ensureRefresh 单例刷新重放一次，救不回则 clearTokens + redirectToLogin("expired")。
+
+// SSE 帧解析（纯函数，供单测）：把一个完整帧文本（event: / data: 多行，行内可含冒号）
+// 解析为 {event, data}。data 多行按换行拼接（SSE 规范）；无 event 行时 event 为 undefined。
+// 注释行（以 ":" 开头，如 sse-starlette 的 ping）与空 data 帧由调用方过滤。
+function parseSSEFrame(frame) {
+  let event;
+  const dataLines = [];
+  for (const rawLine of frame.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line || line.startsWith(":")) continue; // 空行/注释行（心跳）跳过
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    // 值去掉冒号后一个可选前导空格（SSE 规范）
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") dataLines.push(value);
+  }
+  return { event, data: dataLines.join("\n") };
+}
+
+// 消费一个 SSE 流：逐帧解析并回调 onEvent(eventType, parsedData)。
+// data 尝试 JSON.parse（后端 payload 恒 JSON，format_sse_event）；解析失败则回传原始字符串。
+// path: 形如 "/api/projects/{id}/explore/guided/interpret"。
+// opts.method 默认 POST（interpret/settle 触发是 POST，taskEvents 是 GET）；opts.body 为对象。
+// opts.onEvent(type, data)：每帧回调。opts.signal：AbortController.signal，用于「回到探索」/切走时取消。
+// opts._retried：内部标记，401 重放时置 true 防死循环（调用方勿传）。
+async function apiStream(path, { method = "POST", body, onEvent, signal, _retried = false } = {}) {
+  const headers = { Accept: "text/event-stream" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const accessToken = getAccessToken();
+  if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
+  });
+
+  // 建流前 401：与 apiFetch 同款语义（受控决策 1）——有 refresh 且未重放过则刷新重放一次，
+  // 救不回则 clearTokens + 跳登录。不在流内处理、不各页重写。
+  if (res.status === 401 && !_retried && getRefreshToken()) {
+    await ensureRefresh(); // 失败会抛错并已 clearTokens + 跳登录，原流建立在此终止
+    return apiStream(path, { method, body, onEvent, signal, _retried: true });
+  }
+  if (res.status === 401) {
+    clearTokens();
+    redirectToLogin("expired");
+    throw await toApiError(res);
+  }
+  // 其余非 2xx（预检 404 租户/任务不存在、429 护栏触顶、422/409 等）：转 ApiError 抛出，
+  // 不进流循环——调用方 catch 按 err.code 分支。
+  if (!res.ok) {
+    throw await toApiError(res);
+  }
+  if (!res.body) {
+    // 理论上 SSE 响应必有 body；防御性处理，避免 getReader() 抛 TypeError。
+    throw new ApiError("invalid_response", "服务器未返回事件流。", undefined, res.status);
+  }
+
+  // 逐块读取，按 SSE 帧分隔（连续两个换行 \n\n，兼容 \r\n\r\n）切帧，尾部残帧留到下轮。
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // 规范帧分隔为空行；统一 \r\n→\n 后按 \n\n 切分。
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const rawFrame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const { event, data } = parseSSEFrame(rawFrame);
+        if (event === undefined && !data) continue; // 纯心跳/空帧
+        let parsed = data;
+        try {
+          parsed = data ? JSON.parse(data) : null;
+        } catch {
+          // 非 JSON data 原样回传（后端恒 JSON，此为防御）
+        }
+        if (typeof onEvent === "function") onEvent(event, parsed);
+      }
+    }
+  } finally {
+    // 主动释放 reader：正常结束/异常/abort 都归还底层连接，避免泄漏挂起。
+    try {
+      reader.releaseLock();
+    } catch {
+      // 已释放/流已关，忽略
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// 探索 API 薄封装（Story 7.5）：引导探索会话/答案/自述理解/收尾整理。
+// 常规 CRUD（enter/listGuidedAnswers/saveGuidedAnswer/settleGuided）走 apiFetch
+// （默认 auth=true，token/401/error 由地基处理）；SSE（interpretGuided/taskEvents）走 apiStream。
+// 后端契约（backend/src/muse/routers/exploration.py + tasks.py，Story 2.2-2.5/3.3 已 done）：
+//   POST /api/projects/{id}/explore                  → 200 {id, projectId, mode, updatedAt}（get-or-create）
+//   POST /api/projects/{id}/explore/guided/interpret → SSE delta/done/error（body {question, freeText}）
+//   POST /api/projects/{id}/explore/guided/answers   → 200 单条（body {questionIndex, question, answer, answerType}，幂等 upsert）
+//   GET  /api/projects/{id}/explore/guided/answers   → 200 list（题位升序，空 []）
+//   POST /api/projects/{id}/explore/guided/settle    → 200 {taskId}
+//   GET  /api/tasks/{taskId}/events                  → SSE progress/result/error（settle 任务，2.1 底座）
+// 7.6 自由探索复用 apiStream（free/messages SSE）——本封装只做引导侧，自由侧留 7.6 追加。
+const explorationApi = {
+  enter(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore`, { method: "POST" });
+  },
+  listGuidedAnswers(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/guided/answers`);
+  },
+  // 幂等 upsert：同一 questionIndex 覆盖（后端 (session_id, question_index) 复合唯一）。
+  // answerType: "option"（点选）/"custom"（自述凝练结果）。
+  saveGuidedAnswer(projectId, { questionIndex, question, answer, answerType }) {
+    return apiFetch(`/api/projects/${projectId}/explore/guided/answers`, {
+      method: "POST",
+      body: { questionIndex, question, answer, answerType },
+    });
+  },
+  // 自述理解流式：真实 Explorer Agent 把用户一句话凝练为该题答案（delta→done→error）。
+  interpretGuided(projectId, { question, freeText }, { onEvent, signal } = {}) {
+    return apiStream(`/api/projects/${projectId}/explore/guided/interpret`, {
+      method: "POST",
+      body: { question, freeText },
+      onEvent,
+      signal,
+    });
+  },
+  settleGuided(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/guided/settle`, {
+      method: "POST",
+    });
+  },
+  // settle 任务 SSE：progress（整理中过渡）→ result（12 字段候选卡）→ error。GET + Bearer 头。
+  taskEvents(taskId, { onEvent, signal } = {}) {
+    return apiStream(`/api/tasks/${taskId}/events`, {
+      method: "GET",
+      onEvent,
+      signal,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------
 // 全局暴露（受控决策 1：全局脚本，非 module）。app.js 及 7.2–7.7 直接引用这些符号。
 // ---------------------------------------------------------------------
 if (typeof window !== "undefined") {
@@ -367,6 +530,9 @@ if (typeof window !== "undefined") {
   window.projectApi = projectApi;
   window.byokApi = byokApi;
   window.usageApi = usageApi;
+  window.apiStream = apiStream;
+  window.parseSSEFrame = parseSSEFrame;
+  window.explorationApi = explorationApi;
   window.getAccessToken = getAccessToken;
   window.getRefreshToken = getRefreshToken;
   window.setTokens = setTokens;

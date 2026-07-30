@@ -1636,6 +1636,15 @@ a {
   margin-top: 26px;
 }
 
+/* 引导探索接线错误条（Story 7.5）：作答/整理失败时的内联提示，不遮挡问答区 */
+.guided-error {
+  color: #b3261e;
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 12px 0 0;
+  text-align: center;
+}
+
 .guided-complete-actions .primary-button {
   gap: 20px;
   min-width: 220px;

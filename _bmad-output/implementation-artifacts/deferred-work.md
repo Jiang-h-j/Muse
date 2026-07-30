@@ -1,5 +1,18 @@
 # Deferred Work
 
+## Resolved by: Story 7.5 引导探索接线 (2026-07-30)
+
+> 引导探索前端集成切片落地。**兑现并关闭**以下此前 defer 的「合并为同一前端集成切片」条目（引导侧）：
+> - 2.3 引导 interpret 前端接线（本文件 2-3 段）→ ✅ 7.5 Task4 自述作答走 apiStream 消费 interpret SSE（delta/done/error）。
+> - 2.4 引导 answers 存取前端接线（本文件 2-4 段）→ ✅ 7.5 Task3/4/5 进页 GET answers 回填 + 每题 POST answers 落库（选项/自述定点 upsert）。
+> - 2.5 引导 settle 触发 + SSE 消费前端接线（本文件 2-5 段）→ ✅ 7.5 Task6 末题 settle + taskEvents SSE 驱动整理中过渡 + result 弹真实 12 字段设定卡。
+>
+> 地基补齐：7.1 apiFetch 只支持一次性 JSON，本 story 追加 `apiStream`（fetch+ReadableStream 消费 SSE，Bearer 头鉴权、建流前 401 复用 ensureRefresh/redirectToLogin、AbortController 取消）——7.6 自由探索 free/messages SSE 复用。**自由探索侧（7.6）接线仍未做**，本文件 2-6 段 defer 保留待 7.6。
+
+- **settle SSE 无断线自动重连 / 进度续显** [prototype/app/app.js `startSettleFlow`] — 后端 settle 任务 SSE 支持「先 subscribe→补发快照→听增量」（core/sse.py），可断线重连补发终态；本 story V1 前端只做单次消费（用户主动 abort 支持），未做「网络抖动自动重连同一 taskId 续显进度」。settle 任务通常秒级（本机联调 progress×3 数秒内到 result），重连需求低。**归 SSE 编排硬化切片**（与后端 2.1/2.5 defer 的 SSE watchdog/超时同批）：前端加断线重连 + 后端任务级看门狗一并做。
+- **apiStream 无整体超时** [prototype/app/api.js `apiStream`] — reader 循环无客户端整体超时；上游 stall（后端 provider 中途卡住不推 chunk 也不断流）时，前端流会挂到后端 SSE 15s ping 断开或用户 abort。与后端 provider 层无整体超时（deferred-work.md:95/112/154 归 4.4）同源。**归 Story 4.4**：接真实生成入口时，前端 apiStream 加 `AbortController` + 超时定时器（stall 自动 abort 重试），与后端 provider 横切超时一并做。
+- **末题自述作答的 interpret→save→settle 三步非原子** [prototype/app/app.js `commitGuidedAnswer` 末题分支] — 末题若是自述作答，先 interpret 凝练（成功）→ save 落库 → settle。三步任一失败退回收尾态可重试；但「interpret 成功、save 失败」时凝练结果保留在前端态（受控决策 3），未落库——刷新会丢该题的凝练答案（需重新自述）。低概率（save 是快 CRUD），且 settle 前 save 失败会明确退回收尾态提示。**归后续**：如需更强一致性，可让 interpret done 直接带落库（后端合并端点），当前保持前端两步。
+
 ## Deferred from: code review of 7-4-BYOK设置页-托管用量入口接线 (2026-07-30)
 
 - **`providerLabel` 未知 provider 静默兜底「DeepSeek」，掩盖后端契约漂移** [prototype/app/app.js:2513 `providerLabel` + `paintByokPanel` 已绑定分支] — 三层审查 blind#4/#12 + edge#8 独立指出。`providerLabel` 只识别 `deepseek/claude/custom`，其他一律返回「DeepSeek」；后端将来加 `gemini/openai` 等新 provider 而前端未同步时，已绑定新 provider 的用户在设置页看到误标「DeepSeek」的掩码 Key，可能误以为绑错去解绑重来。**当前无触发面**：后端 `ByokBindRequest.provider` 是 `Literal["deepseek","claude","custom"]`（1.7 已固定、已核实），前端三选与之对齐，不存在未知值。**归「后端 provider 扩展批次」**：后端加新 provider 时，同步 `providerLabel` 新分支（或未知值降级为 provider 原文 + 「未识别的提供方」提示）+ 前端 `paintByokPanel` provider 三选按钮 + `ByokBindRequest`（若 custom 类还需 base_url/model，与本文件 1.7 段「custom 数据模型不完整」defer 一并做）。code review Blind + Edge Case Hunter 独立指出，Low。（2026-07-30 第二轮修复后复审再次三层收敛 blind#5 + edge#5 + auditor，结论一致，仍 defer 不重复登记。）

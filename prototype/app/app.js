@@ -111,6 +111,21 @@ let explorationView = explorationHistory.length;
 let showInspirationDirections = false;
 // 引导探索答完最后一题后的“整理中”过渡态：遮住后台生成设定的等待，传递“它在认真理解我”的体感。
 let guidedSettling = false;
+// Story 7.5 引导探索接线态（替换纯 mock/sessionStorage）：
+// explorationProjectId：当前探索作品 id（来自路由 exploreMatch，供建会话/落库/settle 用）。
+let explorationProjectId = "";
+// guidedLoadState：进探索页拉会话 + 回填答案的加载态（loading/ready/error），驱动渲染。
+let guidedLoadState = "loading";
+// guidedLoadSeq：拉取代次，回调校验代次未变才写状态/DOM（仿 7.3 projectsLoadSeq，防往返赛跑）。
+let guidedLoadSeq = 0;
+// guidedLoadError：加载失败时的 ApiError（渲染 error 态用）。
+let guidedLoadError = null;
+// guidedAnswerSaving：某题答案落库在途标志，防重复提交（选项连点 / 自述重复提交）。
+let guidedAnswerSaving = false;
+// settleAbortController：settle SSE 在途控制器，「回到探索」/切走时 abort。
+let settleAbortController = null;
+// settleErrorText：settle SSE error 事件的可读提示（渲染在收尾态供重试）。
+let settleErrorText = "";
 let customStoryClues = [];
 const explorationModeKey = "muse-exploration-mode";
 const explorationEntryModeKey = "muse-exploration-entry-mode";
@@ -561,6 +576,85 @@ function customStoryClue(clue, index) {
     </div>`;
 }
 
+// Story 7.5：引导探索 error code → 中文提示映射（仿 7.3 projectErrorText / 7.4 byokErrorText）。
+// 判定用 err.code（后端恒字符串，7.1-7.4 已坐实）；SSE error 事件的 data.code 同源可复用。
+// token_invalid/token_expired（401）由 apiFetch/apiStream 兜底跳登录，不在此处理。
+function explorationErrorText(err) {
+  const code = err && err.code;
+  switch (code) {
+    case "quota_exceeded":
+      return "已用完当前免费额度。可到设置页绑定自己的 API Key 后继续。";
+    case "generate_failed":
+      return "生成失败，请稍后重试。";
+    case "settle_failed":
+      return "整理故事设定时出错了，请重试。";
+    case "already_settled":
+      return "这部作品的设定已经确认，无法重新整理。";
+    case "mode_mismatch":
+      return "当前作品不是引导模式。";
+    case "project_not_found":
+      return "找不到这部作品，请回到作品库重试。";
+    case "task_not_found":
+      return "整理任务已失效，请重新整理。";
+    default:
+      return "操作未能完成，请检查网络后稍后重试。";
+  }
+}
+
+// 把后端一条引导答案映射为前端 explorationHistory 项。后端行：
+// {questionIndex, question, answer, answerType}；前端项：{question, answer}
+// （answer 即用户所选选项 value 或自述凝练文本，翻页高亮按 value 匹配选项、不匹配即自述）。
+function guidedAnswerFromBackend(row) {
+  return { question: row.question, answer: row.answer };
+}
+
+// 进引导探索页：建/取会话（2.2）+ 回填全部已答（2.4）。仿 7.3 loadProjects 异步范式
+// （loading→ready/error + hash + 代次时序防护）。失败态非 401（401 由 apiFetch 兜底跳登录）。
+function loadGuidedExploration(projectId) {
+  explorationProjectId = projectId;
+  guidedLoadState = "loading";
+  guidedLoadError = null;
+  const seq = ++guidedLoadSeq;
+  const startedHash = location.hash;
+  renderExploration();
+  (async () => {
+    try {
+      // 先建/取会话（get-or-create 幂等），再拉已答。会话建立失败即整体失败态。
+      await explorationApi.enter(projectId);
+      const answers = await explorationApi.listGuidedAnswers(projectId);
+      // 时序防护：用户快速切走 / 往返再进（代次变）时，丢弃过期回调，不写状态/DOM。
+      if (seq !== guidedLoadSeq || location.hash !== startedHash) return;
+      // 按 questionIndex 定点回填（防稀疏/乱序）；answers 已题位升序。
+      const history = [];
+      for (const row of answers) {
+        history[row.questionIndex] = guidedAnswerFromBackend(row);
+      }
+      explorationHistory = history;
+      // 进页翻页指针落在已答进度处（保持原型 explorationView=已答数语义）。
+      explorationView = explorationHistory.length;
+      guidedLoadState = "ready";
+      renderExploration();
+    } catch (err) {
+      if (seq !== guidedLoadSeq || location.hash !== startedHash) return;
+      // 401 已由 apiFetch 兜底（清 token + 跳登录），此处只会拿到非 401 的 ApiError。
+      guidedLoadError = err;
+      guidedLoadState = "error";
+      renderExploration();
+    }
+  })();
+}
+
+// 落库一条引导答案（选项 / 自述凝练结果通用）。幂等 upsert：同 questionIndex 覆盖。
+// 返回 Promise，调用方据成功/失败推进或提示。questionIndex 用当前翻页位置 explorationView。
+function persistGuidedAnswer({ questionIndex, question, answer, answerType }) {
+  return explorationApi.saveGuidedAnswer(explorationProjectId, {
+    questionIndex,
+    question,
+    answer,
+    answerType,
+  });
+}
+
 function currentExplorationQuestion() {
   // 返回当前题的完整对象（含 question / options / allowCustom）。
   // 需要题干字符串的调用点应取 .question，需要选项的取 .options。
@@ -572,33 +666,201 @@ function currentExplorationQuestion() {
   );
 }
 
-// 引导探索提交一题答案：按当前翻页位置写入/覆盖答案并前进一题；
-// 翻回旧题重选只更新该题，不清除后面的答案（问卷式前后翻页）。
-// 只有停留在最后一题并作答时，才进“整理中”过渡态并弹故事设定卡。
-function submitGuidedAnswer(answerText) {
-  const answer = String(answerText || "").trim();
-  if (!answer) return;
-  const wasAnswered = explorationView < explorationHistory.length;
-  explorationHistory[explorationView] = {
-    question: currentExplorationQuestion().question,
-    answer,
-  };
-  const isLastQuestion = explorationView >= explorationQuestions.length - 1;
-  // 停在最后一题作答 = 全部答完：翻页指针推进到收尾页（题数），
-  // 使“回到探索”落到带“上一题”的收尾屏而非死屏；随后进入整理中过渡态。
-  if (isLastQuestion) {
-    explorationView = explorationQuestions.length;
-    guidedSettling = true;
-    renderExploration();
-    window.setTimeout(() => {
-      guidedSettling = false;
-      openStoryProfileDialog();
-    }, 1200);
+// 引导探索提交一题答案（Story 7.5 接线）：分两条路径——
+//   · 选项作答（submitGuidedOption）：不调 LLM，直接落库该选项 value。
+//   · 自述作答（submitGuidedCustom）：先走 interpret 流式凝练，done 拿凝练答案再落库。
+// 两者最终都进 commitGuidedAnswer 共用「乐观写前端 → 落库 → 推进 / 末题 settle」逻辑。
+//
+// 落库语义（受控决策 3）：先乐观写 explorationHistory[view] 让 UI 即时响应，再异步落库；
+// 落库失败提示但保留前端答案（避免用户重打），下次操作或刷新会以后端为准。末题特殊：
+// settle 需读到已落库答案，故末题落库成功后才触发 settle。
+
+// 选项作答：question_index=当前翻页位置，answerType=option。
+function submitGuidedOption(optionValue) {
+  const answer = String(optionValue || "").trim();
+  if (!answer || guidedAnswerSaving) return;
+  commitGuidedAnswer(answer, "option");
+}
+
+// 自述作答：先 interpret 流式凝练（真实 Explorer Agent），done 后以凝练结果落库。
+async function submitGuidedCustom(freeText) {
+  const text = String(freeText || "").trim();
+  if (!text || guidedAnswerSaving) return;
+  const questionIndex = explorationView;
+  const question = currentExplorationQuestion().question;
+  guidedAnswerSaving = true;
+  // 就地显「理解中」态：找当前自述表单的提交按钮，禁用 + 改文案（仿 7.3/7.4 按钮 loading）。
+  const submitBtn = document.querySelector(
+    "[data-guided-custom-form] button[type=submit]",
+  );
+  const originalLabel = submitBtn ? submitBtn.innerHTML : "";
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "理解中…";
+  }
+  let interpreted = "";
+  let streamError = null;
+  try {
+    await explorationApi.interpretGuided(
+      explorationProjectId,
+      { question, freeText: text },
+      {
+        onEvent: (type, data) => {
+          if (type === "delta" && data && data.text) {
+            interpreted += data.text;
+            if (submitBtn) submitBtn.textContent = "理解中…";
+          } else if (type === "done" && data && typeof data.text === "string") {
+            interpreted = data.text;
+          } else if (type === "error") {
+            // 流内业务错误（如 quota_exceeded / generate_failed）：记下，流结束后统一提示。
+            streamError = new ApiError(
+              data && data.code,
+              data && data.message,
+              undefined,
+              undefined,
+            );
+          }
+        },
+      },
+    );
+  } catch (err) {
+    // 建流前错误（预检 429/404/…）或网络中断：转可读提示。401 已由 apiStream 兜底跳登录。
+    streamError = err;
+  }
+  guidedAnswerSaving = false;
+  if (streamError) {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = originalLabel;
+    }
+    showGuidedInlineError(explorationErrorText(streamError));
     return;
   }
-  // 翻回旧题重选后前进：回到“已答进度”的下一题，避免把用户重新拽回问卷开头。
-  explorationView = wasAnswered ? explorationView + 1 : explorationHistory.length;
+  const answer = interpreted.trim();
+  if (!answer) {
+    // 空产兜底（后端一般已发 generate_failed，此为双保险）。
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = originalLabel;
+    }
+    showGuidedInlineError("没能理解这句话，请换个说法再试。");
+    return;
+  }
+  commitGuidedAnswer(answer, "custom", questionIndex);
+}
+
+// 共用：乐观写前端 + 落库 + 推进（末题触发 settle）。
+// questionIndexOverride 供自述路径传入（异步期间 explorationView 可能已变，锁定提交时的题位）。
+function commitGuidedAnswer(answer, answerType, questionIndexOverride) {
+  const questionIndex =
+    questionIndexOverride === undefined ? explorationView : questionIndexOverride;
+  const question =
+    explorationQuestions[questionIndex]?.question ||
+    currentExplorationQuestion().question;
+  const wasAnswered = questionIndex < explorationHistory.length;
+  // 乐观写：即时反映到 UI（翻页高亮 / 收尾态）。
+  explorationHistory[questionIndex] = { question, answer };
+  const isLastQuestion = questionIndex >= explorationQuestions.length - 1;
+
+  if (isLastQuestion) {
+    // 末题：先落库（settle 需读到），成功后进整理中过渡 + 触发 settle SSE。
+    explorationView = explorationQuestions.length;
+    guidedSettling = true;
+    settleErrorText = "";
+    renderExploration();
+    guidedAnswerSaving = true;
+    (async () => {
+      try {
+        await persistGuidedAnswer({
+          questionIndex,
+          question,
+          answer,
+          answerType,
+        });
+        guidedAnswerSaving = false;
+        startSettleFlow();
+      } catch (err) {
+        // 末题落库失败：退出整理中过渡，回收尾态提示重试（不触发 settle）。
+        guidedAnswerSaving = false;
+        guidedSettling = false;
+        settleErrorText = explorationErrorText(err);
+        renderExploration();
+      }
+    })();
+    return;
+  }
+
+  // 非末题：翻回旧题重选后前进到「已答进度」的下一题；否则前进一题。
+  explorationView = wasAnswered
+    ? explorationView + 1
+    : explorationHistory.length;
   renderExploration();
+  // 异步落库（非阻塞 UI）：失败仅提示，保留前端答案（受控决策 3）。
+  guidedAnswerSaving = true;
+  persistGuidedAnswer({ questionIndex, question, answer, answerType })
+    .catch((err) => {
+      showGuidedInlineError(explorationErrorText(err));
+    })
+    .finally(() => {
+      guidedAnswerSaving = false;
+    });
+}
+
+// settle SSE 流：POST settle 拿 taskId → GET /tasks/{id}/events 消费 progress/result/error。
+// progress 驱动整理中过渡（本 V1 保持文案态，不显数字）；result 关过渡 + 弹真实设定卡；
+// error 退回收尾态提示重试。abort（回到探索/切走）时干净退出。
+async function startSettleFlow() {
+  // 取消上一个在途 settle（重复触发防御），新建控制器。
+  if (settleAbortController) settleAbortController.abort();
+  settleAbortController = new AbortController();
+  const signal = settleAbortController.signal;
+  try {
+    const { taskId } = await explorationApi.settleGuided(explorationProjectId);
+    if (signal.aborted) return;
+    await explorationApi.taskEvents(taskId, {
+      signal,
+      onEvent: (type, data) => {
+        if (signal.aborted) return;
+        if (type === "result" && data && data.profile) {
+          guidedSettling = false;
+          settleAbortController = null;
+          openStoryProfileFromBackend(data.profile);
+        } else if (type === "error") {
+          guidedSettling = false;
+          settleAbortController = null;
+          settleErrorText = explorationErrorText({
+            code: data && data.code,
+          });
+          renderExploration();
+        }
+        // progress：整理中过渡已在显示，V1 不额外更新（保持文案态）。
+      },
+    });
+  } catch (err) {
+    if (signal.aborted) return; // 用户主动 abort，不报错
+    guidedSettling = false;
+    settleAbortController = null;
+    settleErrorText = explorationErrorText(err);
+    renderExploration();
+  }
+}
+
+// 引导页内联错误提示：在引导 stage 顶部插一条错误条（无遮挡、可被下次渲染清除）。
+function showGuidedInlineError(text) {
+  const stage = document.querySelector(".guided-stage");
+  if (!stage) {
+    window.alert(text);
+    return;
+  }
+  let bar = stage.querySelector("[data-guided-error]");
+  if (!bar) {
+    bar = document.createElement("p");
+    bar.className = "guided-error";
+    bar.setAttribute("data-guided-error", "");
+    bar.setAttribute("role", "alert");
+    stage.prepend(bar);
+  }
+  bar.textContent = text;
 }
 
 function escapeHtml(value) {
@@ -660,6 +922,65 @@ function buildFinalStoryProfile(draft) {
   return fields;
 }
 
+// Story 7.5：把后端 settle result 的 12 字段候选卡（StoryProfileCard，camelCase）转成
+// 设定卡对话框渲染用的 [{label, value}] 结构。主干 7 恒显（缺料后端为空串）；题材特化 4
+// 按值非空显（后端按 genre 激活、不匹配为 null）；⑫ 文风锚点非空才显。字段顺序对齐
+// [[project_muse_setting_fields]] 的 ①-⑫ 编号。本 story emit-only 展示，不含 revision。
+const PROFILE_FIELD_LABELS = [
+  ["genre", "题材"],
+  ["coreAppeal", "核心吸引力"],
+  ["protagonist", "主角"],
+  ["mainConflict", "主要冲突"],
+  ["worldRules", "关键世界规则"],
+  ["overallTone", "整体气质"],
+  ["openingHook", "开篇钩子"],
+  ["powerSystem", "力量体系"],
+  ["goldenFinger", "金手指"],
+  ["romanceLine", "感情线"],
+  ["factionLandscape", "势力格局"],
+  ["styleProfile", "文风锚点"],
+];
+// 主干 7 字段 key（恒显，即使空串也占位，让用户知道该项待补）。
+const PROFILE_TRUNK_KEYS = new Set([
+  "genre",
+  "coreAppeal",
+  "protagonist",
+  "mainConflict",
+  "worldRules",
+  "overallTone",
+  "openingHook",
+]);
+
+function buildProfileFromBackend(profile) {
+  const fields = [];
+  for (const [key, label] of PROFILE_FIELD_LABELS) {
+    const raw = profile ? profile[key] : undefined;
+    const value = typeof raw === "string" ? raw.trim() : "";
+    if (PROFILE_TRUNK_KEYS.has(key)) {
+      // 主干恒显：空串回落占位文案，提示这项还没聊清楚。
+      fields.push({ label, value: value || "（尚未聊到，可继续补充）", added: false });
+    } else if (value) {
+      // 题材特化 + 文风锚点：仅在后端给了非空值时显（按 genre 激活 / 已锚定文风）。
+      fields.push({ label, value, added: false });
+    }
+  }
+  return fields;
+}
+
+// 用后端真实候选卡弹出设定卡（替换 mock 的 openStoryProfileDialog 走 buildFinalStoryProfile）。
+// 会话内恢复用（AC7）：写 finalStoryProfile + pending 态 + persist 到 sessionStorage。
+function openStoryProfileFromBackend(profile) {
+  finalStoryProfile = buildProfileFromBackend(profile);
+  // signature 用后端 profile 序列化，标识「这份候选卡」；恢复时据此判定是否同一份。
+  finalStoryProfileSignature = JSON.stringify(profile);
+  finalStoryProfileRevision = 1;
+  pendingStoryProfile = true;
+  lastProfileChangedFields = [];
+  profileFeedbackStatus = "";
+  persistPendingStoryProfile();
+  mountStoryProfileDialog();
+}
+
 function storyProfileDialogMarkup() {
   const items = finalStoryProfile
     .map(
@@ -705,6 +1026,14 @@ function discardStoryProfileAndReturn() {
   profileFeedbackStatus = "";
   // 复位“整理中”过渡态：否则回到探索页会卡在整理动画上（弹窗由末题触发时留下的态）。
   guidedSettling = false;
+  // Story 7.5：abort 在途 settle SSE（若还在整理中被点回到探索）。settle 任务 emit-only
+  // 无落库副作用（后端 worker 不写 story_bible），前端丢弃 taskId + 断流即可，不调后端
+  // 丢弃端点（已确认设定的真实丢弃 FR15 归 7.7）。
+  if (settleAbortController) {
+    settleAbortController.abort();
+    settleAbortController = null;
+  }
+  settleErrorText = "";
   clearPendingStoryProfile();
   closeStoryProfileDialog();
   // 回到探索页需重新渲染，回到正常问答界面（收尾态：可翻页修改、可再次整理）。
@@ -923,6 +1252,34 @@ function renderExploration() {
   let mainContent;
   let storyForming = ""; // 引导模式不输出右侧侧边栏；仅自由模式在下方 else 分支构造
   if (isGuided) {
+    // Story 7.5：进页建会话 + 回填答案的加载态优先（error 态在 pending 卡恢复时不触发）。
+    if (guidedLoadState === "loading") {
+      mainContent = `
+        <section class="explore-dialogue guided-dialogue" aria-labelledby="explore-title">
+          <h1 id="explore-title" class="visually-hidden">引导探索</h1>
+          <div class="guided-stage">
+            <div class="guided-current" role="status" aria-live="polite">
+              <span class="guided-settling-spinner" aria-hidden="true"></span>
+              <p class="guided-question">正在准备你的引导探索……</p>
+            </div>
+          </div>
+        </section>`;
+    } else if (guidedLoadState === "error") {
+      const errText = escapeHtml(explorationErrorText(guidedLoadError));
+      mainContent = `
+        <section class="explore-dialogue guided-dialogue" aria-labelledby="explore-title">
+          <h1 id="explore-title" class="visually-hidden">引导探索</h1>
+          <div class="guided-stage">
+            <div class="guided-current">
+              <p class="guided-question">没能载入引导探索</p>
+              <p class="guided-complete-hint">${errText}</p>
+            </div>
+            <div class="guided-complete-actions">
+              <button class="primary-button" type="button" data-guided-reload>重新加载 <span>→</span></button>
+            </div>
+          </div>
+        </section>`;
+    } else {
     // 引导探索：纯选项式沉浸问答。用户只点选项（第一题可自述一句话），
     // 一次只聚焦一题，不显示已答历史，也不显示右侧故事线索侧边栏。
     const totalLabel = String(explorationQuestions.length).padStart(2, "0");
@@ -955,12 +1312,17 @@ function renderExploration() {
         </div>`;
     } else if (guidedComplete) {
       // 收尾态（翻到最后一题之后的虚拟页）：能整理为故事设定；“上一题”由底部翻页栏承载。
+      // Story 7.5：settle 失败时在此显重试提示（settleErrorText）。
+      const settleHint = settleErrorText
+        ? `<p class="guided-error" role="alert">${escapeHtml(settleErrorText)}</p>`
+        : "";
       stageInner = `
         <div class="guided-current is-complete">
           <span class="guided-progress">引导完成 · ${totalLabel} / ${totalLabel}</span>
           <p class="guided-question">这些问题已经把故事的骨架照亮了。</p>
           <p class="guided-complete-hint">如果想修改，可以回到上一题重新选择；准备好了就整理成一份故事设定。</p>
         </div>
+        ${settleHint}
         <div class="guided-complete-actions">
           <button class="primary-button guided-finish" type="button" data-guided-finish>整理为故事设定 <span>→</span></button>
         </div>`;
@@ -1020,6 +1382,7 @@ function renderExploration() {
         </div>
         ${toolbar ? `<div class="guided-footer-nav">${toolbar}</div>` : ""}
       </section>`;
+    } // 结束 guidedLoadState ready 分支（Story 7.5）
   } else {
     // 自由探索：完全保持原有界面与右侧故事线索侧边栏（本次改动不触碰）。
     const canFinish = freeConversation.some((entry) => entry.role === "user");
@@ -1110,7 +1473,7 @@ function bindExplorationInteractions() {
     button.addEventListener("click", () => {
       const options = currentExplorationQuestion().options || [];
       const option = options[Number(button.dataset.guidedOption)];
-      if (option) submitGuidedAnswer(option.value);
+      if (option) submitGuidedOption(option.value);
     });
   });
   document.querySelector("[data-guided-back]")?.addEventListener("click", () => {
@@ -1140,14 +1503,28 @@ function bindExplorationInteractions() {
   document.querySelectorAll("[data-guided-custom-form]").forEach((form) => {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitGuidedAnswer(
+      // 自述作答：走真实 Explorer Agent interpret 流式凝练（Story 7.5）。
+      submitGuidedCustom(
         event.currentTarget.querySelector("[data-guided-custom-input]")?.value,
       );
     });
   });
   document
     .querySelector("[data-guided-finish]")
-    ?.addEventListener("click", () => openStoryProfileDialog());
+    ?.addEventListener("click", () => {
+      // 收尾态显式「整理为故事设定」：进整理中过渡 + 触发真实 settle SSE（Story 7.5，
+      // 替换原 mock openStoryProfileDialog）。末题作答已自动触发；此按钮供翻回后重新整理。
+      guidedSettling = true;
+      settleErrorText = "";
+      renderExploration();
+      startSettleFlow();
+    });
+  document
+    .querySelector("[data-guided-reload]")
+    ?.addEventListener("click", () => {
+      // 加载失败重试：重新建会话 + 回填（Story 7.5 error 态）。
+      if (explorationProjectId) loadGuidedExploration(explorationProjectId);
+    });
 
   // —— 自由探索：以下逻辑保持原样 ——
   document
@@ -1920,6 +2297,16 @@ function resetExplorationStateForNewProject(mode) {
   explorationView = 0;
   showInspirationDirections = false;
   guidedSettling = false;
+  // Story 7.5：重置引导接线态，防新建作品跨会话残留（仿 7.4 logout 态重置）。
+  guidedLoadState = "loading";
+  guidedLoadError = null;
+  guidedLoadSeq += 1; // 作废任何在途加载回调
+  guidedAnswerSaving = false;
+  settleErrorText = "";
+  if (settleAbortController) {
+    settleAbortController.abort();
+    settleAbortController = null;
+  }
   customStoryClues = [];
   finalStoryProfile = null;
   finalStoryProfileSignature = "";
@@ -2888,8 +3275,27 @@ function render() {
   }
   else if (hashPath() === "#/projects/demo/stage-direction")
     renderStageDirection();
-  else if (exploreMatch) renderExploration();
-  else if (archiveMatch) {
+  else if (exploreMatch) {
+    // Story 7.5：进引导探索页须建会话 + 回填已答（异步）。记录路由 projectId 供
+    // 落库/settle 复用（替换 deferred-work.md:42「explore 目标页未消费路由 id」）。
+    // 自由模式（7.6 未接）仍走 mock，不触发引导后端加载。
+    const routeProjectId = exploreMatch[1];
+    if (explorationEntryMode !== "free") {
+      // 待确认设定卡刷新恢复优先（AC7）：pending 态直接渲染（renderExploration 末尾重挂弹窗），
+      // 无需重拉后端（settle 结果已在 sessionStorage）。仅非 pending 时才建会话 + 回填。
+      if (pendingStoryProfile && finalStoryProfile) {
+        explorationProjectId = routeProjectId;
+        guidedLoadState = "ready";
+        renderExploration();
+      } else {
+        loadGuidedExploration(routeProjectId);
+      }
+    } else {
+      explorationProjectId = routeProjectId;
+      guidedLoadState = "ready";
+      renderExploration();
+    }
+  } else if (archiveMatch) {
     const archiveProject = projects.find(
       (project) => project.id === archiveMatch[1],
     );
