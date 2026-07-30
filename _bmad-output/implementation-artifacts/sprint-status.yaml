@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-07-30 (Story 7.2 code review 通过 + 1 patch 修复：review → done)
+last_updated: 2026-07-30 (Story 7.3 作品库接线实现完成：in-progress → review)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -118,7 +118,7 @@ development_status:
   epic-7: in-progress
   7-1-统一请求工具地基token-401跳转-errorenvelope-camelCase边界: done
   7-2-登录注册接线真实会话替换mock: done
-  7-3-作品库接线列表-新建-重命名-删除-空失败态-继续创作跳转: backlog
+  7-3-作品库接线列表-新建-重命名-删除-空失败态-继续创作跳转: review
   7-4-BYOK设置页-托管用量入口接线含UX-DR2新增UI: backlog
   7-5-引导探索接线SSE问答-翻页持久化-整理中过渡-设定卡弹出: backlog
   7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: backlog

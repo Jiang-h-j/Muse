@@ -206,38 +206,16 @@ function clearPendingStoryProfile() {
   window.sessionStorage.removeItem(pendingStoryProfileKey);
 }
 
-const projects = [
-  {
-    id: "mist-harbor",
-    title: "雾港回声",
-    mode: "引导探索",
-    phase: "chapter",
-    attention: "等待你",
-    detail: "第 3 章草稿等待阅读",
-    updated: "今天 16:40",
-    action: "阅读草稿",
-  },
-  {
-    id: "stardust-postman",
-    title: "星尘邮差",
-    mode: "自由探索",
-    phase: "archive",
-    attention: "等待你",
-    detail: "第 2 章草稿等待阅读",
-    updated: "昨天 21:08",
-    action: "阅读草稿",
-  },
-  {
-    id: "nameless",
-    title: "未命名小说",
-    mode: "引导探索",
-    phase: "explore",
-    attention: "可以继续",
-    detail: "继续回答关于主角的问题",
-    updated: "7 月 12 日",
-    action: "继续设定",
-  },
-];
+// 作品库列表：Story 7.3 起由后端 GET /api/projects 真实填充（camelCase），
+// 不再硬编码。ProjectResponse 字段：{id, title, mode(guided/free),
+// phase(explore/chapter/archive), updatedAt(ISO)}。后端已按 updated_at DESC 排序。
+let projects = [];
+// 列表加载态：驱动 renderProjects 渲染 loading/ready/empty/error 四态（替换原型
+// 靠 ?state= 预览开关的手动切换）。初始 loading，list 回调据结果置 ready/empty/error。
+let projectsLoadState = "loading";
+// 当前登录用户邮箱：GET /api/auth/me 拉取后缓存，header 展示（替换硬编码 creator@example.com）。
+// 邮箱不变，缓存即可；me 失败降级为空串、不阻断作品列表。
+let currentUserEmail = "";
 
 // phase → 展示文案 + 继续路由的单一数据源（键须与后端英文枚举逐字一致）
 const PHASE_META = {
@@ -257,6 +235,53 @@ const PHASE_META = {
     route: (id) => `#/projects/${id}/archive`,
   },
 };
+
+// ---------------------------------------------------------------------
+// 作品库字段适配（Story 7.3）：后端 ProjectResponse 只返 {id,title,mode,phase,updatedAt}，
+// 与原型 mock 字段（mode 中文 / updated 预格式化 / attention·detail 副文案）不一一对应，
+// 渲染前在此收敛映射。纯函数、无 DOM 依赖，便于 Node vm 回归。
+// ---------------------------------------------------------------------
+
+// mode 枚举 → 中文展示（后端 guided/free，原型展示「引导探索/自由探索」）。
+// 与 createDialog naming 步骤（selectedMode==="free"?"自由探索":"引导探索"）同一口径。
+function projectModeLabel(mode) {
+  return mode === "free" ? "自由探索" : "引导探索";
+}
+
+// phase → 作品行副文案（受控决策 1）：后端不返 mock 的 attention/detail（真实章节进度
+// 归 Epic 4/5，本 story 无数据源）。故用 phase 派生中性文案，不臆造后端字段、不硬编码假进度。
+function projectStatusText(phase) {
+  if (phase === "chapter") return "创作中";
+  if (phase === "archive") return "已归档";
+  return "设定进行中";
+}
+
+// updatedAt(ISO 8601 UTC，带 Z) → 中文相对时间展示（替换 mock 预格式化的「今天 16:40」）。
+// 容错：非法/缺失时间返空串（<time> 留空不崩）。相对规则：今天/昨天/N 天内/更早显日期。
+function formatRelativeTime(iso) {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return "";
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const hm = `${pad(then.getHours())}:${pad(then.getMinutes())}`;
+  const startOfDay = (d) =>
+    new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const dayDiff = Math.round((startOfDay(now) - startOfDay(then)) / 86400000);
+  if (dayDiff <= 0) return `今天 ${hm}`;
+  if (dayDiff === 1) return `昨天 ${hm}`;
+  if (dayDiff < 7) return `${dayDiff} 天前`;
+  return `${then.getMonth() + 1} 月 ${then.getDate()} 日`;
+}
+
+// 作品操作失败（ApiError）→ 可读提示文案（不臆造后端未定义分支，参照 authStateFromError）。
+// project_not_found：作品已被删/越权（后端 IDOR 消除，越权也返 404）→ 提示已不存在，调用方刷新列表。
+function projectErrorText(err) {
+  const code = err && err.code;
+  if (code === "project_not_found") return "这本小说已不存在，列表已刷新。";
+  if (code === "validation_error") return "输入有误，请检查后重试。";
+  return "操作未能完成，请检查网络后稍后重试。";
+}
 
 function hashPath() {
   return location.hash.split("?")[0] || "#/login";
@@ -362,19 +387,23 @@ function renderAuth() {
 function projectRow(project, index) {
   const number = String(index + 1).padStart(2, "0");
   const meta = PHASE_META[project.phase];
+  // title 为真实用户输入，须 escapeHtml 防 XSS（mock 期是静态标题不涉及）。
+  const title = escapeHtml(project.title || "未命名小说");
+  const modeLabel = projectModeLabel(project.mode);
+  const statusText = projectStatusText(project.phase);
+  const updated = formatRelativeTime(project.updatedAt);
   return `
     <li class="project-row" data-project-id="${project.id}">
-      <a class="project-archive-link" href="#/projects/${project.id}/archive" aria-label="查看《${project.title}》的章节归档"></a>
+      <a class="project-archive-link" href="#/projects/${project.id}/archive" aria-label="查看《${title}》的章节归档"></a>
       <span class="project-number">${number}</span>
       <div class="project-copy">
-        <div class="project-title-line"><h2>${project.title}</h2><span class="project-mode">${project.mode}</span></div>
-        <div class="project-status"><span>${meta?.label ?? project.phase}</span><i></i><strong>${project.attention}</strong></div>
-        <p>${project.detail}</p>
+        <div class="project-title-line"><h2>${title}</h2><span class="project-mode">${modeLabel}</span></div>
+        <div class="project-status"><span>${meta?.label ?? project.phase}</span><i></i><strong>${statusText}</strong></div>
       </div>
-      <time>${project.updated}</time>
+      <time>${updated}</time>
       <button class="project-primary" data-continue="${project.id}">${meta?.continueLabel ?? "继续"}<span>→</span></button>
       <div class="project-menu-wrap">
-        <button class="project-menu-button" aria-label="${project.title}的更多操作" aria-expanded="false" data-menu="${project.id}">•••</button>
+        <button class="project-menu-button" aria-label="${title}的更多操作" aria-expanded="false" data-menu="${project.id}">•••</button>
         <div class="project-menu" hidden><button data-rename="${project.id}">重命名</button><button data-delete="${project.id}">删除</button></div>
       </div>
     </li>`;
@@ -412,28 +441,87 @@ function createDialog() {
     </div>`;
 }
 
+// 作品库渲染（Story 7.3 异步数据驱动）。render() dispatcher 同步调本函数：先按当前
+// projectsLoadState 同步绘制（loading/ready/empty/error），若处于 loading 则触发一次
+// 真实拉取（loadProjects），拉取回调据结果更新态并重绘。此设计保持 render() 同步、
+// 数据真实：进入 #/projects 即 loading→拉取→ready/empty/error。
 function renderProjects() {
-  const state = queryState();
-  const visibleProjects = state === "empty" ? [] : projects;
   document.title = "你的小说 · Muse";
+  paintProjects();
+  bindProjectInteractions();
+  if (projectsLoadState === "loading") {
+    loadProjects();
+  }
+}
+
+// 同步绘制当前态到 DOM（不含数据拉取）。四态：
+//   loading — 拉取中占位；ready — 有作品列表 + 新建入口；
+//   empty — 空库引导；error — 加载失败 + 重新加载。
+function paintProjects() {
+  const state = projectsLoadState;
+  const email = currentUserEmail
+    ? escapeHtml(currentUserEmail)
+    : "创作空间";
+  let content;
+  if (state === "loading") {
+    content = `<section class="library-loading" aria-busy="true"><p>正在载入你的作品…</p></section>`;
+  } else if (state === "error") {
+    content = `<section class="library-error"><strong>暂时无法读取你的作品。</strong><p>连接恢复后可以重新加载，不会影响已经保存的内容。</p><button class="secondary-button" data-reload>重新加载</button></section>`;
+  } else if (projects.length) {
+    content = `<ol class="project-list">${projects
+      .map(projectRow)
+      .join(
+        "",
+      )}<li><button class="new-project" data-new-project><span class="new-number">＋</span><span><strong>开始一本新小说</strong><small>从一个想法，或者一份已经准备好的设定开始。</small></span><span class="new-arrow">→</span></button></li></ol>`;
+  } else {
+    content = `<section class="empty-library"><div class="empty-lead"><div class="empty-index">First novel / 01</div><h2>你的第一本小说，<br />从这里开始。</h2></div><div class="empty-action"><p>不需要准备好完整故事。可以从一个模糊的想法开始，也可以直接写下已有设定。</p><button class="primary-button" data-new-project>开始一本新小说 <span>→</span></button></div></section>`;
+  }
+  // 计数：loading/error 时列表未定，显 -- 占位；ready/empty 显真实条数。
+  const count =
+    state === "loading" || state === "error"
+      ? "--"
+      : String(projects.length).padStart(2, "0");
   app.innerHTML = `
     <div class="library-page">
       <header class="library-header">
         <a class="wordmark" href="#/projects"><span class="wordmark-mark">M</span><span>Muse</span></a>
         <nav class="library-nav" aria-label="主导航"><a aria-current="page" href="#/projects">作品</a></nav>
-        <div class="account"><span>creator@example.com</span><a href="#/login" data-logout>退出</a></div>
+        <div class="account"><span>${email}</span><a href="#/login" data-logout>退出</a></div>
       </header>
       <main class="library-main">
         <div class="library-heading">
-          <div><div class="library-kicker">Library / ${String(visibleProjects.length).padStart(2, "0")} novels</div><h1>你的小说</h1><p>继续写下去。作品按照最后更新时间排列。</p></div>
+          <div><div class="library-kicker">Library / ${count} novels</div><h1>你的小说</h1><p>继续写下去。作品按照最后更新时间排列。</p></div>
           <span class="library-folio">02</span>
         </div>
-        ${state === "error" ? `<section class="library-error"><strong>暂时无法读取你的作品。</strong><p>连接恢复后可以重新加载，不会影响已经保存的内容。</p><button class="secondary-button" data-reload>重新加载</button></section>` : visibleProjects.length ? `<ol class="project-list">${visibleProjects.map(projectRow).join("")}<li><button class="new-project" data-new-project><span class="new-number">＋</span><span><strong>开始一本新小说</strong><small>从一个想法，或者一份已经准备好的设定开始。</small></span><span class="new-arrow">→</span></button></li></ol>` : `<section class="empty-library"><div class="empty-lead"><div class="empty-index">First novel / 01</div><h2>你的第一本小说，<br />从这里开始。</h2></div><div class="empty-action"><p>不需要准备好完整故事。可以从一个模糊的想法开始，也可以直接写下已有设定。</p><button class="primary-button" data-new-project>开始一本新小说 <span>→</span></button></div></section>`}
-        <details class="state-preview library-preview"><summary>原型状态预览</summary><div class="preview-links"><a class="preview-link" href="#/projects">作品列表</a><a class="preview-link" href="#/projects?state=empty">空状态</a><a class="preview-link" href="#/projects?state=error">加载失败</a></div></details>
+        ${content}
       </main>
       ${createDialog()}
     </div>`;
-  bindProjectInteractions();
+}
+
+// 异步拉取真实作品列表 + 当前用户邮箱（AC1/AC2/AC5）。
+// 时序防护：拉取前记录发起时 hash，回调时若已切走（不在 #/projects）则不写 DOM，
+// 避免用户快速切页后回调仍覆盖新页面（受控决策 4）。
+// 401 由 apiFetch 兜底（自动刷新重放 / 失效跳登录），不在此重复处理。
+async function loadProjects() {
+  const startedHash = hashPath();
+  // 并发拉列表 + 邮箱；邮箱失败不阻断列表（受控决策 3，降级为不显示邮箱）。
+  const [listResult, meResult] = await Promise.allSettled([
+    projectApi.list(),
+    authApi.me(),
+  ]);
+  if (hashPath() !== startedHash) return; // 已切走，丢弃本次结果
+  if (meResult.status === "fulfilled" && meResult.value) {
+    currentUserEmail = meResult.value.email || "";
+  }
+  if (listResult.status === "fulfilled") {
+    projects = Array.isArray(listResult.value) ? listResult.value : [];
+    projectsLoadState = projects.length ? "ready" : "empty";
+  } else {
+    // 列表失败（非 401，401 已被 apiFetch 跳登录消化）→ error 态。
+    projectsLoadState = "error";
+  }
+  renderProjects();
 }
 
 function storyClue(label, value = "") {
@@ -1804,6 +1892,58 @@ function openCreate(step = "mode") {
   renderProjects();
 }
 
+// 新建作品成功后重置探索/章节全局态（原型「新建即进全新探索」机制，与作品创建正交）。
+// 从原 data-create-submit handler 抽出，供真实创建成功后调用。入参 mode = guided/free。
+function resetExplorationStateForNewProject(mode) {
+  // 引导探索与自由探索都进入探索页，仅记录入口模式供探索页选择渲染哪种界面
+  explorationEntryMode = mode === "free" ? "free" : "guided";
+  window.sessionStorage.setItem(explorationEntryModeKey, explorationEntryMode);
+  explorationHistory = [];
+  freeConversation = [];
+  explorationView = 0;
+  showInspirationDirections = false;
+  guidedSettling = false;
+  customStoryClues = [];
+  finalStoryProfile = null;
+  finalStoryProfileSignature = "";
+  finalStoryProfileRevision = 1;
+  pendingStoryProfile = false;
+  lastProfileChangedFields = [];
+  profileFeedbackStatus = "";
+  explorationMode = "profile";
+  confirmedStoryProfile = null;
+  stagePlanningHistory = [];
+  stagePlanningRound = 0;
+  stagePlanningDraft = {
+    goal: "",
+    opening: "",
+    conflict: "",
+    events: "",
+    chapters: "",
+  };
+  currentStagePlan = null;
+  chapterCreationState = "input";
+  chapterIdea = "";
+  chapterReaderPage = 0;
+  chapterRevision = 1;
+  chapterFeedback = "";
+  chapterAgentBusy = false;
+  chapterAgentResult = "";
+  chapterLastRevisionAction = "";
+  chapterAnnotations = [];
+  chapterAnnotationTarget = null;
+  chapterAnnotationDraft = "";
+  chapterAnnotationFocus = null;
+  chapterFinalized = false;
+  chapterCreationIndex = 0;
+  archiveDialogOpen = false;
+  archiveSelectedChapter = 0;
+  archiveSelectedStage = 0;
+  clearPendingStoryProfile();
+  window.sessionStorage.removeItem(explorationModeKey);
+  window.sessionStorage.removeItem(confirmedStoryProfileKey);
+}
+
 function bindProjectInteractions() {
   // 退出（Story 7.2 AC5）：拦截默认跳转，先调 authApi.logout 作废后端 refresh + 清本地 token
   // （logout 已保证 finally 清本地态、失败静默，api.js），再回登录态。避免纯 <a href> 绕过登出。
@@ -1840,63 +1980,45 @@ function bindProjectInteractions() {
     });
   document
     .querySelector("[data-create-submit]")
-    ?.addEventListener("click", () => {
+    ?.addEventListener("click", (event) => {
+      const submit = event.currentTarget;
+      if (submit.disabled) return; // 防重复提交（在途禁点）
       const mode = selectedMode;
-      explorationTitle =
-        document.querySelector(".naming-input")?.value.trim() || "未命名小说";
-      createStep = "closed";
-      selectedMode = "";
-      // 引导探索与自由探索都进入探索页，仅记录入口模式供探索页选择渲染哪种界面
-      explorationEntryMode = mode === "free" ? "free" : "guided";
-      window.sessionStorage.setItem(
-        explorationEntryModeKey,
-        explorationEntryMode,
-      );
-      explorationHistory = [];
-      freeConversation = [];
-      explorationView = 0;
-      showInspirationDirections = false;
-      guidedSettling = false;
-      customStoryClues = [];
-      finalStoryProfile = null;
-      finalStoryProfileSignature = "";
-      finalStoryProfileRevision = 1;
-      pendingStoryProfile = false;
-      lastProfileChangedFields = [];
-      profileFeedbackStatus = "";
-      explorationMode = "profile";
-      confirmedStoryProfile = null;
-      stagePlanningHistory = [];
-      stagePlanningRound = 0;
-      stagePlanningDraft = {
-        goal: "",
-        opening: "",
-        conflict: "",
-        events: "",
-        chapters: "",
-      };
-      currentStagePlan = null;
-      chapterCreationState = "input";
-      chapterIdea = "";
-      chapterReaderPage = 0;
-      chapterRevision = 1;
-      chapterFeedback = "";
-      chapterAgentBusy = false;
-      chapterAgentResult = "";
-      chapterLastRevisionAction = "";
-      chapterAnnotations = [];
-      chapterAnnotationTarget = null;
-      chapterAnnotationDraft = "";
-      chapterAnnotationFocus = null;
-      chapterFinalized = false;
-      chapterCreationIndex = 0;
-      archiveDialogOpen = false;
-      archiveSelectedChapter = 0;
-      archiveSelectedStage = 0;
-      clearPendingStoryProfile();
-      window.sessionStorage.removeItem(explorationModeKey);
-      window.sessionStorage.removeItem(confirmedStoryProfileKey);
-      location.hash = "#/projects/demo/explore";
+      const titleInput =
+        document.querySelector(".naming-input")?.value.trim() || "";
+      const originalLabel = submit.textContent;
+      submit.disabled = true;
+      submit.textContent = "创建中…";
+      (async () => {
+        try {
+          // 真实创建（AC3）：title 留空传 undefined，后端回落「未命名小说」，前端勿强制非空。
+          const project = await projectApi.create({
+            mode,
+            title: titleInput || undefined,
+          });
+          // 保留原型「新建即进全新探索」语义：以真实 title 起头 + 重置探索/章节全局态，
+          // 再按真实作品 id 进探索页（替换固定 demo）。
+          explorationTitle = project.title || titleInput || "未命名小说";
+          createStep = "closed";
+          selectedMode = "";
+          resetExplorationStateForNewProject(mode);
+          location.hash = `#/projects/${project.id}/explore`;
+        } catch (err) {
+          // 失败恢复按钮 + 可读提示（不臆造后端未定义分支）。留在命名弹窗让用户重试。
+          submit.disabled = false;
+          submit.textContent = originalLabel;
+          const hint = document.querySelector("[data-create-error]");
+          const text = projectErrorText(err);
+          if (hint) hint.textContent = text;
+          else
+            document
+              .querySelector(".modal-actions")
+              ?.insertAdjacentHTML(
+                "beforebegin",
+                `<p class="create-error" data-create-error role="alert">${escapeHtml(text)}</p>`,
+              );
+        }
+      })();
     });
   document.querySelectorAll("[data-menu]").forEach((button) =>
     button.addEventListener("click", () => {
@@ -1913,7 +2035,8 @@ function bindProjectInteractions() {
     button.addEventListener("click", () => {
       const row = button.closest(".project-row");
       const title = row.querySelector("h2");
-      title.outerHTML = `<div class="rename-form"><input class="rename-input" value="${title.textContent}" aria-label="新的小说名称" /><button data-save-rename>保存</button><button data-cancel-rename>取消</button></div>`;
+      // title.textContent 是已解码文本，插回 attribute 前 escapeHtml 防引号/尖括号破坏结构。
+      title.outerHTML = `<div class="rename-form"><input class="rename-input" value="${escapeHtml(title.textContent)}" aria-label="新的小说名称" /><button data-save-rename>保存</button><button data-cancel-rename>取消</button></div>`;
       row.querySelector(".project-menu").hidden = true;
       row.querySelector(".rename-input").focus();
       bindInlineProjectActions(row);
@@ -1943,22 +2066,69 @@ function bindProjectInteractions() {
     }),
   );
   document.querySelector("[data-reload]")?.addEventListener("click", () => {
-    location.hash = "#/projects";
+    // 重新触发列表拉取（AC2），而非仅重置 hash。
+    projectsLoadState = "loading";
+    renderProjects();
   });
 }
 
 function bindInlineProjectActions(row) {
-  row.querySelector("[data-save-rename]")?.addEventListener("click", () => {
-    const value =
-      row.querySelector(".rename-input").value.trim() || "未命名小说";
-    row.querySelector(".rename-form").outerHTML = `<h2>${value}</h2>`;
+  const projectId = row.dataset.projectId;
+  row.querySelector("[data-save-rename]")?.addEventListener("click", (event) => {
+    const saveBtn = event.currentTarget;
+    if (saveBtn.disabled) return;
+    const input = row.querySelector(".rename-input");
+    const value = input.value.trim();
+    saveBtn.disabled = true;
+    saveBtn.textContent = "保存中…";
+    (async () => {
+      try {
+        // 真实改名（AC3）：title 留空传 undefined，后端回落「未命名小说」。成功后重拉列表反映
+        // 最新（含刷新 updatedAt + 重新按更新时间排序）。
+        await projectApi.rename(projectId, value || undefined);
+        projectsLoadState = "loading";
+        renderProjects();
+      } catch (err) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "保存";
+        // project_not_found（并发删除/越权）→ 刷新列表；其余给提示后重拉。
+        window.alert(projectErrorText(err));
+        projectsLoadState = "loading";
+        renderProjects();
+      }
+    })();
   });
   row
     .querySelector("[data-cancel-rename]")
     ?.addEventListener("click", () => renderProjects());
   row
     .querySelector("[data-confirm-delete]")
-    ?.addEventListener("click", () => row.remove());
+    ?.addEventListener("click", (event) => {
+      const confirmBtn = event.currentTarget;
+      if (confirmBtn.disabled) return;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "删除中…";
+      (async () => {
+        try {
+          await projectApi.remove(projectId);
+          // 真实删除成功（204）→ 从本地列表移除 + 重绘（空则自动转 empty 态）。
+          projects = projects.filter((item) => item.id !== projectId);
+          projectsLoadState = projects.length ? "ready" : "empty";
+          renderProjects();
+        } catch (err) {
+          // project_not_found 视为已删（幂等友好）：同样从列表移除刷新。
+          if (err && err.code === "project_not_found") {
+            projects = projects.filter((item) => item.id !== projectId);
+            projectsLoadState = projects.length ? "ready" : "empty";
+            renderProjects();
+            return;
+          }
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "确认删除";
+          window.alert(projectErrorText(err));
+        }
+      })();
+    });
   row
     .querySelector("[data-cancel-delete]")
     ?.addEventListener("click", () =>
@@ -2400,8 +2570,11 @@ function render() {
     /^#\/projects\/([^/]+)\/chapters\/(\d+)$/,
   );
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
-  if (hashPath() === "#/projects") renderProjects();
-  else if (hashPath() === "#/projects/demo/style-anchor") renderStyleAnchor();
+  if (hashPath() === "#/projects") {
+    // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
+    projectsLoadState = "loading";
+    renderProjects();
+  } else if (hashPath() === "#/projects/demo/style-anchor") renderStyleAnchor();
   else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
   else if (hashPath() === "#/settings/model-access") renderByok();
   else if (hashPath() === "#/projects/demo/stage-direction")

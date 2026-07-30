@@ -273,6 +273,46 @@ const authApi = {
       clearTokens();
     }
   },
+
+  // 当前登录用户（受保护，需 Bearer）：返回 {id, email}。供 7.3 作品库 header 展示真实邮箱，
+  // 替换原型硬编码 creator@example.com。经 apiFetch(auth=true) 自动注入 token + 401 兜底。
+  me() {
+    return apiFetch("/api/auth/me");
+  },
+};
+
+// ---------------------------------------------------------------------
+// 作品 API 薄封装（Story 7.3）：作品库列表/新建/重命名/删除。
+// 全部经 apiFetch（默认 auth=true）——自动注入 Bearer、401 刷新重放、error envelope
+// 解包、跳登录收敛均由地基处理，本封装只拼 path/method/body，不重复实现 token/401/error。
+// 后端契约（backend/src/muse/routers/projects.py，Epic 1 已 done）：
+//   GET    /api/projects            → 200 ProjectResponse[]（updated_at DESC，空返 []）
+//   POST   /api/projects            → 201 ProjectResponse（body {mode, title?}）
+//   PATCH  /api/projects/{id}       → 200 ProjectResponse（body {title?}，含刷新 updatedAt）
+//   DELETE /api/projects/{id}       → 204 无体
+// ProjectResponse 字段：{id, title, mode(guided/free), phase(explore/chapter/archive), updatedAt(ISO)}。
+const projectApi = {
+  list() {
+    return apiFetch("/api/projects");
+  },
+  // title 可空：后端 max_length=255、无 min_length，留空回落「未命名小说」。前端勿强制非空。
+  create({ mode, title }) {
+    return apiFetch("/api/projects", {
+      method: "POST",
+      body: { mode, title },
+    });
+  },
+  rename(projectId, title) {
+    return apiFetch(`/api/projects/${projectId}`, {
+      method: "PATCH",
+      body: { title },
+    });
+  },
+  remove(projectId) {
+    return apiFetch(`/api/projects/${projectId}`, {
+      method: "DELETE",
+    });
+  },
 };
 
 // ---------------------------------------------------------------------
@@ -282,6 +322,7 @@ if (typeof window !== "undefined") {
   window.apiFetch = apiFetch;
   window.ApiError = ApiError;
   window.authApi = authApi;
+  window.projectApi = projectApi;
   window.getAccessToken = getAccessToken;
   window.getRefreshToken = getRefreshToken;
   window.setTokens = setTokens;
