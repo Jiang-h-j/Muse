@@ -1,5 +1,12 @@
 # Deferred Work
 
+## Deferred from: code review of 7-5-引导探索接线 (2026-07-30)
+
+> 三层对抗审查（Blind/Edge/Auditor）。AC1-8 全 PASS、5 受控决策落地、无谎报、边界严守。1 decision-needed（模式错配，待定夺）+ 5 patch（在途异步清理/settle 死锁兜底，见 story Review Findings）+ 以下 2 条 defer。
+
+- **稀疏/越界 questionIndex 回填造成稀疏数组与错误进度** [prototype/app/app.js:628-634 loadGuidedExploration 回填] — 后端 `GuidedAnswerRequest.question_index` 仅约束 `ge=0, lt=2³¹`、**不校验题库上界 6**（后端注释：不镜像题库、脏 index 靠前端契约保证）。历史/异常数据若含越界 index（如 100）或不连续，`history[idx]=...` 造稀疏数组 → `explorationView=length` 越界 → `guidedComplete` 恒真 / 翻页访问 `undefined.answer`。引导为顺序作答、正常流程无缺口，触发需异常数据。**归数据生命周期治理批次**：连同后端是否加题库上界校验、前端回填 clamp/过滤越界 index 一并定夺。blind#5 + edge#F6 独立指出。
+- **apiStream 末帧不 flush decoder + interpret 无 done 事件时静默提交累积 delta** [prototype/app/api.js:90-110 读循环 / app.js:739-749 submitGuidedCustom] — ① `done` 时 `break` 未处理 buffer 残帧、未末次 `decoder.decode()` flush，末帧未以 `\n\n` 结尾或末尾多字节字符跨 read 块时可能丢字符/丢末事件；② interpret 流优雅关闭但只发 delta 未发 `done`（网络代理截断等非预期）时，累积的 delta 片段被当凝练答案静默 commit。**已核实**：SSE 规范要求事件以空行结尾、后端 sse-starlette 合规，delta 拼接≈完整答案内容多半无碍，属健壮性缺口非现实故障。**归 SSE 编排硬化批次**（与本文件 7.5 段已登记的「settle SSE 断线重连」「apiStream 无整体超时」同批）：末帧 flush + 无 done 兜底（视作未完成、提示重试而非静默落库）。blind#4 + edge#F7 独立指出。
+
 ## Resolved by: Story 7.5 引导探索接线 (2026-07-30)
 
 > 引导探索前端集成切片落地。**兑现并关闭**以下此前 defer 的「合并为同一前端集成切片」条目（引导侧）：
@@ -284,3 +291,10 @@
 - **archive/explore URL 直达时 `projects` 空 → 标题回退** [prototype/app/app.js:2584 render dispatcher archiveMatch 分支] — 本 story 把 mock 常量 `projects` 改为初始空数组（`let projects = []`），直接刷新/粘贴 `#/projects/{id}/archive`（或 explore）URL 时 `projects.find` 命中不到，`explorationTitle` 回退默认「未命名小说」（mock 时代常量在，能 find 到标题）。**是本改动引入的行为回退**。但 archive/explore/chapter 目标页本身归 7.5-7.7 接线（内部仍 mock + 锁死 `demo` id，承 1.6 deferred「explore/chapter 目标页未消费路由 id」），届时目标页消费路由 id 取真实作品即闭合此回退；孤立在本 story 修（dispatcher 缺数据时按 id 拉单作品）会与未定的目标页接线语义冲突、二次返工。**归 7.5/7.6/7.7**：探索/设定/归档接线时，目标 render 函数用路由 id 取真实作品标题。Blind + Edge Case Hunter 独立指出。
 - **`formatRelativeTime` 本地时区解析 + `dayDiff<=0` 一律「今天」+ ≥7 天无年份** [prototype/app/app.js:261-275] — `new Date(iso)` 把 UTC ISO 解析为本地时间、`startOfDay` 用本地年月日，跨时区午夜前后「今天/昨天」判断可能差一天；客户端时钟慢/后端时钟超前致 `then` 在未来时 `dayDiff<0` 仍显「今天」；`≥7 天`分支 `M 月 D 日`无年份，跨年同月日混淆（2023-07-30 与 2026-07-30 都显「7 月 30 日」）。均展示层小瑕疵、不影响功能。**归后续作品库 UX 精细化批次**（与 1.4 deferred「GET /api/projects 无分页」的前端配套同批）：相对时间加年份/未来时间兜底/时区口径统一。Blind + Edge Case Hunter 独立指出。
 - **标题输入框无 `maxlength`，超 255 字符靠后端 422 泛化提示** [prototype/app/app.js:436 `.naming-input` + :2039 `.rename-input`] — 新建/改名输入框无 `maxlength="255"` 属性，用户可粘贴超长标题，前端 trim 后直传后端，后端 `ProjectCreateRequest`/`ProjectRenameRequest` 的 `max_length=255` 返 422 `validation_error`，前端 `projectErrorText` 泛化为「输入有误，请检查后重试」——功能正确（后端拦住）但用户不知是标题太长、且浪费一次网络往返。**归后续 UX 加固批次**：输入框加 `maxlength="255"` 前端预拦，或 `projectErrorText` 对 validation_error 给更精确文案（需解析 detail 里的字段）。Edge Case Hunter 指出。
+
+## Deferred from: code review of 7-5-引导探索接线SSE问答-翻页持久化-整理中过渡-设定卡弹出 (2026-07-30, Round 2)
+
+> 第二轮三层对抗审查（Blind/Edge/Auditor，审查范围含上一轮 review 修复 + 工作区未提交改动）。上轮 P1/P4/P5 已正确修复；P2/P3 因 teardownGuidedInflight 死代码未落地（本轮转 patch 就地修）；D1 仍 decision-needed。以下 2 条 defer 延续上轮同类 defer 判定。
+
+- **apiStream 末帧不 flush + interpret 无 done 兜底把半截 delta 当答案** [prototype/app/api.js:442-465 读循环 done 时 break / prototype/app/app.js:380-434 submitGuidedCustom] — ① 读循环 `if(done)break` 后不处理 buffer 残帧、不做无参 `decoder.decode()` final flush，末帧无结尾 `\n\n` 或多字节跨块时可能丢；② interpret 流只见 delta、无 done/error 正常收尾（TCP FIN）时，累积半截 delta 非空 → 绕过空产兜底 → commit 半截答案落库（settle 有 gotTerminal 兜底、interpret 无对等判据）。**已核实**：SSE 规范要求事件空行结尾，后端 sse-starlette 合规、每帧带 `\n\n`，正常路径不触发；delta≈完整答案内容。**归 SSE 编排硬化批次**（与已登记的 SSE 断线重连/apiStream 整体超时同批）：done 后 flush 残帧 + interpret 加「必须见 done 才算成功」判据。Blind Hunter + Edge Case Hunter 独立指出。
+- **稀疏/越界 questionIndex 回填造成稀疏数组与错误进度** [prototype/app/app.js:653-657 loadGuidedExploration] — 后端 GuidedAnswerRequest.question_index 仅约束 ge=0/lt=2³¹、不校验题库上界 6（后端不镜像题库、脏 index 靠前端契约保证）。历史/异常数据越界（如 100）或不连续 index → `history[questionIndex]` 造稀疏数组 → `explorationView=history.length` 越界 → guidedComplete 恒真/翻页访问 undefined.answer。**引导为顺序作答、正常无缺口**，触发需异常数据。**归数据生命周期治理批次**（与后端题库上界校验一并定夺）：前端回填对 questionIndex 做题库上界过滤，或后端加上界校验。Blind Hunter + Edge Case Hunter 独立指出（延续上轮同项 defer）。

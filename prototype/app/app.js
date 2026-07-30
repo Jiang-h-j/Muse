@@ -124,6 +124,8 @@ let guidedLoadError = null;
 let guidedAnswerSaving = false;
 // settleAbortController：settle SSE 在途控制器，「回到探索」/切走时 abort。
 let settleAbortController = null;
+// interpretAbortController：自述作答 interpret SSE 在途控制器，切走/导航离开时 abort（review P1）。
+let interpretAbortController = null;
 // settleErrorText：settle SSE error 事件的可读提示（渲染在收尾态供重试）。
 let settleErrorText = "";
 let customStoryClues = [];
@@ -588,6 +590,9 @@ function explorationErrorText(err) {
       return "生成失败，请稍后重试。";
     case "settle_failed":
       return "整理故事设定时出错了，请重试。";
+    case "settle_empty":
+      // 后端空态短路（story_settle_agent settle_empty 400）：材料不足以凝练，引导补充而非误报网络。
+      return "聊到的内容还不够整理成设定，请回到上一题多补充一些再试。";
     case "already_settled":
       return "这部作品的设定已经确认，无法重新整理。";
     case "mode_mismatch":
@@ -608,12 +613,36 @@ function guidedAnswerFromBackend(row) {
   return { question: row.question, answer: row.answer };
 }
 
+// 统一清理引导页在途异步（review P2/P4）：abort 在途 interpret/settle 流、复位作答门禁、
+// 自增代次作废任何在途回调（loadGuidedExploration/submitGuidedCustom/startSettleFlow 的
+// seq 校验会据此丢弃过期回调，防砸页面/跨会话污染）。用于导航离开探索页与 logout。
+// 注意：只清「在途异步 + 门禁」，不动 pendingStoryProfile（那是待确认卡的持久展示态，
+// 导航离开时应保留以支持会话内恢复；logout 另行清 pending，见其调用点）。
+function teardownGuidedInflight() {
+  if (interpretAbortController) {
+    interpretAbortController.abort();
+    interpretAbortController = null;
+  }
+  if (settleAbortController) {
+    settleAbortController.abort();
+    settleAbortController = null;
+  }
+  guidedAnswerSaving = false;
+  guidedLoadSeq += 1;
+}
+
 // 进引导探索页：建/取会话（2.2）+ 回填全部已答（2.4）。仿 7.3 loadProjects 异步范式
 // （loading→ready/error + hash + 代次时序防护）。失败态非 401（401 由 apiFetch 兜底跳登录）。
 function loadGuidedExploration(projectId) {
+  // review R2 P2：进页先 abort 上一项目残留的在途 SSE（explore→explore 直接换项目时
+  // render 的 !exploreMatch teardown 不触发，须在此清理，防旧流连接悬挂）。
+  teardownGuidedInflight();
   explorationProjectId = projectId;
   guidedLoadState = "loading";
   guidedLoadError = null;
+  // review P4：进页复位作答门禁——防上一次 interpret 挂流/切走时 guidedAnswerSaving 停在
+  // true，重进项目后所有作答被入口 `if (...||guidedAnswerSaving) return` 静默拦截。
+  guidedAnswerSaving = false;
   const seq = ++guidedLoadSeq;
   const startedHash = location.hash;
   renderExploration();
@@ -688,7 +717,16 @@ async function submitGuidedCustom(freeText) {
   if (!text || guidedAnswerSaving) return;
   const questionIndex = explorationView;
   const question = currentExplorationQuestion().question;
+  // 锁定提交时的会话身份（review P1）：interpret 是真实 LLM、秒级在途，期间用户可能切走/
+  // 新建/登出致 explorationProjectId + guidedLoadSeq 变更。回调完成后须校验未变才 commit，
+  // 否则把旧作品答案写进新会话 + 砸当前页面（与 loadGuidedExploration 的 seq 校验同源）。
+  const seq = guidedLoadSeq;
+  const projectId = explorationProjectId;
   guidedAnswerSaving = true;
+  // 在途 interpret 流控制器：切走/导航离开时 abort（P1/P2 统一清理会用到）。
+  if (interpretAbortController) interpretAbortController.abort();
+  interpretAbortController = new AbortController();
+  const signal = interpretAbortController.signal;
   // 就地显「理解中」态：找当前自述表单的提交按钮，禁用 + 改文案（仿 7.3/7.4 按钮 loading）。
   const submitBtn = document.querySelector(
     "[data-guided-custom-form] button[type=submit]",
@@ -702,13 +740,13 @@ async function submitGuidedCustom(freeText) {
   let streamError = null;
   try {
     await explorationApi.interpretGuided(
-      explorationProjectId,
+      projectId,
       { question, freeText: text },
       {
+        signal,
         onEvent: (type, data) => {
           if (type === "delta" && data && data.text) {
             interpreted += data.text;
-            if (submitBtn) submitBtn.textContent = "理解中…";
           } else if (type === "done" && data && typeof data.text === "string") {
             interpreted = data.text;
           } else if (type === "error") {
@@ -724,8 +762,14 @@ async function submitGuidedCustom(freeText) {
       },
     );
   } catch (err) {
+    // 用户主动 abort（切走/导航）：静默退出，不提示、不 commit、不复位 saving（由清理路径统一处理）。
+    if (signal.aborted || (err && err.name === "AbortError")) return;
     // 建流前错误（预检 429/404/…）或网络中断：转可读提示。401 已由 apiStream 兜底跳登录。
     streamError = err;
+  }
+  // 会话已切换（切走/新建/登出）：丢弃本次结果，不写入已变更的会话态、不砸新页面（review P1）。
+  if (signal.aborted || seq !== guidedLoadSeq || projectId !== explorationProjectId) {
+    return;
   }
   guidedAnswerSaving = false;
   if (streamError) {
@@ -746,6 +790,7 @@ async function submitGuidedCustom(freeText) {
     showGuidedInlineError("没能理解这句话，请换个说法再试。");
     return;
   }
+  interpretAbortController = null;
   commitGuidedAnswer(answer, "custom", questionIndex);
 }
 
@@ -795,15 +840,16 @@ function commitGuidedAnswer(answer, answerType, questionIndexOverride) {
     ? explorationView + 1
     : explorationHistory.length;
   renderExploration();
-  // 异步落库（非阻塞 UI）：失败仅提示，保留前端答案（受控决策 3）。
-  guidedAnswerSaving = true;
-  persistGuidedAnswer({ questionIndex, question, answer, answerType })
-    .catch((err) => {
+  // 异步落库（fire-and-forget，非阻塞 UI）：失败仅提示，保留前端答案（受控决策 3）。
+  // review P4：非末题落库**不设 guidedAnswerSaving**——该标志仅用于「自述 interpret 在途」
+  // 与「末题 settle 落库在途」这两个真需互斥的场景；若非末题落库也占用它（一个 RTT），
+  // 会误伤用户对下一题的正常点击（renderExploration 已推进到下一题）。选项落库幂等 upsert
+  // （后端 (session_id, question_index) 复合唯一），连点/乱序各写各题位、无害。
+  persistGuidedAnswer({ questionIndex, question, answer, answerType }).catch(
+    (err) => {
       showGuidedInlineError(explorationErrorText(err));
-    })
-    .finally(() => {
-      guidedAnswerSaving = false;
-    });
+    },
+  );
 }
 
 // settle SSE 流：POST settle 拿 taskId → GET /tasks/{id}/events 消费 progress/result/error。
@@ -814,18 +860,27 @@ async function startSettleFlow() {
   if (settleAbortController) settleAbortController.abort();
   settleAbortController = new AbortController();
   const signal = settleAbortController.signal;
+  // 锁定会话身份（review P2）：settle 期间用户切走/进别的项目时，result/error 不该
+  // 弹卡或砸到新页面（跨项目污染）。回调与收尾都校验 seq/projectId 未变。
+  const seq = guidedLoadSeq;
+  const projectId = explorationProjectId;
+  const stale = () =>
+    signal.aborted || seq !== guidedLoadSeq || projectId !== explorationProjectId;
+  let gotTerminal = false; // 是否收到 result/error 终态（review P5：无终态兜底判据）
   try {
-    const { taskId } = await explorationApi.settleGuided(explorationProjectId);
-    if (signal.aborted) return;
+    const { taskId } = await explorationApi.settleGuided(projectId);
+    if (stale()) return;
     await explorationApi.taskEvents(taskId, {
       signal,
       onEvent: (type, data) => {
-        if (signal.aborted) return;
+        if (stale()) return;
         if (type === "result" && data && data.profile) {
+          gotTerminal = true;
           guidedSettling = false;
           settleAbortController = null;
           openStoryProfileFromBackend(data.profile);
         } else if (type === "error") {
+          gotTerminal = true;
           guidedSettling = false;
           settleAbortController = null;
           settleErrorText = explorationErrorText({
@@ -836,8 +891,17 @@ async function startSettleFlow() {
         // progress：整理中过渡已在显示，V1 不额外更新（保持文案态）。
       },
     });
+    // review P5：SSE 流正常结束（await 返回）却没收到 result/error 终态——后端漏发终态 /
+    // result 里 profile 缺失（if 判据不满足未置 gotTerminal）/ 只发 progress 就断。此时若不
+    // 兜底，guidedSettling 永远为 true、UI 永久卡「整理中」spinner。视作失败退回收尾态可重试。
+    if (!stale() && !gotTerminal && guidedSettling) {
+      guidedSettling = false;
+      settleAbortController = null;
+      settleErrorText = explorationErrorText({ code: "settle_failed" });
+      renderExploration();
+    }
   } catch (err) {
-    if (signal.aborted) return; // 用户主动 abort，不报错
+    if (stale()) return; // 用户主动 abort / 已切走，不报错、不砸新页面
     guidedSettling = false;
     settleAbortController = null;
     settleErrorText = explorationErrorText(err);
@@ -2303,6 +2367,12 @@ function resetExplorationStateForNewProject(mode) {
   guidedLoadSeq += 1; // 作废任何在途加载回调
   guidedAnswerSaving = false;
   settleErrorText = "";
+  // 与 settle 对称 abort 在途 interpret 流（review R2）：自述作答 interpret 在途时点新建，
+  // guidedLoadSeq++ 已作废回调不污染新会话，但流本身须取消，否则跑完整轮真实 LLM + 连接挂着。
+  if (interpretAbortController) {
+    interpretAbortController.abort();
+    interpretAbortController = null;
+  }
   if (settleAbortController) {
     settleAbortController.abort();
     settleAbortController = null;
@@ -2372,6 +2442,18 @@ function bindProjectInteractions() {
       byokSaving = false;
       byokLoadState = "loading";
       byokLoadSeq++;
+      // review R2 P3：清引导探索态防跨用户残留（违反 7.4 review P3 先例 + 触碰 AC8 多租户）。
+      // A 设定卡 pending 时 logout → B 同标签页登录进引导项目 → render 先判 pending 为真直接
+      // 给 B 弹 A 的卡。须 abort 在途 SSE（teardown）+ 清 pending 内存态与 sessionStorage。
+      teardownGuidedInflight();
+      clearPendingStoryProfile();
+      finalStoryProfile = null;
+      finalStoryProfileSignature = "";
+      pendingStoryProfile = false;
+      guidedLoadState = "loading";
+      guidedLoadError = null;
+      settleErrorText = "";
+      explorationProjectId = "";
       location.hash = "#/login";
     })();
   });
@@ -2493,7 +2575,16 @@ function bindProjectInteractions() {
         (item) => item.id === button.dataset.continue,
       );
       const meta = project && PHASE_META[project.phase];
-      if (meta) location.hash = meta.route(project.id);
+      if (meta) {
+        // review R2 D1：按打开作品的真实 mode 设 entryMode，防残留 sessionStorage 值致模式错配
+        // （上次进过 free 项目残留 "free" → 继续创作打开 guided 项目被当自由、不加载引导会话）。
+        explorationEntryMode = project.mode === "free" ? "free" : "guided";
+        window.sessionStorage.setItem(
+          explorationEntryModeKey,
+          explorationEntryMode,
+        );
+        location.hash = meta.route(project.id);
+      }
     }),
   );
   document.querySelector("[data-reload]")?.addEventListener("click", () => {
@@ -3262,6 +3353,10 @@ function render() {
     /^#\/projects\/([^/]+)\/chapters\/(\d+)$/,
   );
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
+  // review R2 P2：离开探索页时清理在途 SSE + 门禁（teardownGuidedInflight 原为死代码，此处挂载）。
+  // 防 settle/interpret 在途时切走 → 流不 abort 连接悬挂 + 陈旧回调污染。teardown 不动 pending
+  // 设定卡（会话内恢复态，导航离开应保留）。进 explore 分支由 loadGuidedExploration 自管清理。
+  if (!exploreMatch) teardownGuidedInflight();
   if (hashPath() === "#/projects") {
     // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
     projectsLoadState = "loading";
@@ -3280,6 +3375,22 @@ function render() {
     // 落库/settle 复用（替换 deferred-work.md:42「explore 目标页未消费路由 id」）。
     // 自由模式（7.6 未接）仍走 mock，不触发引导后端加载。
     const routeProjectId = exploreMatch[1];
+    // review R2 P2/F7：进 explore 页先统一清理上一项目残留在途流 + 复位作答门禁（saving）。
+    // 覆盖三条子分支（pending 恢复 / 引导加载 / 自由）——尤其 pending 恢复分支不走
+    // loadGuidedExploration，若无此清理，A interpret 在途时导航到有 pending 卡的 B → saving
+    // 卡死 + 旧流不 abort。teardown 幂等且不动 pending 卡（会话内恢复态保留）。
+    teardownGuidedInflight();
+    // review R2 D1：从路由项目派生 entryMode，不信残留 sessionStorage 值（防模式错配）。
+    // projects 已加载且命中该项目时以其真实 mode 为准；找不到（直接 URL 访问 / 列表未加载）
+    // 才回退残留值（继续创作路径已在 data-continue 按 project.mode 校准，此处双保险）。
+    const routeProject = projects.find((p) => p.id === routeProjectId);
+    if (routeProject) {
+      explorationEntryMode = routeProject.mode === "free" ? "free" : "guided";
+      window.sessionStorage.setItem(
+        explorationEntryModeKey,
+        explorationEntryMode,
+      );
+    }
     if (explorationEntryMode !== "free") {
       // 待确认设定卡刷新恢复优先（AC7）：pending 态直接渲染（renderExploration 末尾重挂弹窗），
       // 无需重拉后端（settle 结果已在 sessionStorage）。仅非 pending 时才建会话 + 回填。

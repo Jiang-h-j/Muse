@@ -3,7 +3,7 @@ baseline_commit: ba07001
 ---
 # Story 7.5: 引导探索接线（SSE 流式问答 / 翻页持久化 / 整理中过渡 / 设定卡弹出）
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -279,6 +279,48 @@ Claude Opus 4.8 (claude-opus-4-8)
 - `prototype/app/styles.css`（修改）— 新增 `.guided-error` 内联错误条样式（引导接线失败提示）
 - `_bmad-output/implementation-artifacts/deferred-work.md`（修改）— 标注 2.3/2.4/2.5 引导前端接线合并切片已由 7.5 兑现（引导侧）；新增 7.5 段登记 3 条 defer（SSE 重连、apiStream 超时、末题三步非原子）
 - `_bmad-output/implementation-artifacts/sprint-status.yaml`（修改）— 7-5 状态 ready-for-dev → in-progress → review
+
+## Review Findings (2026-07-30，三层对抗审查，Blind Hunter + Edge Case Hunter + Acceptance Auditor 独立于实现)
+
+> Blind Hunter（仅 diff，8 条）+ Edge Case Hunter（diff + 项目只读 + 前后端契约核实，7 条 F1-F7）+ Acceptance Auditor（diff + spec，**AC1-8 全 PASS、5 受控决策落地、无谎报、边界严守**，2 条偏离）。三层完整无 failed_layer。去重合并后：1 decision-needed + 5 patch + 2 defer + 4 dismiss。**根因归纳**：引导接线新增的在途异步（interpret 流、settle SSE、pending 设定卡）+ 模块级状态，只在「回到探索」「新建」两条路径清理，**普通 hashchange 导航与 logout 未纳入清理**（F1/F2/F4 同源）；F3 是 explorationEntryMode 未从被打开项目派生（既有缺陷被接线放大）。
+
+- [ ] [Review][Decision] explorationEntryMode 不随「打开的项目」同步 → 模式错配 [prototype/app/app.js:2489-2497 继续创作 / :3283 判定] — edge#F3。「继续创作」（data-continue）只按 phase 改 hash、不设 entryMode；render() exploreMatch 用 `explorationEntryMode !== "free"`（残留 sessionStorage 值）判引导/自由。**既有缺陷**（原型 continue 从来不设 entryMode），但本 story 接线放大后果：上次进过 free 项目 → 残留 "free" → 继续创作打开 guided 项目 → 被当自由模式、**根本不调 loadGuidedExploration**（引导项目后端会话/答案永不加载、作答不落库）；反向（entryMode=guided 打开 free 项目）→ 引导端点撞后端 409 mode_mismatch → 卡 error 页。修法多选（继续创作时按 project.mode 设 entryMode / render 里从路由项目派生 / 二者结合），**需定夺是否在本 story 修此既有缺陷及范围**。（Blind#6「pending 恢复分支不回填历史」并入此项一并考量。）
+
+- [ ] [Review][Patch] 自述 interpret 流不可中断 + commit 无代次校验 → 跨会话/跨作品污染 [prototype/app/app.js:704 interpretGuided 未传 signal / :749 commitGuidedAnswer] — blind#1 + edge#F1 + auditor发现1 三层收敛。`submitGuidedCustom` 调 interpretGuided 只传 onEvent、无 AbortController、无 guidedLoadSeq/hash 校验。interpret（真实 LLM 秒级）在途时用户切走/新建（resetExplorationStateForNewProject 只 abort settle），done 回调仍执行 commitGuidedAnswer 写模块级 explorationHistory（已属新作品）+ renderExploration 砸掉当前页面 + persistGuidedAnswer 落到新作品。**违反受控决策 4「异步 render 时序防护」**（loadGuidedExploration 有 seq 双校验，自述路径缺失）。修：传 signal + commit 前校验 seq/projectId 未变。
+
+- [ ] [Review][Patch] 普通导航离开不 abort settle SSE → 跨项目弹错设定卡 + persist 污染 [prototype/app/app.js:812-846 startSettleFlow / :3340 hashchange 不 abort] — edge#F2 + blind#7。abort 只在「回到探索」/新建发生，hashchange→render 不 abort。项目 A settle 在途 → 回作品库 → 进项目 B（explorationProjectId 变 B）→ A 的 result 到达 → 在 B 页面弹 A 的设定卡 + persistPendingStoryProfile 落 sessionStorage，用户对 A 卡确认时 projectId 已是 B，张冠李戴；error 分支直接 renderExploration 砸 B 页。修：render() 离开探索页时 abort 在途 settle（+interpret）。
+
+- [ ] [Review][Patch] logout 不清引导态 + pending sessionStorage → 跨用户残留（弹 A 的卡给 B） [prototype/app/app.js:2354-2377 logout / :3286 pending 优先判定] — edge#F4。logout 重置了 projects/byok 态，未碰 pendingStoryProfile/finalStoryProfile/settleAbortController/guidedAnswerSaving/guidedLoadState、未清 sessionStorage `muse-pending-story-profile`。A 设定卡 pending 时 logout，B 同标签页登录进引导项目 → render exploreMatch 先判 `pendingStoryProfile && finalStoryProfile` 为真 → **直接给 B 弹 A 的设定卡**、不重拉后端。**违反 7.4 review P3 已立先例**（logout 须重置模块态防跨账号残留）。修：logout 追加引导态全量重置 + clearPendingStoryProfile + abort settle + guidedLoadSeq++。
+
+- [ ] [Review][Patch] guidedAnswerSaving 导航/挂流后不复位 → 卡死后续作答；非末题落库在途误伤下一题点击 [prototype/app/app.js:691/771 置 true / :611-645 loadGuidedExploration 不复位] — blind#3 + edge#F5。① interpret 挂流或切走时 guidedAnswerSaving 停在 true，重进项目 loadGuidedExploration 只重置 load 态、不复位它 → submitGuidedOption/Custom 入口 `if (...||guidedAnswerSaving) return` 静默拦截所有作答，页面看似正常但点选项无反应；② 非末题落库在途（一个 RTT）guidedAnswerSaving 仍 true，renderExploration 已推进下一题，用户对下一题的点击被静默吞掉。修：loadGuidedExploration 复位 guidedAnswerSaving；非末题落库改乐观（不用 saving 门禁挡下一题，或落库不阻塞作答）。
+
+- [ ] [Review][Patch] settle 流正常结束但无 result/error → 永久卡「整理中」无兜底 [prototype/app/app.js:812-846 startSettleFlow] — blind#2。只在 result(带 profile)/error 复位 guidedSettling。后端 SSE 正常关闭却漏发终态（只发 progress 就断、result 里 profile 空/字段不符）时，taskEvents await 正常 resolve 不进 catch，guidedSettling 永远 true，UI 卡整理中 spinner、无超时兜底无重试出口。修：流结束（await 返回）后若仍 settling 且未拿到 result → 视为失败退回收尾态提示重试。
+
+- [x] [Review][Defer] 稀疏/越界 questionIndex 回填造成稀疏数组与错误进度 [prototype/app/app.js:628-634] — blind#5 + edge#F6，deferred。后端 GuidedAnswerRequest.question_index 仅约束 ge=0/lt=2³¹、**不校验题库上界 6**（后端注释：不镜像题库、脏 index 靠前端契约保证）。若历史/异常数据存在越界（如 100）或不连续 index，history 造稀疏数组 → explorationView 越界 → guidedComplete 恒真/翻页访问 undefined.answer。**引导为顺序作答、正常无缺口**，触发需异常数据。归数据生命周期治理批次（与后端题库上界校验一并定夺）。
+
+- [x] [Review][Defer] apiStream 末帧不 flush decoder + 无 done 静默提交累积 delta [prototype/app/api.js:90-110 读循环 / prototype/app/app.js:739-749] — blind#4 + edge#F7，deferred。① done 时 break 未处理 buffer 残帧、未 `decoder.decode()` flush，末帧未以 `\n\n` 结尾或末尾多字节跨块时可能丢；② interpret 优雅关闭但无 done 事件时，累积的 delta 片段被当凝练答案静默 commit。**已核实**：SSE 规范要求事件空行结尾，后端 sse-starlette 合规、delta≈完整答案内容无碍。归 SSE 编排硬化批次（与 deferred-work.md 已登记的 SSE 重连/超时同批）。
+
+**Dismissed（噪声/假阳性/正确边界，4 条）**：① blind#8 自述表单按钮选择器依赖 type=submit（**假阳性**：核实 app.js:1357/1365 两个按钮均显式 `type="submit"`，选择器命中）；② auditor发现2 delta 增量未实时呈现（显示了静态「理解中…」擦边达标 AC4「引号里就是理解中」，打字机体感属产品增强非缺陷，delta 累积在无 done 兜底时仍用到）；③ auditor发现3 openStoryProfileDialog/buildFinalStoryProfile 保留（**正确边界**：自由探索 7.6 未接仍需 mock，引导已改走 openStoryProfileFromBackend，属新增替代非删除，无越界）；④ blind#6 pending 恢复分支不回填历史（并入 decision-needed D1 一并考量，非独立缺陷）。
+
+## Review Findings (Round 2 · 2026-07-30，含上一轮修复 + 工作区未提交改动的合并审查)
+
+> 三层对抗审查（Blind Hunter 仅 diff 7 条 + Edge Case Hunter diff+项目只读+前后端契约核实 9 条 + Acceptance Auditor diff+spec AC 逐条核对）。审查范围 = 提交 83c137b（7.5 主体）+ 工作区未提交改动（上一轮 review 的修复）。**上一轮 5 patch 中 P1/P4/P5 已正确修复并核实**（interpretAbortController + submitGuidedCustom 的 seq/projectId 校验 = P1；loadGuidedExploration 复位 guidedAnswerSaving + 非末题不设门禁 = P4；startSettleFlow 的 gotTerminal 无终态兜底 = P5）。**但 P2/P3 的修复未落地**——统一清理函数 `teardownGuidedInflight` 写好了却零调用（死代码，grep 确认仅 app.js:618 定义），导致普通导航离开与 logout 两条路径的清理缺口依然存在。三层去重合并后：1 decision-needed（沿用上轮 D1）+ 4 patch + 2 defer + 2 dismiss。**根因**：清理逻辑集中进 teardownGuidedInflight 但漏了挂载调用点；F5 是新发现的 error code 契约缺口。
+
+- [x] [Review][Decision→Patch·已修复] explorationEntryMode 不随「打开的项目」同步 → 模式错配（D1，定夺=方案1 本 story 内修） [prototype/app/app.js data-continue + render exploreMatch] — auditor 核实上轮 D1 仍标 [ ] 未修。「继续创作」只按 phase 改 hash、不设 entryMode；render() exploreMatch 用残留 sessionStorage 的 `explorationEntryMode !== "free"` 判引导/自由。上次进过 free 项目 → 残留 "free" → 继续创作打开 guided 项目 → 被当自由、根本不调 loadGuidedExploration；反向 → 引导端点撞 409 mode_mismatch 卡 error 页。**修复**：① data-continue 跳转前按 `project.mode` 设 explorationEntryMode + 落 sessionStorage；② render exploreMatch 从路由项目 `projects.find` 派生 entryMode（命中以真实 mode 为准，找不到回退残留值双保险）。
+
+- [x] [Review][Patch·已修复] teardownGuidedInflight 是死代码 → 普通导航离开探索页从不 abort 在途 SSE/复位门禁 [prototype/app/app.js:621 定义] — blind#5 + edge#1 + auditor P2 三层收敛。原全文件该函数仅一处定义、零调用点。**修复**：① render() 开头 `if (!exploreMatch) teardownGuidedInflight()` 挂载离开 explore 清理；② exploreMatch 块顶统一 teardown 覆盖三条子分支（pending 恢复 / 引导加载 / 自由）——尤其 pending 恢复分支不走 loadGuidedExploration，此前无清理会致 F7 saving 卡死；③ loadGuidedExploration 开头补 teardown 覆盖 explore→explore 换项目。teardown 幂等、不动 pending 卡。
+
+- [x] [Review][Patch·已修复] logout 不清引导态 + pending sessionStorage → 跨用户残留（给 B 弹 A 的设定卡） [prototype/app/app.js logout 处理器] — edge#2 + auditor P3。原 logout 只重置 projects/byok 态。A 设定卡 pending 时 logout → B 同标签页登录进引导项目 → render 先判 `pendingStoryProfile && finalStoryProfile` 为真 → 直接给 B 弹 A 的卡。**违反 7.4 review P3 先例 + 触碰 AC8 多租户**。**修复**：logout 追加 teardownGuidedInflight（abort SSE + seq++）+ clearPendingStoryProfile（清 sessionStorage）+ 清 finalStoryProfile/pendingStoryProfile 内存态 + guidedLoadState/settleErrorText/explorationProjectId 重置。
+
+- [x] [Review][Patch·已修复] 新建作品不 abort 在途 interpret 流（只 abort 了 settle）→ 浪费一次计费 LLM 调用 [prototype/app/app.js resetExplorationStateForNewProject] — edge#3 + auditor 补充观察。原 reset 追加了 settleAbortController.abort() 却遗漏 interpretAbortController。在途 interpret SSE 未取消、跑完整轮真实 LLM + 连接挂着，白费一次 quota 计费。**修复**：与 settle 对称补 abort interpretAbortController + 置 null。
+
+- [x] [Review][Patch·已修复] settle_empty error code 未映射 → 文案错配（已核实后端契约） [prototype/app/app.js explorationErrorText] — edge#4，新发现。已核实：后端 story_settle_agent.py:89/386 空态短路抛 400 `settle_empty`，worker.py:165-171 经 ErrorEnvelope 透传 SSE error `data.code`。前端 switch 无该 case → 落 default「请检查网络」。**修复**：switch 补 `settle_empty` case → 「聊到的内容还不够整理成设定，请回到上一题多补充一些再试。」（对齐后端空态语义，非误报网络）。
+
+- [x] [Review][Defer] apiStream 末帧不 flush + interpret 无 done 兜底把半截 delta 当答案 [prototype/app/api.js:442-465 读循环 done 时 break / prototype/app/app.js:380-434 submitGuidedCustom] — blind#1 + edge#5+7，deferred（延续上轮同类 defer）。① 读循环 `if(done)break` 后不处理 buffer 残帧、不做 `decoder.decode()`（无参 final flush），末帧无结尾 `\n\n` 或多字节跨块时可能丢；② interpret 流只见 delta、无 done/error 正常收尾（TCP FIN）时，累积的半截 delta 非空 → 绕过空产兜底 → commit 半截答案落库（对比 settle 有 gotTerminal 兜底，interpret 无）。**已核实**：SSE 规范要求事件空行结尾，后端 sse-starlette 合规、每帧带 `\n\n`，正常路径不触发；delta≈完整答案内容。归 SSE 编排硬化批次（与已登记的 SSE 重连/超时同批）。
+
+- [x] [Review][Defer] 稀疏/越界 questionIndex 回填造成稀疏数组与错误进度 [prototype/app/app.js:653-657 loadGuidedExploration] — blind#6 + edge#8，deferred（延续上轮同项 defer）。后端 GuidedAnswerRequest.question_index 仅 ge=0/lt=2³¹、不校验题库上界 6（后端不镜像题库、脏 index 靠前端契约保证）。历史/异常数据越界（如 100）或不连续 index → history 稀疏数组 → explorationView 越界 → guidedComplete 恒真/翻页访问 undefined.answer。引导顺序作答正常无缺口，触发需异常数据。归数据生命周期治理批次（与后端题库上界校验一并定夺）。
+
+**Dismissed（噪声/假阳性/正确边界，2 条）**：① blind#7 整理按钮不检查 guidedAnswerSaving（末题落库**成功后**才 startSettleFlow，收尾态与整理中态不同屏不可同时点；即便触发 settle 也 abort 旧的重起、且末题落库幂等 upsert，窄窗无害）；② edge#9 settle 重复 result 二次弹卡（已核实后端 core/sse.py 保证终态不重复——快照分支 return 去重，防御性缺口非真实触发路径）。
 
 ## Change Log
 
