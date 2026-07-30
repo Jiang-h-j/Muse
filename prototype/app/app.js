@@ -281,8 +281,27 @@ function stateMessage(state, mode) {
         : "邀请码无效、已使用或已过期。",
     ],
     locked: ["error", "登录尝试次数过多，请稍后再试。"],
+    // 未知/网络/校验类错误的中性兜底（Story 7.2 AC6）：不臆造 expired/invalid，只提示重试。
+    failed: ["error", "操作未能完成，请检查网络后稍后重试。"],
   };
   return messages[state] || null;
+}
+
+// error envelope code → 登录/注册状态位（Story 7.2 AC6，严格对应后端 code，不臆造）。
+// 入参为 7.1 apiFetch 抛出的 ApiError（含 code/detail/status）。映射见 story error code 表：
+//   invalid_credentials / invalid_invite → invalid；too_many_attempts → locked；
+//   token_invalid(expired) → expired（通常 7.1 已跳转，登录页少见）；其余 → failed 中性兜底。
+function authStateFromError(err) {
+  const code = err && err.code;
+  const detail = (err && err.detail) || {};
+  if (code === "invalid_credentials" || code === "invalid_invite") return "invalid";
+  if (code === "too_many_attempts") return "locked";
+  if (code === "token_invalid" || code === "token_expired") return "expired";
+  // 优先按 code 判定；code 不可识别时退到 detail 布尔位（后端已透传）。
+  if (detail.invalid) return "invalid";
+  if (detail.locked) return "locked";
+  if (detail.expired) return "expired";
+  return "failed";
 }
 
 function renderAuth() {
@@ -402,7 +421,7 @@ function renderProjects() {
       <header class="library-header">
         <a class="wordmark" href="#/projects"><span class="wordmark-mark">M</span><span>Muse</span></a>
         <nav class="library-nav" aria-label="主导航"><a aria-current="page" href="#/projects">作品</a></nav>
-        <div class="account"><span>creator@example.com</span><a href="#/login">退出</a></div>
+        <div class="account"><span>creator@example.com</span><a href="#/login" data-logout>退出</a></div>
       </header>
       <main class="library-main">
         <div class="library-heading">
@@ -1710,13 +1729,49 @@ function bindAuthInteractions() {
   document.querySelector("#auth-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     if (!event.currentTarget.reportValidity()) return;
-    const submit = event.currentTarget.querySelector(".submit");
+    const form = event.currentTarget;
+    const mode = currentMode();
+    const submit = form.querySelector(".submit");
+    const submitLabel = submit.querySelector("span");
+    const originalLabel = submitLabel.textContent;
     submit.disabled = true;
-    submit.querySelector("span").textContent =
-      currentMode() === "register" ? "正在创建账号…" : "正在登录…";
-    window.setTimeout(() => {
-      location.hash = "#/projects";
-    }, 650);
+    submitLabel.textContent = mode === "register" ? "正在创建账号…" : "正在登录…";
+
+    // 失败复位：跳带 ?state= 的 hash 通常触发 render 重绘表单天然复位；但目标 hash 与当前
+    // 完全一致时（连续同类错误）hashchange 不触发，须手动复位按钮（受控决策 2）。
+    const restoreSubmit = () => {
+      submit.disabled = false;
+      submitLabel.textContent = originalLabel;
+    };
+    const showError = (err) => {
+      // 严格按后端 code 映射状态位（AC6），不臆造分支；未知错误落 failed 中性兜底。
+      const state = authStateFromError(err);
+      restoreSubmit();
+      const base = mode === "register" ? "#/register" : "#/login";
+      const target = `${base}?state=${state}`;
+      // 同 hash 不会触发 render，此时按钮已手动复位、错误文案已在页面呈现，无需额外处理。
+      location.hash = target;
+    };
+
+    const email = form.querySelector("#email").value;
+    const password = form.querySelector("#password").value;
+
+    (async () => {
+      try {
+        if (mode === "register") {
+          const inviteCode = form.querySelector("#invite").value;
+          // 注册不签发 token（受控决策 1）：register 成功后串接一次 login 拿会话 token。
+          await authApi.register({ inviteCode, email, password });
+          await authApi.login({ email, password });
+        } else {
+          // login 内部已 setTokens 落 localStorage（api.js），此处勿重复存 token。
+          await authApi.login({ email, password });
+        }
+        location.hash = "#/projects";
+      } catch (err) {
+        showError(err);
+      }
+    })();
   });
   document.querySelectorAll("[data-auth-state]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1734,6 +1789,15 @@ function openCreate(step = "mode") {
 }
 
 function bindProjectInteractions() {
+  // 退出（Story 7.2 AC5）：拦截默认跳转，先调 authApi.logout 作废后端 refresh + 清本地 token
+  // （logout 已保证 finally 清本地态、失败静默，api.js），再回登录态。避免纯 <a href> 绕过登出。
+  document.querySelector("[data-logout]")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    (async () => {
+      await authApi.logout();
+      location.hash = "#/login";
+    })();
+  });
   document
     .querySelectorAll("[data-new-project]")
     .forEach((button) => button.addEventListener("click", () => openCreate()));

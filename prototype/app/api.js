@@ -289,34 +289,3 @@ if (typeof window !== "undefined") {
   window.redirectToLogin = redirectToLogin;
 }
 
-// ---------------------------------------------------------------------
-// 冒烟验证临时入口（Story 7.1 Task 6）：证明地基对接真实后端可用。
-// **不接任何 UI**（不进 bindAuthInteractions/render），7.2 接登录/注册 UI 后可整段移除
-// （deferred-work 已登记）。devtools console 手动调 `await __museApiSmoke('测试邮箱','密码')`。
-// ---------------------------------------------------------------------
-if (typeof window !== "undefined") {
-  window.__museApiSmoke = async (email, password) => {
-    const log = (...a) => console.log("[muse-smoke]", ...a);
-    // 1) 登录往返：拿 camelCase 双 token，setTokens 落 localStorage（AC1）
-    const bundle = await authApi.login({ email, password });
-    log("① 登录往返：", { accessToken: !!bundle.accessToken, expiresIn: bundle.expiresIn });
-    log("   localStorage access =", !!getAccessToken(), "refresh =", !!getRefreshToken());
-    // 2) 带 token 请求：/me 200 返 {id,email}（AC1）
-    const me = await apiFetch("/api/auth/me");
-    log("② 带 token 请求 /me：", me);
-    // 3) error 解包：故意错密码 → invalid_credentials + detail.invalid（AC2）
-    try {
-      await authApi.login({ email, password: password + "_wrong" });
-      log("③ error 解包：⚠️ 预期抛错但未抛");
-    } catch (e) {
-      log("③ error 解包：", { name: e.name, code: e.code, detail: e.detail, status: e.status });
-    }
-    // 4) 401 刷新重放：手动改坏 access → /me 401 → 自动 refresh 换新 → 重放成功（AC3）
-    setTokens({ accessToken: "broken-access-token" });
-    const meAfterRefresh = await apiFetch("/api/auth/me");
-    log("④ 401 刷新重放：改坏 access 后 /me 仍成功 →", meAfterRefresh);
-    log("   刷新后新 access 已落库 =", getAccessToken() !== "broken-access-token");
-    log("✅ 冒烟完成。再手动 setTokens({refreshToken:'x'}) 改坏 refresh 后调 apiFetch 可验跳登录。");
-    return meAfterRefresh;
-  };
-}
