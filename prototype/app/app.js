@@ -134,21 +134,33 @@ let freeLoadSeq = 0;
 let freeLoadError = null;
 let freeMessageSending = false;
 let freeMessageAbortController = null;
+// freeMessageQueue：Agent 处理在途时用户继续发送的排队消息（通常 0-1 条）。输入框/发送
+// 按钮不再因 freeMessageSending 锁死——点发送即视觉发出、清空输入框；若上一轮还没跑完
+// 全部收尾步骤（消息同步/线索刷新/导航刷新），本条文本先入队，待收尾后自动继续发送。
+let freeMessageQueue = [];
+// freeMessageBusyLabel：非空时在对话区下方展示进度提示（如“Agent 正在思考…”），不阻塞输入。
+let freeMessageBusyLabel = "";
 let freeSettlePending = false;
 let freeSettleErrorText = "";
 let freeClueEditingIds = new Map();
 let freeClueFocusedIds = new Set();
 let deferredFreeClues = null;
-// Story 2.8 消费（Correct Course 替换旧版「给方向」+「≥1条消息」门禁）：自由探索导航状态，
-// 完成度/当前问题/就绪位恒以后端 GuidanceStateResponse 为准，前端不本地推断。
+// Story 2.8 消费（Correct Course 替换旧版「给方向」+「≥1条消息」门禁，2026-08-03 合并重构后
+// 再次调整）：自由探索导航状态，完成度/当前追问字段/候选回复/就绪位恒以后端
+// GuidanceStateResponse 为准，前端不本地推断。**不再有 currentQuestion**——聊天记录本身
+// 就是唯一的问题事实源，候选回复（currentSuggestions）贴在最新一条 Agent 消息下方展示。
 let guidanceFields = {};
 let guidanceCurrentField = null;
-let guidanceCurrentQuestion = null;
+// guidanceSuggestions：随每轮对话/开场/跳过一起从后端拿到，不再需要单独请求生成。
+let guidanceSuggestions = [];
+// guidanceSuggestionsExpanded：纯前端 UI 态，控制候选回复默认收起/点击展开，不发请求。
+let guidanceSuggestionsExpanded = false;
 let guidanceReadyToSettle = false;
-// guidanceSuggestions：null=未请求过；[]=已请求但空（异常兜底）；非空=可点击选项列表。
-let guidanceSuggestions = null;
-let guidanceSuggestionsLoading = false;
 let guidanceSkipping = false;
+// guidanceSkipSeq：跳过操作的序号，每次 skipFreeGuidanceQuestion 递增。收尾里的
+// refreshGuidance 若发现序号已变（期间发生过跳过），放弃 apply——避免跳过刚写入的新 state
+// 被收尾里挂起的旧 GET guidance 结果覆盖回跳过前的状态。
+let guidanceSkipSeq = 0;
 // guidanceStartingEntry：零对话四入口点击后在途的 entry key，用于禁用四个入口按钮防重复点击。
 let guidanceStartingEntry = null;
 let customStoryClues = [];
@@ -659,12 +671,13 @@ function teardownExplorationInflight() {
   }
   guidedAnswerSaving = false;
   freeMessageSending = false;
+  freeMessageQueue = [];
+  freeMessageBusyLabel = "";
   freeSettlePending = false;
   // Story 2.8 导航状态的提交门禁（无 AbortController，均是常规 apiFetch）：teardown 后
   // isCurrentFreeExploration 会因代次不匹配丢弃在途回调的状态写入，但 finally 里的门禁
   // 复位同样会被挡住——须在此显式复位，否则重进该项目后按钮永久卡在 disabled。
   guidanceStartingEntry = null;
-  guidanceSuggestionsLoading = false;
   guidanceSkipping = false;
   guidedLoadSeq += 1;
   freeLoadSeq += 1;
@@ -761,12 +774,17 @@ function loadFreeExploration(projectId) {
 
 // 把后端 GuidanceStateResponse（Story 2.8）写入前端导航态；currentField 变化即视为新一问，
 // 清空上一问的按需思路列表，避免展示与新问题不匹配的旧建议。
+// 把后端 GuidanceStateResponse（Story 2.8，2026-08-03 合并重构）写入前端导航态；
+// currentField 变化即视为新一问，收起上一问遗留的候选回复展开态（新问题的候选默认也是
+// 收起的，避免用户还没读新问题就先看到一堆候选回答）。
 function applyGuidanceState(state) {
   const nextField = (state && state.currentField) || null;
-  if (nextField !== guidanceCurrentField) guidanceSuggestions = null;
+  if (nextField !== guidanceCurrentField) guidanceSuggestionsExpanded = false;
   guidanceFields = (state && state.fields) || {};
   guidanceCurrentField = nextField;
-  guidanceCurrentQuestion = (state && state.currentQuestion) || null;
+  guidanceSuggestions = Array.isArray(state && state.currentSuggestions)
+    ? state.currentSuggestions
+    : [];
   guidanceReadyToSettle = Boolean(state && state.readyToSettle);
 }
 
@@ -862,9 +880,12 @@ async function refreshFreeClues(projectId, seq, startedHash) {
   return true;
 }
 
-async function refreshGuidance(projectId, seq, startedHash) {
+async function refreshGuidance(projectId, seq, startedHash, skipSeqSnapshot) {
   const state = await explorationApi.getGuidance(projectId);
   if (!isCurrentFreeExploration(projectId, seq, startedHash)) return false;
+  // 收尾的 GET guidance 可能在跳过之后才返回——此时跳过已 apply 了最新 state，
+  // 这里若再 apply 旧 state 会覆盖回跳过前。检测到期间发生过跳过就放弃。
+  if (skipSeqSnapshot !== undefined && skipSeqSnapshot !== guidanceSkipSeq) return false;
   applyGuidanceState(state);
   return true;
 }
@@ -887,6 +908,10 @@ async function startFreeGuidanceEntry(entry) {
   try {
     const state = await explorationApi.startGuidance(projectId, { entry });
     if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    // 开场问题已落库为真实 agent 聊天消息（2026-08-03 合并重构）：必须重新拉取对话
+    // 历史才能让它出现在聊天框里，仅更新导航状态（applyGuidanceState）不会带出新消息。
+    await syncFreeMessages(projectId, seq, startedHash);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
     applyGuidanceState(state);
   } catch (err) {
     if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
@@ -898,56 +923,37 @@ async function startFreeGuidanceEntry(entry) {
   }
 }
 
-// 按需回答思路（AC4）：仅点击时请求，不随每轮自动生成。无当前问题时后端 400
-// no_current_question——按中性提示处理，不视为异常错误态。
-async function requestGuidanceSuggestions() {
-  if (
-    guidanceSuggestionsLoading ||
-    freeMessageSending ||
-    !explorationProjectId ||
-    !guidanceCurrentQuestion
-  )
-    return;
-  const projectId = explorationProjectId;
-  const seq = freeLoadSeq;
-  const startedHash = location.hash;
-  guidanceSuggestionsLoading = true;
+// 按需回答思路（AC4，2026-08-03 合并重构后）：候选回复随每轮对话/开场/跳过同一次 LLM
+// 调用生成好，前端只是本地展开/收起，不发任何请求——点击「没想好？看看几个思路」瞬间显示。
+function toggleGuidanceSuggestions() {
+  guidanceSuggestionsExpanded = !guidanceSuggestionsExpanded;
   renderExploration();
-  try {
-    const { suggestions } = await explorationApi.suggestGuidance(projectId);
-    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
-    guidanceSuggestions = Array.isArray(suggestions) ? suggestions : [];
-  } catch (err) {
-    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
-    if (err && err.code === "no_current_question") {
-      guidanceSuggestions = [];
-    } else {
-      showFreeInlineError(explorationErrorText(err));
-    }
-  } finally {
-    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
-    guidanceSuggestionsLoading = false;
-    renderExploration();
-  }
 }
 
-// 跳过当前问题（AC4）：标记该字段 skipped，原地刷新导航状态（可能是下一问，也可能是收束
-// 态）。不调用 submitFreeMessage、不新增对话消息。
+// 跳过当前问题（AC6）：标记该字段 skipped，原地刷新导航状态（可能是下一问，也可能是收束
+// 态，均已随后端响应带上新的候选回复）。不调用 submitFreeMessage、不新增对话消息。
 async function skipFreeGuidanceQuestion() {
   if (
     guidanceSkipping ||
-    freeMessageSending ||
     !explorationProjectId ||
-    !guidanceCurrentQuestion
+    !guidanceCurrentField
   )
     return;
   const projectId = explorationProjectId;
   const seq = freeLoadSeq;
   const startedHash = location.hash;
+  // 递增跳过序号：让收尾里挂起的 refreshGuidance 检测到「跳过刚发生」后放弃 apply，
+  // 避免它用跳过前的旧 state 覆盖跳过刚写入的新 state。跳过是独立 HTTP 端点，不依赖
+  // freeMessageSending——收尾期间也允许点（用户在 Agent 刚说完话时最想跳过）。
+  const skipSeq = ++guidanceSkipSeq;
   guidanceSkipping = true;
   renderExploration();
   try {
     const state = await explorationApi.skipGuidance(projectId);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    // 跳过后若还有下一问，后端会落库为真实 agent 聊天消息（2026-08-03 合并重构）；
+    // 若已收束则不会有新消息。统一重新拉取一次对话历史，两种情况都覆盖，逻辑更简单。
+    await syncFreeMessages(projectId, seq, startedHash);
     if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
     applyGuidanceState(state);
   } catch (err) {
@@ -962,13 +968,30 @@ async function skipFreeGuidanceQuestion() {
   }
 }
 
-async function submitFreeMessage(content) {
+// 提交自由对话一轮。输入框/发送按钮不因 freeMessageSending 锁死（真实聊天软件式体验）：
+// 若上一轮仍在处理（含 SSE 消费完成后的消息同步/线索刷新/导航刷新收尾），本条文本先入队，
+// 交由 finally 收尾时的 drainFreeMessageQueue 自动续发；队列里最多保留最新的排队消息，
+// 不重复排队同一轮尚未处理的内容。
+function submitFreeMessage(content) {
   const text = String(content || "").trim();
-  if (!text || freeMessageSending || !explorationProjectId) return;
+  if (!text || !explorationProjectId) return;
+  if (freeMessageSending) {
+    freeMessageQueue = [...freeMessageQueue, text];
+    renderExploration();
+    return;
+  }
+  return sendFreeMessageNow(text);
+}
+
+async function sendFreeMessageNow(text) {
   const projectId = explorationProjectId;
   const seq = freeLoadSeq;
   const startedHash = location.hash;
+  // 捕获本轮开始时的跳过序号：收尾里 refreshGuidance 若发现序号变了（期间用户跳过过），
+  // 就放弃 apply，避免用旧 state 覆盖跳过刚写入的新 state。
+  const skipSeqSnapshot = guidanceSkipSeq;
   freeMessageSending = true;
+  freeMessageBusyLabel = "Agent 正在思考…";
   freeSettleErrorText = "";
   freeConversation = [...freeConversation, { role: "user", text }];
   freeMessageAbortController = new AbortController();
@@ -977,7 +1000,9 @@ async function submitFreeMessage(content) {
   let streamError = null;
   let agentText = "";
   let keepEditingDom = false;
-  renderExploration();
+  // 排队续发可能发生在用户正聚焦编辑线索输入框时；此时不重绘，避免打断输入
+  // （用户消息气泡会随下一次 renderExploration 一起补上，不会丢）。
+  if (!freeClueFocusedIds.size) renderExploration();
   try {
     await explorationApi.sendFreeMessage(
       projectId,
@@ -1005,6 +1030,8 @@ async function submitFreeMessage(content) {
     if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted) return;
     if (!gotTerminal) streamError = { code: "generate_failed" };
     if (!streamError) {
+      freeMessageBusyLabel = "正在整理线索与下一个问题…";
+      if (!freeClueFocusedIds.size) renderExploration();
       const messagesSynced = await syncFreeMessages(projectId, seq, startedHash);
       if (!messagesSynced) return;
       const cluesRefreshed = await refreshFreeClues(projectId, seq, startedHash);
@@ -1012,7 +1039,9 @@ async function submitFreeMessage(content) {
       // AC3 第 3 步：后端 stream_free_chat 已在落库后同步调用 guidance_agent.refresh_guidance，
       // 此处重新 GET 一次即可拿到本轮判定后的当前具体问题/完成度/就绪位。失败不影响本轮已
       // 成功的对话与线索（同后端「主链路成功、副作用降级」的容忍粒度），静默保留旧导航态。
-      await refreshGuidance(projectId, seq, startedHash).catch(() => false);
+      // 传入 skipSeqSnapshot：若期间用户点了跳过，跳过已 apply 新 state，这里的旧 GET 结果
+      // 放弃 apply，避免覆盖。
+      await refreshGuidance(projectId, seq, startedHash, skipSeqSnapshot).catch(() => false);
       keepEditingDom = freeClueFocusedIds.size > 0;
     } else {
       await syncFreeMessages(projectId, seq, startedHash).catch(() => false);
@@ -1024,10 +1053,21 @@ async function submitFreeMessage(content) {
   } finally {
     if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted) return;
     freeMessageSending = false;
+    freeMessageBusyLabel = "";
     freeMessageAbortController = null;
     if (!keepEditingDom) renderExploration();
     if (streamError) showFreeInlineError(explorationErrorText(streamError));
+    drainFreeMessageQueue();
   }
+}
+
+// 本轮收尾后若有排队消息，自动续发下一条（先进先出）；每次只取一条，续发完成后的
+// finally 会再次调用本函数，从而顺序处理队列里剩余的排队消息。
+function drainFreeMessageQueue() {
+  if (freeMessageSending || !freeMessageQueue.length) return;
+  const [next, ...rest] = freeMessageQueue;
+  freeMessageQueue = rest;
+  sendFreeMessageNow(next);
 }
 
 async function updateFreeClue(clueId, value, label) {
@@ -1953,10 +1993,10 @@ function renderExploration() {
       </section>`;
   } else {
     const hasConversation = freeConversation.length > 0;
-    // 零对话起点（AC2）：无对话且导航状态尚无 currentQuestion 时展示四个固定入口；
-    // 点击 startGuidance 生成开场问题后即使仍无对话消息，也按「已开始」渲染当前问题 + 常规输入框
+    // 零对话起点（AC2）：无对话且导航状态尚无 currentField 时展示四个固定入口；
+    // 点击 startGuidance 生成开场问题后即使仍无对话消息，也按「已开始」渲染对话 + 常规输入框
     // （幂等重放/刷新恢复见 loadFreeExploration→applyGuidanceState）。
-    const showEntryPoints = !hasConversation && !guidanceCurrentQuestion;
+    const showEntryPoints = !hasConversation && !guidanceCurrentField;
     const missingFieldCount = Object.values(guidanceFields).filter(
       (status) => status === "missing",
     ).length;
@@ -1992,13 +2032,41 @@ function renderExploration() {
         <button class="finish-exploration" type="button" ${canFinish && !freeSettlePending ? "" : "disabled"}>整理为故事设定 <span>→</span></button>
       </div>
     </aside>`;
+    // 当前具体问题不再单独展示（2026-08-03 合并重构）：聊天记录本身就是唯一的问题
+    // 事实源。按需思路 + 跳过挂在「最后一条 Agent 消息」下方——只有存在 current_field
+    // （还有待补字段）且这是最后一条消息时才渲染，避免用户已经继续往下聊、这两个按钮
+    // 还挂在半山腰的旧消息下面。
+    const lastMessageIndex = freeConversation.length - 1;
+    const suggestionsBlock = !guidanceSuggestionsExpanded
+      ? ""
+      : guidanceSuggestions.length
+        ? `<div class="guidance-suggestions" role="group" aria-label="回答思路">${guidanceSuggestions
+            .map(
+              (text, index) =>
+                `<button type="button" class="guidance-suggestion-option" data-guidance-suggestion="${index}">${escapeHtml(text)}</button>`,
+            )
+            .join("")}</div>`
+        : `<p class="guidance-suggestions-empty">暂时没想到合适的思路，直接说说你的想法也可以。</p>`;
+    // 跳过/候选/思路切换三个按钮不因 freeMessageSending 禁用：跳过是独立端点、候选点击
+    // 走消息队列（收尾期间自动入队）、思路切换纯本地——都不该让用户在 Agent 刚说完话、
+    // 收尾还在跑时「点不动」。只保留 guidanceSkipping 防跳过重复点击。
+    const guidanceActionsBlock = guidanceCurrentField
+      ? `<div class="guidance-question-actions">
+          <button type="button" class="guidance-suggest-toggle" data-guidance-suggest>${guidanceSuggestionsExpanded ? "收起思路" : "没想好？看看几个思路"}</button>
+          <button type="button" class="guidance-skip" data-guidance-skip ${guidanceSkipping ? "disabled" : ""}>先跳过这个问题</button>
+        </div>
+        ${suggestionsBlock}`
+      : "";
     const freeMessages = freeConversation
-      .map(
-        (entry) => `<article class="conversation-message ${entry.role === "agent" ? "agent-message" : "user-message"}">
+      .map((entry, index) => {
+        const isLastAgentMessage =
+          entry.role === "agent" && index === lastMessageIndex;
+        return `<article class="conversation-message ${entry.role === "agent" ? "agent-message" : "user-message"}">
           <div class="message-meta"><span>${entry.role === "agent" ? "Agent / 自由讨论" : "你"}</span></div>
           <p>${escapeHtml(entry.text)}</p>
-        </article>`,
-      )
+          ${isLastAgentMessage ? guidanceActionsBlock : ""}
+        </article>`;
+      })
       .join("");
     // 四个产品固定入口（AC2，不得渲染成/命名为 AI 建议）：entry key 对齐后端
     // GuidanceStartRequest.entry 的 Literal 取值。
@@ -2018,31 +2086,9 @@ function renderExploration() {
             .join("")}
         </div>`
       : "";
-    // 当前具体问题区（AC3/AC4/AC7）：只在导航状态给出 currentQuestion 时展示；按需思路与
-    // 跳过是这一区域的两个入口，绑定见 bindExplorationInteractions（Task 10）。
-    const suggestionsBlock = guidanceSuggestionsLoading
-      ? `<p class="guidance-suggestions-loading">正在想几个思路……</p>`
-      : guidanceSuggestions === null
-        ? ""
-        : guidanceSuggestions.length
-          ? `<div class="guidance-suggestions" role="group" aria-label="回答思路">${guidanceSuggestions
-              .map(
-                (text, index) =>
-                  `<button type="button" class="guidance-suggestion-option" data-guidance-suggestion="${index}" ${freeMessageSending ? "disabled" : ""}>${escapeHtml(text)}</button>`,
-              )
-              .join("")}</div>`
-          : `<p class="guidance-suggestions-empty">暂时没想到合适的思路，直接说说你的想法也可以。</p>`;
-    const currentQuestionBlock = guidanceCurrentQuestion
-      ? `<div class="guidance-current-question" role="status" aria-live="polite">
-          <p class="guidance-question-text">${escapeHtml(guidanceCurrentQuestion)}</p>
-          <div class="guidance-question-actions">
-            <button type="button" class="guidance-suggest-toggle" data-guidance-suggest ${guidanceSuggestionsLoading || freeMessageSending ? "disabled" : ""}>没想好？看看几个思路</button>
-            <button type="button" class="guidance-skip" data-guidance-skip ${guidanceSkipping || freeMessageSending ? "disabled" : ""}>先跳过这个问题</button>
-          </div>
-          ${suggestionsBlock}
-        </div>`
-      : hasConversation && canFinish
-        ? `<div class="guidance-current-question is-complete" role="status" aria-live="polite"><p class="guidance-question-text">7 项设定主干都聊得差不多了，可以在右侧整理为故事设定了。</p></div>`
+    const completionHintBlock =
+      hasConversation && !guidanceCurrentField && canFinish
+        ? `<p class="guidance-complete-hint">7 项设定主干都聊得差不多了，可以在右侧整理为故事设定了。</p>`
         : "";
     mainContent = `
       <section class="explore-dialogue" aria-labelledby="explore-title">
@@ -2052,15 +2098,16 @@ function renderExploration() {
           <div class="conversation-scroll" data-conversation-scroll>${freeMessages || '<p class="guided-complete-hint">想到什么都可以先说出来。我们边聊边把人物、冲突和世界一点点理清楚。</p>'}</div>
         </section>
         ${entryPointsBlock}
-        ${currentQuestionBlock}
+        ${completionHintBlock}
         ${
           showEntryPoints
             ? ""
             : `<form class="explore-response compact-composer" id="explore-response" data-free-mode="true">
           <label for="explore-answer">继续讨论</label>
-          <textarea id="explore-answer" placeholder="继续回答，或者和 Agent 讨论其他故事想法……" required ${freeMessageSending ? "disabled" : ""}></textarea>
+          <textarea id="explore-answer" placeholder="继续回答，或者和 Agent 讨论其他故事想法……" required></textarea>
+          ${freeMessageBusyLabel ? `<p class="free-busy-hint" role="status" aria-live="polite"><span class="free-busy-spinner" aria-hidden="true"></span>${escapeHtml(freeMessageBusyLabel)}${freeMessageQueue.length ? `（还有 ${freeMessageQueue.length} 条待发送）` : ""}</p>` : ""}
           <div class="response-actions">
-            <button class="primary-button explore-submit" type="submit" ${freeMessageSending ? "disabled" : ""}>${freeMessageSending ? "正在回复…" : "发送"} <span>→</span></button>
+            <button class="primary-button explore-submit" type="submit">发送 <span>→</span></button>
           </div>
         </form>`
         }
@@ -2243,12 +2290,15 @@ function bindExplorationInteractions() {
   );
   document
     .querySelector("[data-guidance-suggest]")
-    ?.addEventListener("click", () => requestGuidanceSuggestions());
+    ?.addEventListener("click", () => toggleGuidanceSuggestions());
   document.querySelectorAll("[data-guidance-suggestion]").forEach((button) =>
     button.addEventListener("click", () => {
       const index = Number(button.dataset.guidanceSuggestion);
-      const text = guidanceSuggestions && guidanceSuggestions[index];
-      if (text) submitFreeMessage(text);
+      const text = guidanceSuggestions[index];
+      if (!text) return;
+      // 点击即收起面板，避免建议列表悬在半空跨越到下一轮生成期间（视觉上像还没选定）。
+      guidanceSuggestionsExpanded = false;
+      submitFreeMessage(text);
     }),
   );
   document
@@ -2258,7 +2308,11 @@ function bindExplorationInteractions() {
     .querySelector("#explore-response")
     ?.addEventListener("submit", (event) => {
       event.preventDefault();
-      const answer = event.currentTarget.querySelector("#explore-answer").value;
+      const textarea = event.currentTarget.querySelector("#explore-answer");
+      const answer = textarea.value;
+      // 聊天式体验：提交即清空输入框视觉反馈，不等待网络/渲染；排队态下 submitFreeMessage
+      // 只入队不触发整页重绘，故这里必须显式清空，否则文本会一直留在框里。
+      textarea.value = "";
       submitFreeMessage(answer);
     });
   const conversation = document.querySelector("[data-conversation-scroll]");
@@ -2955,17 +3009,16 @@ function resetExplorationStateForNewProject(mode) {
   freeLoadError = null;
   freeLoadSeq += 1;
   freeMessageSending = false;
+  freeMessageQueue = [];
+  freeMessageBusyLabel = "";
   freeSettlePending = false;
-  freeSettleErrorText = "";
-  freeClueEditingIds.clear();
   freeClueFocusedIds.clear();
   deferredFreeClues = null;
   guidanceFields = {};
   guidanceCurrentField = null;
-  guidanceCurrentQuestion = null;
   guidanceReadyToSettle = false;
-  guidanceSuggestions = null;
-  guidanceSuggestionsLoading = false;
+  guidanceSuggestions = [];
+  guidanceSuggestionsExpanded = false;
   guidanceSkipping = false;
   guidanceStartingEntry = null;
   if (freeMessageAbortController) {
@@ -3074,10 +3127,9 @@ function bindProjectInteractions() {
       deferredFreeClues = null;
       guidanceFields = {};
       guidanceCurrentField = null;
-      guidanceCurrentQuestion = null;
       guidanceReadyToSettle = false;
-      guidanceSuggestions = null;
-      guidanceSuggestionsLoading = false;
+      guidanceSuggestions = [];
+      guidanceSuggestionsExpanded = false;
       guidanceSkipping = false;
       guidanceStartingEntry = null;
       finalStoryProfile = null;

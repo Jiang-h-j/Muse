@@ -1436,26 +1436,14 @@ a {
   cursor: not-allowed;
 }
 
-/* 自由探索：当前具体问题 + 按需思路 + 跳过（Story 2.8/7.6 AC3/AC4） */
-.guidance-current-question {
-  border: 1px solid var(--line-strong);
-  margin-top: 16px;
-  max-width: 820px;
-  padding: 16px 18px;
-}
-
-.guidance-question-text {
-  font-weight: 600;
-  margin: 0 0 10px;
-}
-
-.guidance-current-question.is-complete .guidance-question-text {
-  font-weight: 500;
-}
-
+/* 自由探索：按需思路 + 跳过，挂在最后一条 Agent 消息下方（Story 2.8/7.6 AC3/AC4，
+   2026-08-03 合并重构：不再有独立「当前具体问题」框，聊天记录本身就是问题事实源）。
+   随消息气泡走正常文档流，不用绝对定位——候选面板默认收起，展开时把消息气泡撑高，
+   属于消息内容的一部分，不会像悬浮层那样跳出气泡边界。 */
 .guidance-question-actions {
   display: flex;
   gap: 12px;
+  margin-top: 10px;
 }
 
 .guidance-suggest-toggle,
@@ -1480,7 +1468,7 @@ a {
 .guidance-suggestions {
   display: grid;
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 10px;
 }
 
 .guidance-suggestion-option {
@@ -1496,11 +1484,37 @@ a {
   border-color: var(--line-strong);
 }
 
-.guidance-suggestions-loading,
 .guidance-suggestions-empty {
   color: var(--sub);
   font-size: 11px;
   margin-top: 10px;
+}
+
+.guidance-complete-hint {
+  color: var(--sub);
+  font-size: 12px;
+  margin-top: 16px;
+  max-width: 820px;
+}
+
+/* 输入框上方的非阻塞进度提示（聊天式体验：Agent 处理中输入框仍可编辑）。 */
+.free-busy-hint {
+  align-items: center;
+  color: var(--sub);
+  display: flex;
+  font-size: 11px;
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.free-busy-spinner {
+  border: 2px solid color-mix(in srgb, var(--sub) 28%, transparent);
+  border-radius: 50%;
+  border-top-color: var(--ink, currentColor);
+  display: inline-block;
+  height: 12px;
+  width: 12px;
+  animation: guided-settle-spin 0.9s linear infinite;
 }
 
 /* 引导探索：沉浸式单问界面 */

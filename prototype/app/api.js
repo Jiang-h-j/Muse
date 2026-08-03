@@ -486,10 +486,9 @@ async function apiStream(path, { method = "POST", body, onEvent, signal, _retrie
 //   PATCH/DELETE /api/projects/{id}/explore/free/clues/{clueId} → 200 单条 / 204
 //   POST /api/projects/{id}/explore/free/clues/refresh → 200 完整线索列表
 //   POST /api/projects/{id}/explore/free/settle      → 200 {taskId}
-//   GET  /api/projects/{id}/explore/free/guidance     → 200 {fields, currentField, currentQuestion, readyToSettle}
-//   POST /api/projects/{id}/explore/free/guidance/start → 200 同上（body {entry}，四入口幂等开场）
-//   POST /api/projects/{id}/explore/free/guidance/suggestions → 200 {suggestions}（只读 2-4 条，不落库）
-//   POST /api/projects/{id}/explore/free/guidance/skip → 200 同上（跳过当前问题，推进下一问/收束）
+//   GET  /api/projects/{id}/explore/free/guidance     → 200 {fields, currentField, currentSuggestions, readyToSettle}
+//   POST /api/projects/{id}/explore/free/guidance/start → 200 同上（body {entry}，四入口幂等开场，开场问题落库为真实聊天消息）
+//   POST /api/projects/{id}/explore/free/guidance/skip → 200 同上（跳过当前问题，推进下一问/收束，下一问落库为真实聊天消息）
 //   GET  /api/tasks/{taskId}/events                  → SSE progress/result/error（settle 任务，2.1 底座）
 const explorationApi = {
   enter(projectId) {
@@ -571,12 +570,6 @@ const explorationApi = {
       method: "POST",
       body: { entry },
     });
-  },
-  suggestGuidance(projectId) {
-    return apiFetch(
-      `/api/projects/${projectId}/explore/free/guidance/suggestions`,
-      { method: "POST" },
-    );
   },
   skipGuidance(projectId) {
     return apiFetch(`/api/projects/${projectId}/explore/free/guidance/skip`, {
