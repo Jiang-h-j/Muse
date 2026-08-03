@@ -15,6 +15,7 @@ session 生命周期（陷阱⑩，仿 explorer_agent.py 模块 docstring 论证
 的生命周期。`extract_clues` 虽非流式，但同样调用 provider，为保持一致范式也用独立 session。
 """
 
+import logging
 import uuid
 from collections.abc import AsyncIterator
 
@@ -27,7 +28,9 @@ from muse.models.project import Project
 from muse.providers.base import ChatResult, Message, StreamChunk
 from muse.providers.factory import get_provider_for_user
 from muse.repositories import exploration_repo, project_repo, story_clue_repo
-from muse.services import exploration_service, usage_service
+from muse.services import exploration_service, guidance_agent, usage_service
+
+logger = logging.getLogger("muse")
 
 # 自由对话是轻交互任务 → 快档（deepseek-v4-flash）。快档是推理模型（2.1 Debug Log 实测：
 # reasoning_content 先吃 token 预算），留足余量避免正文被挤空（同 2.3 陷阱⑥考量）。
@@ -55,12 +58,17 @@ _CHAT_SYSTEM_PROMPT = """你在陪一位读者自由聊他脑中的小说想法�
 
 直接说你想说的话，不要任何前后缀。"""
 
-# 4 个预设线索槙位的 key → 中文标签（Task 4 播种与本模块整理端点共用，供 prompt 报送）。
+# 7 个预设线索槙位的 key → 中文标签（Task 4 播种与本模块整理端点共用，供 prompt 报送；
+# 2.8 扩容到 7 项，key/顺序对齐 exploration_service._PRESET_CLUES 与
+# story_settle_agent._BACKBONE_FIELDS——三处各自维护但语义须对齐，勿改动顺序）。
 PRESET_CLUE_KEYS: dict[str, str] = {
-    "opening": "最初的念头",
+    "genre": "题材",
+    "core_appeal": "核心吸引力",
     "protagonist": "主角",
-    "conflict": "核心冲突",
-    "world": "世界与氛围",
+    "main_conflict": "主要冲突",
+    "world_rules": "关键世界规则",
+    "overall_tone": "整体气质",
+    "opening_hook": "开篇钩子",
 }
 
 
@@ -249,6 +257,25 @@ async def stream_free_chat(
                 content=answer,
             )
             await session.commit()
+
+            # 6. 一轮对话落库成功后，刷新自由探索导航状态（2.8 AC2/AC9）：判完成度 + 选
+            #    下一问。这是「本轮对话的副作用」，同一独立 session 内追加调用，不新开
+            #    session（guidance_agent.refresh_guidance 的 session 生命周期约定）。护栏
+            #    触顶时该函数内部静默降级、不影响本轮对话已成功落库的结果（Dev Notes 已
+            #    论证「主链路成功、副作用降级」的失败容忍粒度）。**本轮对话已成功落库**，
+            #    故这里对任何异常（包括 429 之外的未预期异常，如网络错误/provider 超时）
+            #    一律吞掉只记日志——绝不让副作用失败冒泡到调用方 SSE 端点、把已成功的对话
+            #    误报为 error（code review 修复：此前只在 refresh_guidance 内部捕获
+            #    ErrorEnvelope，非 ErrorEnvelope 异常会一路冒泡到 _free_chat_event_stream，
+            #    改发 error 事件掩盖已落库成功的事实）。
+            try:
+                await guidance_agent.refresh_guidance(
+                    session, user_id=user_id, project_id=project_id
+                )
+            except Exception:
+                logger.exception(
+                    "refresh_guidance 副作用失败，不影响本轮对话已成功落库的结果"
+                )
 
 
 async def extract_clues(

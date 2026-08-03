@@ -8,11 +8,18 @@ status/title 等派生态（YAGNI）；对话（exploration_message，2.4）、�
 
 mode 取自 project.mode（后端单一事实源），非客户端所传——service 建会话时读 project.mode
 落库，接口无 mode 入参，从数据通道上根除「模式中途切换」（AC2/AC3）。
+
+guidance_state（2.8 新增）：自由探索的设定导航状态（JSONB），记录 7 项通用主干字段的
+完成度（missing/filled/skipped）、当前待补字段、当前问题文本与 readyToSettle 布尔位。
+只服务 free 模式——guided 会话恒 NULL，不写、不读。**不与 story_clue 合并**
+（architecture.md L237 已定档的职责边界）：story_clue 仍是用户可编辑事实展示区，
+guidance_state 只是完成度与下一问的后端事实源。
 """
 
 import uuid
 
 from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from muse.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -47,3 +54,7 @@ class ExplorationSession(Base, UUIDPKMixin, TimestampMixin):
     )
     # 探索模式：guided（引导）/ free（自由）。取自 project.mode，会话建后不可改写（AC2/AC3）。
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 自由探索设定导航状态（2.8 新增）：{fields:{7项主干key:missing/filled/skipped},
+    # current_field, current_question, ready_to_settle}。nullable、无 server_default——
+    # 只服务 free 模式，guided 会话恒 NULL；free 会话在 enter_exploration 首次创建时初始化。
+    guidance_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

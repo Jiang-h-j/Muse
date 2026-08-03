@@ -20,10 +20,22 @@ free_explorer_agent）。
 - POST /{project_id}/explore/free/clues/refresh：Agent 依对话自动整理线索（Story 2.6 AC5，硬 AC）
   ——同步调用，只更新未被用户编辑的预设槙位。
 - POST /{project_id}/explore/free/settle：自由探索触发「整理为故事设定」ARQ 后台任务（Story 2.7
-  AC3/AC4）——租户守卫 + **门禁硬校验**（本会话须至少 1 条 free 用户消息，否则 400
-  exploration_not_ready）+ 登记属主 + 入队 settle_exploration，返 taskId，前端连 2.1 的
-  GET /api/tasks/{taskId}/events 消费 SSE。非流式提交（同 guided/settle，异步模型二分见 epics）。
-  门禁硬校验是本 story 相对 2.5 的差异（FR10「补足信息才开放」+ 2.6「不止于前端」先例）。
+  AC3 + 2.8 AC8）——租户守卫 + **门禁硬校验**（2.8 起判据为 7 项主干全部 filled/skipped，
+  即 `guidance_state.ready_to_settle`，替换 2.7「≥1 条消息」近似判据，非「或」关系）+ 登记
+  属主 + 入队 settle_exploration，返 taskId，前端连 2.1 的 GET /api/tasks/{taskId}/events
+  消费 SSE。非流式提交（同 guided/settle，异步模型二分见 epics）。
+- GET  /{project_id}/explore/free/guidance：恢复自由探索导航状态（Story 2.8 AC1/AC10）——完成度
+  `fields`（7 项主干 missing/filled/skipped）、`currentField`/`currentQuestion`、
+  `readyToSettle`；guided 会话/未初始化态返回全 missing 初始态（不 404，前端无需处理该分支）。
+- POST /{project_id}/explore/free/guidance/start：零对话四入口生成对应开场问题（Story 2.8 AC3）
+  ——仅当会话尚无任何对话时生成新问题，已有对话则幂等返回当前态。
+- POST /{project_id}/explore/free/guidance/suggestions：按需生成当前问题的 2-4 个候选回答
+  （Story 2.8 AC4）——只读建议，不落库、不改导航状态。
+- POST /{project_id}/explore/free/guidance/skip：跳过当前问题（Story 2.8 AC6）——标记
+  `skipped` + 谨慎归纳写入对应线索槙位（不覆盖 `user_edited=true`）+ 推进下一问/收束。
+  一轮自由对话结束后的导航状态刷新（判完成度 + 选下一问）由 `stream_free_chat` 内部调用
+  `guidance_agent.refresh_guidance`，不独立暴露 HTTP 端点（AC2 是「对话的副作用」而非用户
+  主动操作）。
 
 依赖 CurrentUser 自动完成 access token 校验并取当前 User；未登录/token 失效在依赖内 401。
 所有操作绑定 current_user.id 实现租户隔离；越权/不存在同码 404（业务在 service）。guided/free
@@ -51,12 +63,20 @@ from muse.schemas.exploration import (
     ExplorationSessionResponse,
     FreeMessageRequest,
     FreeMessageResponse,
+    GuidanceStartRequest,
+    GuidanceStateResponse,
+    GuidanceSuggestionsResponse,
     GuidedAnswerRequest,
     GuidedAnswerResponse,
     GuidedInterpretRequest,
 )
 from muse.schemas.task import TaskSubmitResponse
-from muse.services import exploration_service, explorer_agent, free_explorer_agent
+from muse.services import (
+    exploration_service,
+    explorer_agent,
+    free_explorer_agent,
+    guidance_agent,
+)
 
 router = APIRouter(prefix="/api/projects", tags=["exploration"])
 
@@ -436,17 +456,19 @@ async def refresh_clues(
 async def settle_free_exploration(
     project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
 ) -> TaskSubmitResponse:
-    """自由探索触发「整理为故事设定」ARQ 后台任务（AC3/AC4）：提交语义，返 200 + taskId。
+    """自由探索触发「整理为故事设定」ARQ 后台任务（2.7 AC3 + 2.8 AC8）：提交语义，返 200 + taskId。
 
     **非流式**（陷阱③）：POST→taskId 提交（同 guided/settle），前端拿 taskId 后连 2.1 的
     GET /api/tasks/{taskId}/events 消费 SSE——**不返 EventSourceResponse**（那是 interpret /
     free/messages 的交互式流式模式；settle 是 ARQ 后台任务模式，epics.md:457 二分）。SSE 消费
     端点由 2.1 已建，本 story 复用、不重建（陷阱⑪）。
 
-    **门禁硬校验（AC4，本 story 相对 2.5 的差异）**：service 层在租户守卫 + mode 守卫之后，再校验
-    本会话至少有 1 条 free 用户消息，否则 400 exploration_not_ready（不入队、不登记属主、不返
-    taskId）。门禁「补足信息才开放」是 user story 核心 benefit（FR10），且延续 2.6「模式独立在数据
-    写入层真正落地不止于前端」先例，故后端做实（前端 disabled + 后端 400 双防线）。
+    **门禁硬校验（2.8 AC8，替换 2.7 近似判据）**：service 层在租户守卫 + mode 守卫之后，读取
+    `guidance_state.ready_to_settle`——7 项主干全部 filled/skipped 才为真，否则 400
+    exploration_not_ready（不入队、不登记属主、不返 taskId）。**不再是「≥1 条消息」**（2.7
+    旧判据被本次替换，非「或」关系）。门禁「补足信息才开放」是 user story 核心 benefit（FR10），
+    且延续 2.6「模式独立在数据写入层真正落地不止于前端」先例，故后端做实（前端 disabled + 后端
+    400 双防线）。
 
     无 body（触发即整理，凝练所需数据由任务自己从库读；project_id 已在路径）；project_id 非法
     UUID 由 FastAPI 自动 422。越权/不存在在 service 统一 404（陷阱①，先于门禁）。整理任务体复用
@@ -456,5 +478,87 @@ async def settle_free_exploration(
         session, user_id=current_user.id, project_id=project_id
     )
     return TaskSubmitResponse(task_id=task_id)
+
+
+@router.get(
+    "/{project_id}/explore/free/guidance", response_model=GuidanceStateResponse
+)
+async def get_free_guidance(
+    project_id: uuid.UUID, current_user: CurrentUser, session: SessionDep
+) -> GuidanceStateResponse:
+    """恢复自由探索导航状态（Story 2.8 AC1/AC10）：只读，供刷新/断线重连恢复。
+
+    与 `refresh_guidance`（对话轮次结束后的判定+生成副作用）语义不同——本端点纯读取已
+    持久化的 `guidance_state`，不调 LLM、不改状态（Dev Notes 已论证二者不可混淆）。无
+    会话/未初始化（guided 会话恒此态）返回全 `missing` 初始态而非 404，前端无需处理该
+    分支。越权/不存在 project → 404；mode 不匹配 → 409。
+    """
+    guidance_state = await guidance_agent.get_guidance(
+        session, user_id=current_user.id, project_id=project_id
+    )
+    return GuidanceStateResponse.model_validate(guidance_state)
+
+
+@router.post(
+    "/{project_id}/explore/free/guidance/start",
+    response_model=GuidanceStateResponse,
+)
+async def start_free_guidance(
+    project_id: uuid.UUID,
+    payload: GuidanceStartRequest,
+    current_user: CurrentUser,
+) -> GuidanceStateResponse:
+    """零对话四入口生成对应开场问题（Story 2.8 AC3）：返 200 + 更新后的导航状态。
+
+    四个固定入口（`entry`）由 schema `Literal` 约束，非法值 422。仅当会话尚无任何对话
+    时才真正生成新问题；已有对话则幂等返回当前态（前端误调用/重放不产生副作用，
+    `guidance_agent.start_guidance` 已定档）。**独立 session 自管**（陷阱⑩，函数内部调
+    provider 走记账），本端点不注入请求 session。越权/不存在 404；mode 不匹配 409；
+    护栏触顶 429。
+    """
+    guidance_state = await guidance_agent.start_guidance(
+        user_id=current_user.id, project_id=project_id, entry=payload.entry
+    )
+    return GuidanceStateResponse.model_validate(guidance_state)
+
+
+@router.post(
+    "/{project_id}/explore/free/guidance/suggestions",
+    response_model=GuidanceSuggestionsResponse,
+)
+async def suggest_free_guidance_answers(
+    project_id: uuid.UUID, current_user: CurrentUser
+) -> GuidanceSuggestionsResponse:
+    """按需生成当前问题的 2-4 个候选回答（Story 2.8 AC4）：只读建议，返 200。
+
+    无 `current_field`（已就绪或未初始化）→ 400 `no_current_question`。**不落库**——本
+    操作是只读建议，用户可以看了不选，不产生任何持久化副作用。独立 session 自管；越权/
+    不存在 404；mode 不匹配 409；护栏触顶 429；空产 502 `generate_failed`。
+    """
+    suggestions = await guidance_agent.suggest_answers(
+        user_id=current_user.id, project_id=project_id
+    )
+    return GuidanceSuggestionsResponse(suggestions=suggestions)
+
+
+@router.post(
+    "/{project_id}/explore/free/guidance/skip",
+    response_model=GuidanceStateResponse,
+)
+async def skip_free_guidance_field(
+    project_id: uuid.UUID, current_user: CurrentUser
+) -> GuidanceStateResponse:
+    """跳过当前问题（Story 2.8 AC6）：标记 `skipped` + 谨慎归纳写线索 + 推进下一问/收束。
+
+    无 `current_field`（已就绪或未初始化）→ 400 `no_current_question`。状态转移（标记
+    `skipped` + 推进）优先生效、不依赖 LLM；谨慎归纳写线索是独立后续步骤，护栏触顶时
+    静默跳过归纳（不影响已生效的状态转移，`guidance_agent.skip_current_field` 已定档
+    取舍）。归纳只写未被用户编辑（`user_edited=false`）的槙位，与 2.6 硬约束一致。独立
+    session 自管；越权/不存在 404；mode 不匹配 409。
+    """
+    guidance_state = await guidance_agent.skip_current_field(
+        user_id=current_user.id, project_id=project_id
+    )
+    return GuidanceStateResponse.model_validate(guidance_state)
 
 

@@ -5,8 +5,9 @@
   happy delta→done + 两条消息真实落库（user/agent 各一行，kind="free"）；GET messages 恢复
   顺序正确（严格递增 created_at，验证「分两次 commit 避免同值」确实生效）；空产兜底 error；
   租户隔离 404。
-- 线索 CRUD（@requires_db）：进入自由探索播种 4 preset（display_order 0-3、user_edited=false）；
-  PATCH 编辑后 user_edited=true；新增/删除自定义线索；删除 preset 返 400 clue_not_deletable
+- 线索 CRUD（@requires_db）：进入自由探索播种 7 preset（display_order 0-6、user_edited=false，
+  2.8 扩容自 4 preset，key 与 story_settle_agent._BACKBONE_FIELDS 一致）；PATCH 编辑后
+  user_edited=true；新增/删除自定义线索；删除 preset 返 400 clue_not_deletable
   （非 404）；越权访问他人线索 404。
 - Agent 整理（@requires_db，mock provider.chat）：全部未编辑时更新全部槙位；已编辑槙位跳过；
   全部已编辑时不调用 provider（省成本）；LLM 输出格式异常时全部槙位保持原值、端点仍 200。
@@ -24,7 +25,7 @@ from sqlalchemy import Engine, text
 from muse.main import app
 from muse.models.account import User
 from muse.providers.base import ChatResult
-from muse.services import free_explorer_agent
+from muse.services import free_explorer_agent, guidance_agent
 from tests.conftest import requires_db
 
 _client = TestClient(app, raise_server_exceptions=False)
@@ -193,10 +194,25 @@ async def test_free_chat_persists_two_messages_with_strictly_increasing_created_
     fake_provider = AsyncMock()
     fake_provider.stream = _fake_stream
 
-    with patch.object(
-        free_explorer_agent,
-        "get_provider_for_user",
-        new=AsyncMock(return_value=fake_provider),
+    with (
+        patch.object(
+            free_explorer_agent,
+            "get_provider_for_user",
+            new=AsyncMock(return_value=fake_provider),
+        ),
+        # 2.8：stream_free_chat 成功落库后追加调用 guidance_agent.refresh_guidance，
+        # 它是独立 import 的同名函数引用，需单独 mock（否则真的会打外部 LLM）。用
+        # 空产出模拟判定失败态，refresh_guidance 内部保留上一轮 guidance_state 不变，
+        # 不影响本测试断言的对话持久化行为。
+        patch.object(
+            guidance_agent,
+            "get_provider_for_user",
+            new=AsyncMock(
+                return_value=AsyncMock(
+                    chat=AsyncMock(return_value=_fake_chat_result(""))
+                )
+            ),
+        ),
     ):
         deltas = [
             d
@@ -336,7 +352,7 @@ def test_list_free_messages_empty_returns_empty_list(
 
 
 @requires_db
-def test_enter_free_exploration_seeds_four_preset_clues(
+def test_enter_free_exploration_seeds_seven_preset_clues(
     make_user: Callable[..., User],
     auth_headers: Callable[[User], dict[str, str]],
 ) -> None:
@@ -351,15 +367,26 @@ def test_enter_free_exploration_seeds_four_preset_clues(
     resp = _client.get(_clues_url(project_id), headers=headers)
     assert resp.status_code == 200
     clues = resp.json()
-    assert len(clues) == 4
-    assert [c["displayOrder"] for c in clues] == [0, 1, 2, 3]
+    assert len(clues) == 7
+    assert [c["displayOrder"] for c in clues] == [0, 1, 2, 3, 4, 5, 6]
     assert [c["clueKey"] for c in clues] == [
-        "opening",
+        "genre",
+        "core_appeal",
         "protagonist",
-        "conflict",
-        "world",
+        "main_conflict",
+        "world_rules",
+        "overall_tone",
+        "opening_hook",
     ]
-    assert [c["label"] for c in clues] == ["最初的念头", "主角", "核心冲突", "世界与氛围"]
+    assert [c["label"] for c in clues] == [
+        "题材",
+        "核心吸引力",
+        "主角",
+        "主要冲突",
+        "关键世界规则",
+        "整体气质",
+        "开篇钩子",
+    ]
     for c in clues:
         assert c["kind"] == "preset"
         assert c["userEdited"] is False
@@ -379,7 +406,55 @@ def test_enter_free_exploration_idempotent_does_not_reseed(
     _client.post(f"/api/projects/{project_id}/explore", headers=headers)
 
     resp = _client.get(_clues_url(project_id), headers=headers)
-    assert len(resp.json()) == 4
+    assert len(resp.json()) == 7
+
+
+@requires_db
+def test_enter_free_exploration_heals_stale_null_guidance_state(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    db_engine: Engine,
+) -> None:
+    # code review 修复回归：模拟本 story 上线前已创建的存量 free 会话（guidance_state 被
+    # 迁移回填为 NULL）。再次进入探索（enter_exploration 命中「已存在」分支）应就地初始化
+    # guidance_state，而不是让它永久停留在 None（否则 settle 门禁永久无法满足）。
+    user = make_user("guidance-heal-stale@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(headers)
+    _client.post(f"/api/projects/{project_id}/explore", headers=headers)
+
+    with db_engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE exploration_session SET guidance_state = NULL "
+                "WHERE project_id = :pid"
+            ),
+            {"pid": project_id},
+        )
+    with db_engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT guidance_state FROM exploration_session WHERE project_id = :pid"),
+            {"pid": project_id},
+        ).one()
+    assert row.guidance_state is None  # 模拟成功：确认已回退成存量态
+
+    resp = _client.post(f"/api/projects/{project_id}/explore", headers=headers)
+    assert resp.status_code == 200
+
+    resp2 = _client.get(
+        f"/api/projects/{project_id}/explore/free/guidance", headers=headers
+    )
+    assert resp2.status_code == 200
+    body = resp2.json()
+    assert body["readyToSettle"] is False
+    assert all(v == "missing" for v in body["fields"].values())
+
+    with db_engine.begin() as conn:
+        row_after = conn.execute(
+            text("SELECT guidance_state FROM exploration_session WHERE project_id = :pid"),
+            {"pid": project_id},
+        ).one()
+    assert row_after.guidance_state is not None  # 已就地初始化并落库，不再是 NULL
 
 
 @requires_db
@@ -393,7 +468,7 @@ def test_edit_clue_sets_user_edited_true(
     _client.post(f"/api/projects/{project_id}/explore", headers=headers)
 
     clues = _client.get(_clues_url(project_id), headers=headers).json()
-    opening_clue = next(c for c in clues if c["clueKey"] == "opening")
+    opening_clue = next(c for c in clues if c["clueKey"] == "genre")
 
     resp = _client.patch(
         f"{_clues_url(project_id)}/{opening_clue['id']}",
@@ -425,7 +500,7 @@ def test_create_and_delete_custom_clue(
     custom_clue = resp.json()
     assert custom_clue["kind"] == "custom"
     assert custom_clue["clueKey"] is None
-    assert custom_clue["displayOrder"] == 4  # 4 个 preset 之后追加
+    assert custom_clue["displayOrder"] == 7  # 7 个 preset 之后追加
 
     del_resp = _client.delete(
         f"{_clues_url(project_id)}/{custom_clue['id']}", headers=headers
@@ -433,7 +508,7 @@ def test_create_and_delete_custom_clue(
     assert del_resp.status_code == 204
 
     remaining = _client.get(_clues_url(project_id), headers=headers).json()
-    assert len(remaining) == 4  # 只剩 4 个 preset
+    assert len(remaining) == 7  # 只剩 7 个 preset
 
 
 @requires_db
@@ -502,10 +577,13 @@ def test_refresh_clues_updates_all_unedited_presets(
     fake_provider = AsyncMock()
     fake_provider.chat = AsyncMock(
         return_value=_fake_chat_result(
-            "最初的念头：一个雨夜的来信\n"
+            "题材：悬疑\n"
+            "核心吸引力：谎言与真相的拉扯\n"
             "主角：一个孤独的侦探\n"
-            "核心冲突：真相与谎言的对抗\n"
-            "世界与氛围：阴郁的近未来都市"
+            "主要冲突：真相与谎言的对抗\n"
+            "关键世界规则：阴郁的近未来都市\n"
+            "整体气质：压抑克制\n"
+            "开篇钩子：一个雨夜的来信"
         )
     )
     with patch.object(
@@ -518,10 +596,13 @@ def test_refresh_clues_updates_all_unedited_presets(
         )
     assert resp.status_code == 200
     clues = {c["clueKey"]: c for c in resp.json()}
-    assert clues["opening"]["value"] == "一个雨夜的来信"
+    assert clues["genre"]["value"] == "悬疑"
+    assert clues["core_appeal"]["value"] == "谎言与真相的拉扯"
     assert clues["protagonist"]["value"] == "一个孤独的侦探"
-    assert clues["conflict"]["value"] == "真相与谎言的对抗"
-    assert clues["world"]["value"] == "阴郁的近未来都市"
+    assert clues["main_conflict"]["value"] == "真相与谎言的对抗"
+    assert clues["world_rules"]["value"] == "阴郁的近未来都市"
+    assert clues["overall_tone"]["value"] == "压抑克制"
+    assert clues["opening_hook"]["value"] == "一个雨夜的来信"
     # Agent 整理不改 user_edited（仍 false，可被后续整理继续覆盖）。
     for c in clues.values():
         assert c["userEdited"] is False
@@ -538,7 +619,7 @@ def test_refresh_clues_skips_user_edited_preset(
     _client.post(f"/api/projects/{project_id}/explore", headers=headers)
 
     clues = _client.get(_clues_url(project_id), headers=headers).json()
-    opening_clue = next(c for c in clues if c["clueKey"] == "opening")
+    opening_clue = next(c for c in clues if c["clueKey"] == "genre")
     _client.patch(
         f"{_clues_url(project_id)}/{opening_clue['id']}",
         json={"value": "用户手动写的开头"},
@@ -548,9 +629,12 @@ def test_refresh_clues_skips_user_edited_preset(
     fake_provider = AsyncMock()
     fake_provider.chat = AsyncMock(
         return_value=_fake_chat_result(
+            "核心吸引力：谎言与真相的拉扯\n"
             "主角：一个孤独的侦探\n"
-            "核心冲突：真相与谎言的对抗\n"
-            "世界与氛围：阴郁的近未来都市"
+            "主要冲突：真相与谎言的对抗\n"
+            "关键世界规则：阴郁的近未来都市\n"
+            "整体气质：压抑克制\n"
+            "开篇钩子：一个雨夜的来信"
         )
     )
     with patch.object(
@@ -563,9 +647,9 @@ def test_refresh_clues_skips_user_edited_preset(
         )
     assert resp.status_code == 200
     result_clues = {c["clueKey"]: c for c in resp.json()}
-    # opening 已被用户编辑，值不变、user_edited 仍 true。
-    assert result_clues["opening"]["value"] == "用户手动写的开头"
-    assert result_clues["opening"]["userEdited"] is True
+    # genre 已被用户编辑，值不变、user_edited 仍 true。
+    assert result_clues["genre"]["value"] == "用户手动写的开头"
+    assert result_clues["genre"]["userEdited"] is True
     # 其余槙位正常被整理更新。
     assert result_clues["protagonist"]["value"] == "一个孤独的侦探"
 
@@ -641,20 +725,20 @@ async def test_extract_clues_race_does_not_overwrite_user_edit(
     _client.post(f"/api/projects/{project_id}/explore", headers=headers)
 
     clues = _client.get(_clues_url(project_id), headers=headers).json()
-    opening_clue = next(c for c in clues if c["clueKey"] == "opening")
+    opening_clue = next(c for c in clues if c["clueKey"] == "genre")
 
     async def _chat_then_user_edits(*args: object, **kwargs: object) -> ChatResult:
-        # 模拟 LLM 调用耗时窗口内用户抢先手动编辑 opening 槙位（置 user_edited=true）。
+        # 模拟 LLM 调用耗时窗口内用户抢先手动编辑 genre 槙位（置 user_edited=true）。
         _client.patch(
             f"{_clues_url(project_id)}/{opening_clue['id']}",
             json={"value": "用户在整理期间抢先写的开头"},
             headers=headers,
         )
         return _fake_chat_result(
-            "最初的念头：Agent 想覆盖的开头\n"
+            "题材：Agent 想覆盖的题材\n"
             "主角：一个孤独的侦探\n"
-            "核心冲突：真相与谎言\n"
-            "世界与氛围：阴郁都市"
+            "主要冲突：真相与谎言\n"
+            "关键世界规则：阴郁都市"
         )
 
     fake_provider = AsyncMock()
@@ -672,9 +756,9 @@ async def test_extract_clues_race_does_not_overwrite_user_edit(
         c["clueKey"]: c
         for c in _client.get(_clues_url(project_id), headers=headers).json()
     }
-    # 关键断言：opening 保留用户抢写的值、user_edited 仍 true（未被 Agent 覆盖）。
-    assert result["opening"]["value"] == "用户在整理期间抢先写的开头"
-    assert result["opening"]["userEdited"] is True
+    # 关键断言：genre 保留用户抢写的值、user_edited 仍 true（未被 Agent 覆盖）。
+    assert result["genre"]["value"] == "用户在整理期间抢先写的开头"
+    assert result["genre"]["userEdited"] is True
     # 其余未被用户碰的槙位仍正常被整理更新。
     assert result["protagonist"]["value"] == "一个孤独的侦探"
 
@@ -691,7 +775,7 @@ def test_edit_preset_clue_label_returns_400(
     _client.post(f"/api/projects/{project_id}/explore", headers=headers)
 
     clues = _client.get(_clues_url(project_id), headers=headers).json()
-    preset_clue = next(c for c in clues if c["clueKey"] == "opening")
+    preset_clue = next(c for c in clues if c["clueKey"] == "genre")
 
     resp = _client.patch(
         f"{_clues_url(project_id)}/{preset_clue['id']}",

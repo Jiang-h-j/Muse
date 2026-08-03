@@ -10,7 +10,7 @@ user_id 的全表查询入口。
 
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -201,4 +201,54 @@ async def has_free_user_message(
     )
     result = await session.execute(stmt)
     return bool(result.scalar())
+
+
+async def get_guidance_state(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> dict | None:
+    """读当前会话的自由探索导航状态（2.8 AC1/AC10）。
+
+    只服务 free 模式——guided 会话该列恒 `None`（未初始化，本函数不做区分，调用方
+    guidance_agent 自行判断 mode）。where 显式带 user_id + project_id + session_id
+    （租户守卫 NFR3）；单列 select，不拉回整个 ORM 对象。
+    """
+    stmt = select(ExplorationSession.guidance_state).where(
+        ExplorationSession.id == session_id,
+        ExplorationSession.user_id == user_id,
+        ExplorationSession.project_id == project_id,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def update_guidance_state(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+    guidance_state: dict,
+) -> None:
+    """整体覆写会话的导航状态（2.8 AC1/AC2/AC6/AC7）：`guidance_agent` 每次都传完整新结构。
+
+    走 Core UPDATE（非 ORM 对象改属性 flush，同 `story_clue_repo.update_clue_value` 范式）
+    ——本函数不需要先查再改，调用方（guidance_agent）已在内存里组装好完整的新
+    `guidance_state`，这里只负责原子写入。只 flush 不 commit（事务边界归 service）。
+    where 显式带三件套（租户守卫 NFR3）。
+    """
+    stmt = (
+        update(ExplorationSession)
+        .where(
+            ExplorationSession.id == session_id,
+            ExplorationSession.user_id == user_id,
+            ExplorationSession.project_id == project_id,
+        )
+        .values(guidance_state=guidance_state)
+    )
+    await session.execute(stmt)
+    await session.flush()
 

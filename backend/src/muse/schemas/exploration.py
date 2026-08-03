@@ -11,7 +11,8 @@ GuidedInterpretRequest 收当前题干 + 用户一句话自述。
 import uuid
 from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, field_serializer
+from pydantic.alias_generators import to_camel
 
 from muse.schemas.base import CamelModel, UTCDateTime
 
@@ -148,4 +149,47 @@ class ClueCreateRequest(CamelModel):
 
     label: _NonBlankText
     value: _BoundedText = ""
+
+
+class GuidanceStartRequest(CamelModel):
+    """自由探索零对话四入口请求（Story 2.8 AC3）：边界 camelCase：entry。
+
+    四个固定产品入口标识，`Literal` 约束非法值 422（同 `project.mode`/`answer_type`
+    既有 `Literal` 用法）。取值语义见 `guidance_agent._ENTRY_FIELD_MAP`。
+    """
+
+    entry: Literal["story_idea", "protagonist", "conflict", "world"]
+
+
+class GuidanceStateResponse(CamelModel):
+    """自由探索导航状态响应（Story 2.8 AC1/AC2/AC3/AC6/AC7）：完成度 + 当前问题 + 就绪位。
+
+    边界自动 camelCase：currentField/currentQuestion/readyToSettle。**`fields` 是例外**
+    ——`alias_generator=to_camel` 只作用于模型字段名，不转换 dict 值内部的 key（已用脚本
+    验证 Pydantic 行为）。内部（`guidance_state.fields`）仍用 snake_case 存储（与
+    `story_settle_agent._BACKBONE_FIELDS`/`story_bible` 列名一致，不打破项目既定的「内部
+    snake_case、边界 camelCase」约定），只在本响应序列化时经 `field_serializer` 把 dict
+    key 转 camelCase（如 `core_appeal` → `coreAppeal`），供前端拿到与其他字段一致的
+    camelCase key。`current_field`（若非空）也是 snake_case 领域值，同样需要转换。
+    """
+
+    fields: dict[str, str]
+    current_field: str | None
+    current_question: str | None
+    ready_to_settle: bool
+
+    @field_serializer("fields")
+    def _camel_fields(self, value: dict[str, str]) -> dict[str, str]:
+        return {to_camel(key): status for key, status in value.items()}
+
+    @field_serializer("current_field")
+    def _camel_current_field(self, value: str | None) -> str | None:
+        return to_camel(value) if value is not None else None
+
+
+class GuidanceSuggestionsResponse(CamelModel):
+    """按需回答思路响应（Story 2.8 AC4）：边界 camelCase：suggestions（无内部 key 转换需要
+    ——`list[str]` 是纯文本数组，非 dict）。"""
+
+    suggestions: list[str]
 

@@ -28,14 +28,22 @@ from muse.models.project import Project
 from muse.models.story_clue import StoryClue
 from muse.repositories import exploration_repo, project_repo, story_clue_repo
 
-# 4 个预设线索槙位：(clue_key, 中文标签)，进入自由探索首次建会话时播种（AC3）。
-# 顺序即 display_order 0-3，与 free_explorer_agent.PRESET_CLUE_KEYS 定义一致（勿改动顺序，
-# 两处各自维护但语义须对齐——见 Dev Agent Record 说明本 story 在何处保证一致）。
+# 7 个预设线索槙位：(clue_key, 中文标签)，进入自由探索首次建会话时播种（AC3，2.8 扩容）。
+# key 与顺序对齐 story_settle_agent._BACKBONE_FIELDS（题材/核心吸引力/主角/主要冲突/
+# 关键世界规则/整体气质/开篇钩子）——2.8 起 guidance_state 的完成度判定与跳过归纳
+# 直接按这 7 个 key 一一对应写线索，故必须与主干字段集合同名同序（不可再自成一套
+# opening/protagonist/conflict/world 短名）。顺序即 display_order 0-6，与
+# free_explorer_agent.PRESET_CLUE_KEYS 定义一致（勿改动顺序，两处各自维护但语义须对齐）。
+# **存量数据不受影响**：本常量只在 enter_exploration 建新会话时生效，已建会话的旧 4
+# preset 槙位（opening/protagonist/conflict/world）保留不动、不迁移、不删除。
 _PRESET_CLUES: list[tuple[str, str]] = [
-    ("opening", "最初的念头"),
+    ("genre", "题材"),
+    ("core_appeal", "核心吸引力"),
     ("protagonist", "主角"),
-    ("conflict", "核心冲突"),
-    ("world", "世界与氛围"),
+    ("main_conflict", "主要冲突"),
+    ("world_rules", "关键世界规则"),
+    ("overall_tone", "整体气质"),
+    ("opening_hook", "开篇钩子"),
 ]
 
 
@@ -109,6 +117,21 @@ def _exploration_not_ready() -> ErrorEnvelope:
 
 
 
+def _initial_guidance_state() -> dict:
+    """自由探索导航状态的初始结构（2.8 AC1）：7 项主干全 `missing`、无当前问题、未就绪。
+
+    key 集合直接取 `_PRESET_CLUES`（与 `story_settle_agent._BACKBONE_FIELDS` 同一 7 项、
+    同一顺序，Task 1 已同步扩容对齐），本函数不反向 import `story_settle_agent`（避免
+    `story_settle_agent` 已 import `exploration_service` 造成循环 import）。
+    """
+    return {
+        "fields": {key: "missing" for key, _ in _PRESET_CLUES},
+        "current_field": None,
+        "current_question": None,
+        "ready_to_settle": False,
+    }
+
+
 async def enter_exploration(
     session: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> ExplorationSession:
@@ -122,6 +145,16 @@ async def enter_exploration(
     # 2. get：已有会话直接返回（AC1 幂等 / AC3 已存在会话 mode 不改写）。
     existing = await exploration_repo.get_session_by_project(session, user_id, project_id)
     if existing is not None:
+        # code review 修复：本 story 上线前已创建的存量 free 会话，其 guidance_state 由
+        # 迁移回填为 NULL（迁移 docstring 承诺"由 enter_exploration 幂等编排读到 None 时
+        # 按需初始化"，但原实现只在「新建会话」分支处理，本分支从未补上）。此处就地初始化
+        # 并落库，否则这批存量会话的 guidance_state 永久停留在 None——refresh_guidance
+        # 每轮只能临时返回内存态、trigger_free_settle 门禁永远判未就绪。仿新建会话分支
+        # 同款 commit + refresh（onupdate=func.now() 陷阱，同上）。
+        if existing.mode == "free" and existing.guidance_state is None:
+            existing.guidance_state = _initial_guidance_state()
+            await session.commit()
+            await session.refresh(existing)
         return existing
 
     # 3. create：mode 取自 project.mode（AC2，非客户端）。并发下第二插入撞唯一约束，
@@ -130,8 +163,10 @@ async def enter_exploration(
         created = await exploration_repo.create_session(
             session, user_id=user_id, project_id=project_id, mode=project.mode
         )
-        # 新建会话且 mode=free：同一事务内额外播种 4 个预设线索槙位（AC3）。已存在会话
-        # 走上面第 2 步直接 return，不会重复播种（幂等，同 AC1 既有精神）。
+        # 新建会话且 mode=free：同一事务内额外播种 7 个预设线索槙位（AC3，2.8 扩容）+
+        # 初始化 guidance_state（2.8 AC1）。已存在会话走上面第 2 步直接 return，不会
+        # 重复播种/初始化（幂等，同 AC1 既有精神）。guided 会话 guidance_state 恒留 NULL
+        # （列默认值，本分支不触及）。
         if project.mode == "free":
             await story_clue_repo.seed_preset_clues(
                 session,
@@ -140,7 +175,15 @@ async def enter_exploration(
                 session_id=created.id,
                 presets=_PRESET_CLUES,
             )
+            created.guidance_state = _initial_guidance_state()
         await session.commit()
+        if project.mode == "free":
+            # 陷阱（本 story 新增）：上面对 created.guidance_state 的属性赋值会在 flush/
+            # commit 时对该行发一次 UPDATE，onupdate=func.now() 令 updated_at 被标记为
+            # 「过期待重取」——commit 后同步访问（如 Pydantic model_validate 序列化）会
+            # 触发 MissingGreenlet。显式 refresh 回填，仿 story_clue_repo.update_clue/
+            # story_bible_repo.upsert_style_profile 同款处理。
+            await session.refresh(created)
         return created
     except IntegrityError:
         await session.rollback()
@@ -265,17 +308,20 @@ async def trigger_guided_settle(
 async def trigger_free_settle(
     session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> str:
-    """自由探索触发「整理为故事设定」ARQ 后台任务（2.7 AC3/AC4）。返回 taskId 供前端连 SSE。
+    """自由探索触发「整理为故事设定」ARQ 后台任务（2.7 AC3 + 2.8 AC8 门禁）。返回 taskId
+    供前端连 SSE。
 
-    结构照搬 `trigger_guided_settle`，仅两点差异：① mode 守卫要求 free；② **门禁硬校验**（AC4）
-    ——2.5 guided settle 不校验是否有答案（受控决策 C），本 story 因门禁是 user story 核心 benefit
-    （FR10「须补足信息才开放」）且延续 2.6「模式独立在数据写入层真正落地」先例，后端做实门禁。
+    结构照搬 `trigger_guided_settle`，仅两点差异：① mode 守卫要求 free；② **门禁硬校验**
+    ——**2.8 替换 2.7 的近似判据**：不再是「≥1 条 free 用户消息」，而是 7 项主干全部
+    `filled`/`skipped`（`guidance_state.ready_to_settle`）。门禁语义仍是「补足信息才开放」
+    （FR10）+ 延续 2.6「模式独立在数据写入层真正落地」先例，只是判据从近似升级为真实覆盖度。
 
     1. 租户守卫（陷阱①）：get_owned_project → None 抛 project_not_found 404（二义合一，NFR3）。
     2. mode 守卫（AC7）：project.mode 须为 free，否则 409 mode_mismatch。
-    3. **门禁硬校验（AC4）**：本会话须至少有 1 条 free 用户消息，否则 400 exploration_not_ready。
-       无会话（还没进探索）视为无消息、门禁不通过。门禁在入队前——不满足则不建 Redis 池、不登记
-       属主、不入队（越权/不存在先于门禁返 404，不泄露存在性）。
+    3. **门禁硬校验（2.8 AC8）**：本会话的 `guidance_state.ready_to_settle` 须为真，否则
+       400 exploration_not_ready（code 不变，前端错误映射零改动）。无会话/`guidance_state`
+       为 `None`（未初始化）视为未就绪、门禁不通过。门禁在入队前——不满足则不建 Redis 池、
+       不登记属主、不入队（越权/不存在先于门禁返 404，不泄露存在性）。
     4. task_id = uuid4 hex（不可枚举，陷阱⑤）。
     5. register_task_owner **必须在 enqueue_job 之前**（陷阱②）：否则 worker 可能在属主键写入前
        发首个事件、SSE 端点鉴权读不到属主而对合法属主误返 404。
@@ -284,8 +330,7 @@ async def trigger_free_settle(
        有效线索（非空 preset 槽 + custom）凝练成 12 字段候选卡（epics.md:715-717「接 2.5/2.7
        的 ARQ 任务」）。guided/free 凝练逻辑共享单任务（YAGNI，不拆两个任务体，受控决策 3）。
 
-    **不做**（受控决策 B/C）：不 check_quota（skeleton 无 LLM 调用、无成本，护栏随 3.3 落地）、
-    不生成设定卡（Epic 3）。
+    **不做**（受控决策 B/C）：不生成设定卡（Epic 3）。
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
@@ -293,15 +338,16 @@ async def trigger_free_settle(
     _require_project_mode(project, "free")
     _require_not_settled(project)
 
-    # 门禁硬校验（AC4）：无会话 → 无消息 → 门禁不通过；有会话则判是否有 free 用户消息。
+    # 门禁硬校验（2.8 AC8）：无会话/guidance_state 未初始化 → 未就绪；否则读
+    # ready_to_settle——7 项主干未全 filled/skipped 时为 False，即便远超 1 条消息也不放行
+    # （替换 2.7「≥1 条消息」近似判据，非「或」关系）。
     exploration_session = await exploration_repo.get_session_by_project(
         session, user_id, project_id
     )
-    if exploration_session is None or not await exploration_repo.has_free_user_message(
-        session,
-        user_id=user_id,
-        project_id=project_id,
-        session_id=exploration_session.id,
+    if (
+        exploration_session is None
+        or exploration_session.guidance_state is None
+        or not exploration_session.guidance_state.get("ready_to_settle")
     ):
         raise _exploration_not_ready()
 

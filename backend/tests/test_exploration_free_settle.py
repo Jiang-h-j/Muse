@@ -25,10 +25,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from muse.core import sse
+from muse.core.db import async_session_maker
 from muse.core.settings import get_settings
 from muse.main import app
 from muse.models.account import User
-from muse.services import exploration_service, free_explorer_agent
+from muse.providers.base import ChatResult
+from muse.repositories import exploration_repo
+from muse.services import exploration_service, free_explorer_agent, guidance_agent
 from tests.conftest import requires_db, requires_redis
 
 _client = TestClient(app, raise_server_exceptions=False)
@@ -67,10 +70,32 @@ async def _seed_free_user_message(user: User, project_id: str) -> None:
 
     fake_provider = AsyncMock()
     fake_provider.stream = _fake_stream
-    with patch.object(
-        free_explorer_agent,
-        "get_provider_for_user",
-        new=AsyncMock(return_value=fake_provider),
+    with (
+        patch.object(
+            free_explorer_agent,
+            "get_provider_for_user",
+            new=AsyncMock(return_value=fake_provider),
+        ),
+        # 2.8：stream_free_chat 成功落库后追加调用 guidance_agent.refresh_guidance，它是
+        # 独立 import 的同名函数引用，需单独 mock（否则真的会打外部 LLM）。空产出即可，
+        # refresh_guidance 内部对解析失败保留上一轮 guidance_state 不变。
+        patch.object(
+            guidance_agent,
+            "get_provider_for_user",
+            new=AsyncMock(
+                return_value=AsyncMock(
+                    chat=AsyncMock(
+                        return_value=ChatResult(
+                            content="",
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            model="deepseek-v4-flash",
+                        )
+                    )
+                )
+            ),
+        ),
     ):
         async for _ in free_explorer_agent.stream_free_chat(
             user_id=user.id,
@@ -90,6 +115,42 @@ def _cleanup_enqueued_job(task_id: str) -> None:
         client.zrem("arq:queue", task_id)
     finally:
         client.close()
+
+
+async def _force_ready_to_settle(user: User, project_id: str) -> None:
+    """直接把本会话的 `guidance_state.ready_to_settle` 置真（2.8 门禁前置）。
+
+    本文件聚焦触发端点契约（AC3/AC8），不是 `guidance_agent` 判定逻辑本身的测试场地
+    （那归 `test_guidance_agent.py`/`test_exploration_guidance.py`）——故绕过真实 LLM
+    判定链路，直调 repo 原语把 7 项主干强制推到 `filled`/`skipped`，只验证「就绪后能
+    正常触发」这一件事。
+    """
+    async with async_session_maker() as session:
+        exploration_session = await exploration_service.enter_exploration(
+            session, user.id, uuid.UUID(project_id)
+        )
+        ready_state = {
+            "fields": {
+                "genre": "filled",
+                "core_appeal": "filled",
+                "protagonist": "filled",
+                "main_conflict": "filled",
+                "world_rules": "filled",
+                "overall_tone": "filled",
+                "opening_hook": "filled",
+            },
+            "current_field": None,
+            "current_question": None,
+            "ready_to_settle": True,
+        }
+        await exploration_repo.update_guidance_state(
+            session,
+            user_id=user.id,
+            project_id=uuid.UUID(project_id),
+            session_id=exploration_session.id,
+            guidance_state=ready_state,
+        )
+        await session.commit()
 
 
 # ========== 离线：触发端点鉴权前置（无 token，不需容器）==========
@@ -153,6 +214,27 @@ def test_free_settle_no_session_blocked_400(
     spy_pool.assert_not_awaited()  # 未建 Redis 池 → 必然未入队（门禁 raise 早于建池）
 
 
+@requires_db
+@requires_redis
+async def test_free_settle_with_message_but_not_ready_still_blocked_400(
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    # 2.8 AC8 核心回归：2.7 旧判据「≥1 条消息」被本 story **替换**而非「或」关系——即便远
+    # 超 1 条消息，7 项主干未全部 filled/skipped 时（guidance_state 恒 missing 初始态，
+    # 本用例不驱动 refresh_guidance）仍应 400，不因消息存在而放行。
+    user = make_user("free-settle-notready@example.com")
+    headers = auth_headers(user)
+    project_id = _create_project(user, headers)
+    await _seed_free_user_message(user, project_id)
+
+    with patch.object(exploration_service, "create_pool", new=AsyncMock()) as spy_pool:
+        resp = _client.post(_settle_url(project_id), headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "exploration_not_ready"
+    spy_pool.assert_not_awaited()
+
+
 # ========== 门禁通过 → 正常触发（AC3）==========
 
 
@@ -162,11 +244,14 @@ async def test_free_settle_with_message_returns_task_id_and_registers_owner(
     make_user: Callable[..., User],
     auth_headers: Callable[[User], dict[str, str]],
 ) -> None:
-    # AC3：落 1 条 free 用户消息后 → POST /free/settle → 200 taskId（camelCase）+ Redis 登记属主。
+    # AC3/AC8（2.8 门禁替换）：7 项主干全 filled/skipped 后 → POST /free/settle → 200
+    # taskId（camelCase）+ Redis 登记属主。落 1 条消息不再足够（2.8 替换 2.7 近似判据），
+    # 故本用例额外强制 ready_to_settle=True（判定逻辑本身归 test_guidance_agent.py）。
     user = make_user("free-settle-ready@example.com")
     headers = auth_headers(user)
     project_id = _create_project(user, headers)
     await _seed_free_user_message(user, project_id)
+    await _force_ready_to_settle(user, project_id)
 
     resp = _client.post(_settle_url(project_id), headers=headers)
     assert resp.status_code == 200
