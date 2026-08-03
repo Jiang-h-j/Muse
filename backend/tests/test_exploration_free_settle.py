@@ -29,9 +29,8 @@ from muse.core.db import async_session_maker
 from muse.core.settings import get_settings
 from muse.main import app
 from muse.models.account import User
-from muse.providers.base import ChatResult
 from muse.repositories import exploration_repo
-from muse.services import exploration_service, free_explorer_agent, guidance_agent
+from muse.services import exploration_service, free_explorer_agent
 from tests.conftest import requires_db, requires_redis
 
 _client = TestClient(app, raise_server_exceptions=False)
@@ -70,32 +69,10 @@ async def _seed_free_user_message(user: User, project_id: str) -> None:
 
     fake_provider = AsyncMock()
     fake_provider.stream = _fake_stream
-    with (
-        patch.object(
-            free_explorer_agent,
-            "get_provider_for_user",
-            new=AsyncMock(return_value=fake_provider),
-        ),
-        # 2.8：stream_free_chat 成功落库后追加调用 guidance_agent.refresh_guidance，它是
-        # 独立 import 的同名函数引用，需单独 mock（否则真的会打外部 LLM）。空产出即可，
-        # refresh_guidance 内部对解析失败保留上一轮 guidance_state 不变。
-        patch.object(
-            guidance_agent,
-            "get_provider_for_user",
-            new=AsyncMock(
-                return_value=AsyncMock(
-                    chat=AsyncMock(
-                        return_value=ChatResult(
-                            content="",
-                            prompt_tokens=0,
-                            completion_tokens=0,
-                            total_tokens=0,
-                            model="deepseek-v4-flash",
-                        )
-                    )
-                )
-            ),
-        ),
+    with patch.object(
+        free_explorer_agent,
+        "get_provider_for_user",
+        new=AsyncMock(return_value=fake_provider),
     ):
         async for _ in free_explorer_agent.stream_free_chat(
             user_id=user.id,
@@ -140,7 +117,7 @@ async def _force_ready_to_settle(user: User, project_id: str) -> None:
                 "opening_hook": "filled",
             },
             "current_field": None,
-            "current_question": None,
+            "current_suggestions": [],
             "ready_to_settle": True,
         }
         await exploration_repo.update_guidance_state(

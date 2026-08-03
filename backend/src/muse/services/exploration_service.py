@@ -118,7 +118,10 @@ def _exploration_not_ready() -> ErrorEnvelope:
 
 
 def _initial_guidance_state() -> dict:
-    """自由探索导航状态的初始结构（2.8 AC1）：7 项主干全 `missing`、无当前问题、未就绪。
+    """自由探索导航状态的初始结构（2.8 AC1）：7 项主干全 `missing`、无当前追问字段、未就绪。
+
+    **2026-08-03 合并重构**：`current_question` 已移除（聊天记录本身是唯一的问题事实源，
+    不需要独立展示文本），改为 `current_suggestions`（候选回复列表，初始为空）。
 
     key 集合直接取 `_PRESET_CLUES`（与 `story_settle_agent._BACKBONE_FIELDS` 同一 7 项、
     同一顺序，Task 1 已同步扩容对齐），本函数不反向 import `story_settle_agent`（避免
@@ -127,7 +130,7 @@ def _initial_guidance_state() -> dict:
     return {
         "fields": {key: "missing" for key, _ in _PRESET_CLUES},
         "current_field": None,
-        "current_question": None,
+        "current_suggestions": [],
         "ready_to_settle": False,
     }
 

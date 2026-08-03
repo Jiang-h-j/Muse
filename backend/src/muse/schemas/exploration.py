@@ -162,9 +162,13 @@ class GuidanceStartRequest(CamelModel):
 
 
 class GuidanceStateResponse(CamelModel):
-    """自由探索导航状态响应（Story 2.8 AC1/AC2/AC3/AC6/AC7）：完成度 + 当前问题 + 就绪位。
+    """自由探索导航状态响应（Story 2.8 AC1/AC2/AC3/AC6/AC7）：完成度 + 当前追问字段 + 就绪位。
 
-    边界自动 camelCase：currentField/currentQuestion/readyToSettle。**`fields` 是例外**
+    **2026-08-03 合并重构**：`currentQuestion` 已移除——聊天记录本身是唯一的问题事实源，
+    不再有独立展示文本；改为 `currentSuggestions`（候选回复列表，随聊天回复同一次 LLM
+    调用生成，前端默认收起，点击「没想好？看看几个思路」才展开，不必再发请求）。
+
+    边界自动 camelCase：currentField/currentSuggestions/readyToSettle。**`fields` 是例外**
     ——`alias_generator=to_camel` 只作用于模型字段名，不转换 dict 值内部的 key（已用脚本
     验证 Pydantic 行为）。内部（`guidance_state.fields`）仍用 snake_case 存储（与
     `story_settle_agent._BACKBONE_FIELDS`/`story_bible` 列名一致，不打破项目既定的「内部
@@ -175,7 +179,7 @@ class GuidanceStateResponse(CamelModel):
 
     fields: dict[str, str]
     current_field: str | None
-    current_question: str | None
+    current_suggestions: list[str]
     ready_to_settle: bool
 
     @field_serializer("fields")
@@ -185,11 +189,4 @@ class GuidanceStateResponse(CamelModel):
     @field_serializer("current_field")
     def _camel_current_field(self, value: str | None) -> str | None:
         return to_camel(value) if value is not None else None
-
-
-class GuidanceSuggestionsResponse(CamelModel):
-    """按需回答思路响应（Story 2.8 AC4）：边界 camelCase：suggestions（无内部 key 转换需要
-    ——`list[str]` 是纯文本数组，非 dict）。"""
-
-    suggestions: list[str]
 

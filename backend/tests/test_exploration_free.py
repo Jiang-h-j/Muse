@@ -25,7 +25,7 @@ from sqlalchemy import Engine, text
 from muse.main import app
 from muse.models.account import User
 from muse.providers.base import ChatResult
-from muse.services import free_explorer_agent, guidance_agent
+from muse.services import free_explorer_agent
 from tests.conftest import requires_db
 
 _client = TestClient(app, raise_server_exceptions=False)
@@ -194,25 +194,10 @@ async def test_free_chat_persists_two_messages_with_strictly_increasing_created_
     fake_provider = AsyncMock()
     fake_provider.stream = _fake_stream
 
-    with (
-        patch.object(
-            free_explorer_agent,
-            "get_provider_for_user",
-            new=AsyncMock(return_value=fake_provider),
-        ),
-        # 2.8：stream_free_chat 成功落库后追加调用 guidance_agent.refresh_guidance，
-        # 它是独立 import 的同名函数引用，需单独 mock（否则真的会打外部 LLM）。用
-        # 空产出模拟判定失败态，refresh_guidance 内部保留上一轮 guidance_state 不变，
-        # 不影响本测试断言的对话持久化行为。
-        patch.object(
-            guidance_agent,
-            "get_provider_for_user",
-            new=AsyncMock(
-                return_value=AsyncMock(
-                    chat=AsyncMock(return_value=_fake_chat_result(""))
-                )
-            ),
-        ),
+    with patch.object(
+        free_explorer_agent,
+        "get_provider_for_user",
+        new=AsyncMock(return_value=fake_provider),
     ):
         deltas = [
             d

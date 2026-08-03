@@ -54,7 +54,8 @@ class ExplorationSession(Base, UUIDPKMixin, TimestampMixin):
     )
     # 探索模式：guided（引导）/ free（自由）。取自 project.mode，会话建后不可改写（AC2/AC3）。
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
-    # 自由探索设定导航状态（2.8 新增）：{fields:{7项主干key:missing/filled/skipped},
-    # current_field, current_question, ready_to_settle}。nullable、无 server_default——
-    # 只服务 free 模式，guided 会话恒 NULL；free 会话在 enter_exploration 首次创建时初始化。
+    # 自由探索设定导航状态（2.8 新增，2026-08-03 合并重构后字段调整）：{fields:{7项主干key:
+    # missing/filled/skipped}, current_field, current_suggestions（候选回复列表）,
+    # ready_to_settle}。nullable、无 server_default——只服务 free 模式，guided 会话恒
+    # NULL；free 会话在 enter_exploration 首次创建时初始化。
     guidance_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
