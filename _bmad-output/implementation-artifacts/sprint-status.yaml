@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-03 (Story 2.8 code review 通过并修复：review → done)
+last_updated: 2026-08-03 (Story 7.6 消费 2.8 完成，浏览器 UI 验证通过：in-progress → review)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -122,6 +122,6 @@ development_status:
   7-3-作品库接线列表-新建-重命名-删除-空失败态-继续创作跳转: done
   7-4-BYOK设置页-托管用量入口接线含UX-DR2新增UI: done
   7-5-引导探索接线SSE问答-翻页持久化-整理中过渡-设定卡弹出: done
-  7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: in-progress
+  7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: review
   7-7-设定卡-文风锚点接线12字段-编辑升版本-确认圣经-回到探索丢弃含UX-DR1新增UI: backlog
   epic-7-retrospective: optional

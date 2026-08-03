@@ -470,17 +470,27 @@ async function apiStream(path, { method = "POST", body, onEvent, signal, _retrie
 }
 
 // ---------------------------------------------------------------------
-// 探索 API 薄封装（Story 7.5）：引导探索会话/答案/自述理解/收尾整理。
-// 常规 CRUD（enter/listGuidedAnswers/saveGuidedAnswer/settleGuided）走 apiFetch
-// （默认 auth=true，token/401/error 由地基处理）；SSE（interpretGuided/taskEvents）走 apiStream。
-// 后端契约（backend/src/muse/routers/exploration.py + tasks.py，Story 2.2-2.5/3.3 已 done）：
+// 探索 API 薄封装（Story 7.5/7.6）：引导/自由探索的会话、对话、线索与收尾整理。
+// 常规 CRUD（enter/listGuidedAnswers/saveGuidedAnswer/settleGuided 及 free 线索/guidance 接口）走
+// apiFetch（默认 auth=true，token/401/error 由地基处理）；SSE（interpretGuided/sendFreeMessage/
+// taskEvents）走 apiStream。
+// 后端契约（backend/src/muse/routers/exploration.py + tasks.py，Story 2.2-2.5/2.8/3.3 已 done）：
 //   POST /api/projects/{id}/explore                  → 200 {id, projectId, mode, updatedAt}（get-or-create）
 //   POST /api/projects/{id}/explore/guided/interpret → SSE delta/done/error（body {question, freeText}）
 //   POST /api/projects/{id}/explore/guided/answers   → 200 单条（body {questionIndex, question, answer, answerType}，幂等 upsert）
 //   GET  /api/projects/{id}/explore/guided/answers   → 200 list（题位升序，空 []）
 //   POST /api/projects/{id}/explore/guided/settle    → 200 {taskId}
+//   POST /api/projects/{id}/explore/free/messages    → SSE delta/done/error（body {content}）
+//   GET  /api/projects/{id}/explore/free/messages    → 200 list（创建时间升序，空 []）
+//   GET/POST /api/projects/{id}/explore/free/clues   → 200 list / 201 单条
+//   PATCH/DELETE /api/projects/{id}/explore/free/clues/{clueId} → 200 单条 / 204
+//   POST /api/projects/{id}/explore/free/clues/refresh → 200 完整线索列表
+//   POST /api/projects/{id}/explore/free/settle      → 200 {taskId}
+//   GET  /api/projects/{id}/explore/free/guidance     → 200 {fields, currentField, currentQuestion, readyToSettle}
+//   POST /api/projects/{id}/explore/free/guidance/start → 200 同上（body {entry}，四入口幂等开场）
+//   POST /api/projects/{id}/explore/free/guidance/suggestions → 200 {suggestions}（只读 2-4 条，不落库）
+//   POST /api/projects/{id}/explore/free/guidance/skip → 200 同上（跳过当前问题，推进下一问/收束）
 //   GET  /api/tasks/{taskId}/events                  → SSE progress/result/error（settle 任务，2.1 底座）
-// 7.6 自由探索复用 apiStream（free/messages SSE）——本封装只做引导侧，自由侧留 7.6 追加。
 const explorationApi = {
   enter(projectId) {
     return apiFetch(`/api/projects/${projectId}/explore`, { method: "POST" });
@@ -507,6 +517,69 @@ const explorationApi = {
   },
   settleGuided(projectId) {
     return apiFetch(`/api/projects/${projectId}/explore/guided/settle`, {
+      method: "POST",
+    });
+  },
+  listFreeMessages(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/messages`);
+  },
+  sendFreeMessage(projectId, { content }, { onEvent, signal } = {}) {
+    return apiStream(`/api/projects/${projectId}/explore/free/messages`, {
+      method: "POST",
+      body: { content },
+      onEvent,
+      signal,
+    });
+  },
+  listClues(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/clues`);
+  },
+  createCustomClue(projectId, { label, value }) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/clues`, {
+      method: "POST",
+      body: { label, value },
+    });
+  },
+  editClue(projectId, clueId, { value, label }) {
+    const body = { value };
+    if (label !== undefined) body.label = label;
+    return apiFetch(`/api/projects/${projectId}/explore/free/clues/${clueId}`, {
+      method: "PATCH",
+      body,
+    });
+  },
+  deleteClue(projectId, clueId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/clues/${clueId}`, {
+      method: "DELETE",
+    });
+  },
+  refreshClues(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/clues/refresh`, {
+      method: "POST",
+    });
+  },
+  settleFree(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/settle`, {
+      method: "POST",
+    });
+  },
+  getGuidance(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/guidance`);
+  },
+  startGuidance(projectId, { entry }) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/guidance/start`, {
+      method: "POST",
+      body: { entry },
+    });
+  },
+  suggestGuidance(projectId) {
+    return apiFetch(
+      `/api/projects/${projectId}/explore/free/guidance/suggestions`,
+      { method: "POST" },
+    );
+  },
+  skipGuidance(projectId) {
+    return apiFetch(`/api/projects/${projectId}/explore/free/guidance/skip`, {
       method: "POST",
     });
   },

@@ -108,7 +108,6 @@ let freeConversation = startWithConversationPreview
 // explorationView：引导探索的翻页指针（“正在看第几题”），可前后翻不删答案。
 // 已答题数由 explorationHistory.length 决定，两者解耦以支持问卷式前后翻页。
 let explorationView = explorationHistory.length;
-let showInspirationDirections = false;
 // 引导探索答完最后一题后的“整理中”过渡态：遮住后台生成设定的等待，传递“它在认真理解我”的体感。
 let guidedSettling = false;
 // Story 7.5 引导探索接线态（替换纯 mock/sessionStorage）：
@@ -128,6 +127,30 @@ let settleAbortController = null;
 let interpretAbortController = null;
 // settleErrorText：settle SSE error 事件的可读提示（渲染在收尾态供重试）。
 let settleErrorText = "";
+// Story 7.6 自由探索接线态：与引导侧并列，所有数据以 API 返回为准。
+let freeClues = [];
+let freeLoadState = "loading";
+let freeLoadSeq = 0;
+let freeLoadError = null;
+let freeMessageSending = false;
+let freeMessageAbortController = null;
+let freeSettlePending = false;
+let freeSettleErrorText = "";
+let freeClueEditingIds = new Map();
+let freeClueFocusedIds = new Set();
+let deferredFreeClues = null;
+// Story 2.8 消费（Correct Course 替换旧版「给方向」+「≥1条消息」门禁）：自由探索导航状态，
+// 完成度/当前问题/就绪位恒以后端 GuidanceStateResponse 为准，前端不本地推断。
+let guidanceFields = {};
+let guidanceCurrentField = null;
+let guidanceCurrentQuestion = null;
+let guidanceReadyToSettle = false;
+// guidanceSuggestions：null=未请求过；[]=已请求但空（异常兜底）；非空=可点击选项列表。
+let guidanceSuggestions = null;
+let guidanceSuggestionsLoading = false;
+let guidanceSkipping = false;
+// guidanceStartingEntry：零对话四入口点击后在途的 entry key，用于禁用四个入口按钮防重复点击。
+let guidanceStartingEntry = null;
 let customStoryClues = [];
 const explorationModeKey = "muse-exploration-mode";
 const explorationEntryModeKey = "muse-exploration-entry-mode";
@@ -593,6 +616,12 @@ function explorationErrorText(err) {
     case "settle_empty":
       // 后端空态短路（story_settle_agent settle_empty 400）：材料不足以凝练，引导补充而非误报网络。
       return "聊到的内容还不够整理成设定，请回到上一题多补充一些再试。";
+    case "exploration_not_ready":
+      return "继续和 Agent 讨论，线索足够时就能整理为故事设定。";
+    case "clue_not_deletable":
+      return "预设线索不可删除。";
+    case "preset_label_immutable":
+      return "预设线索的名称不可修改。";
     case "already_settled":
       return "这部作品的设定已经确认，无法重新整理。";
     case "mode_mismatch":
@@ -613,22 +642,32 @@ function guidedAnswerFromBackend(row) {
   return { question: row.question, answer: row.answer };
 }
 
-// 统一清理引导页在途异步（review P2/P4）：abort 在途 interpret/settle 流、复位作答门禁、
-// 自增代次作废任何在途回调（loadGuidedExploration/submitGuidedCustom/startSettleFlow 的
-// seq 校验会据此丢弃过期回调，防砸页面/跨会话污染）。用于导航离开探索页与 logout。
-// 注意：只清「在途异步 + 门禁」，不动 pendingStoryProfile（那是待确认卡的持久展示态，
-// 导航离开时应保留以支持会话内恢复；logout 另行清 pending，见其调用点）。
-function teardownGuidedInflight() {
+// 统一清理探索页在途异步：所有流都必须在切页、换作品和登出时取消，避免旧项目/旧账号的
+// 回调污染当前 DOM。pendingStoryProfile 是会话内展示态，导航离开时保留；logout 另行清除。
+function teardownExplorationInflight() {
   if (interpretAbortController) {
     interpretAbortController.abort();
     interpretAbortController = null;
+  }
+  if (freeMessageAbortController) {
+    freeMessageAbortController.abort();
+    freeMessageAbortController = null;
   }
   if (settleAbortController) {
     settleAbortController.abort();
     settleAbortController = null;
   }
   guidedAnswerSaving = false;
+  freeMessageSending = false;
+  freeSettlePending = false;
+  // Story 2.8 导航状态的提交门禁（无 AbortController，均是常规 apiFetch）：teardown 后
+  // isCurrentFreeExploration 会因代次不匹配丢弃在途回调的状态写入，但 finally 里的门禁
+  // 复位同样会被挡住——须在此显式复位，否则重进该项目后按钮永久卡在 disabled。
+  guidanceStartingEntry = null;
+  guidanceSuggestionsLoading = false;
+  guidanceSkipping = false;
   guidedLoadSeq += 1;
+  freeLoadSeq += 1;
 }
 
 // 进引导探索页：建/取会话（2.2）+ 回填全部已答（2.4）。仿 7.3 loadProjects 异步范式
@@ -636,7 +675,7 @@ function teardownGuidedInflight() {
 function loadGuidedExploration(projectId) {
   // review R2 P2：进页先 abort 上一项目残留的在途 SSE（explore→explore 直接换项目时
   // render 的 !exploreMatch teardown 不触发，须在此清理，防旧流连接悬挂）。
-  teardownGuidedInflight();
+  teardownExplorationInflight();
   explorationProjectId = projectId;
   guidedLoadState = "loading";
   guidedLoadError = null;
@@ -671,6 +710,460 @@ function loadGuidedExploration(projectId) {
       renderExploration();
     }
   })();
+}
+
+function freeMessageFromBackend(row) {
+  return { role: row.role, text: row.content };
+}
+
+function isCurrentFreeExploration(projectId, seq, startedHash) {
+  return (
+    seq === freeLoadSeq &&
+    projectId === explorationProjectId &&
+    location.hash === startedHash &&
+    explorationEntryMode === "free"
+  );
+}
+
+function loadFreeExploration(projectId) {
+  teardownExplorationInflight();
+  explorationProjectId = projectId;
+  freeLoadState = "loading";
+  freeLoadError = null;
+  freeSettleErrorText = "";
+  const seq = ++freeLoadSeq;
+  const startedHash = location.hash;
+  renderExploration();
+  (async () => {
+    try {
+      await explorationApi.enter(projectId);
+      const [messages, clues, guidance] = await Promise.all([
+        explorationApi.listFreeMessages(projectId),
+        explorationApi.listClues(projectId),
+        explorationApi.getGuidance(projectId),
+      ]);
+      if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+      freeConversation = Array.isArray(messages)
+        ? messages.map(freeMessageFromBackend)
+        : [];
+      freeClues = Array.isArray(clues) ? clues : [];
+      applyGuidanceState(guidance);
+      freeLoadState = "ready";
+      renderExploration();
+    } catch (err) {
+      if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+      freeLoadError = err;
+      freeLoadState = "error";
+      renderExploration();
+    }
+  })();
+}
+
+// 把后端 GuidanceStateResponse（Story 2.8）写入前端导航态；currentField 变化即视为新一问，
+// 清空上一问的按需思路列表，避免展示与新问题不匹配的旧建议。
+function applyGuidanceState(state) {
+  const nextField = (state && state.currentField) || null;
+  if (nextField !== guidanceCurrentField) guidanceSuggestions = null;
+  guidanceFields = (state && state.fields) || {};
+  guidanceCurrentField = nextField;
+  guidanceCurrentQuestion = (state && state.currentQuestion) || null;
+  guidanceReadyToSettle = Boolean(state && state.readyToSettle);
+}
+
+function replaceFreeClue(updated) {
+  const index = freeClues.findIndex((clue) => clue.id === updated.id);
+  if (index === -1) freeClues.push(updated);
+  else freeClues[index] = updated;
+}
+
+function replaceFreeClues(clues) {
+  const next = Array.isArray(clues) ? clues : [];
+  if (freeClueFocusedIds.size) {
+    deferredFreeClues = next;
+    return;
+  }
+  freeClues = next;
+}
+
+function applyDeferredFreeClues() {
+  if (!deferredFreeClues || freeClueFocusedIds.size) return false;
+  freeClues = deferredFreeClues;
+  deferredFreeClues = null;
+  return true;
+}
+
+function freePresetClue(clue) {
+  const value = clue.value || "";
+  const empty = !value;
+  return `
+    <div class="story-clue">
+      <span>${escapeHtml(clue.label)}</span>
+      <div class="story-clue-value${empty ? " is-empty" : ""}" contenteditable="true" role="textbox" aria-label="编辑${escapeHtml(clue.label)}" data-placeholder="尚未确定" data-free-clue-id="${escapeHtml(clue.id)}" data-free-clue-value="${escapeHtml(value)}">${escapeHtml(value || "尚未确定")}</div>
+    </div>`;
+}
+
+function freeCustomClue(clue, index) {
+  const id = clue.id ? escapeHtml(clue.id) : "";
+  return `
+    <div class="story-clue custom-story-clue" data-free-custom-index="${index}">
+      <div class="custom-clue-head">
+        <input value="${escapeHtml(clue.label || "")}" placeholder="设定名称" aria-label="自定义设定名称" data-free-custom-label="${index}" data-free-clue-id="${id}" />
+        <button type="button" data-remove-free-custom-clue="${index}" aria-label="删除这项自定义设定">×</button>
+      </div>
+      <input class="custom-clue-value-input" value="${escapeHtml(clue.value || "")}" placeholder="描述这项设定……" aria-label="自定义设定描述" data-free-custom-value="${index}" data-free-clue-id="${id}" />
+    </div>`;
+}
+
+function freeCustomDraftClue(draft, index) {
+  const disabled = draft.creating ? "disabled" : "";
+  return `
+    <div class="story-clue custom-story-clue" data-free-draft-index="${index}">
+      <div class="custom-clue-head">
+        <input value="${escapeHtml(draft.label || "")}" placeholder="设定名称" aria-label="自定义设定名称" data-free-draft-label="${index}" ${disabled} />
+        <button type="button" data-remove-free-draft="${index}" aria-label="删除这项自定义设定" ${disabled}>×</button>
+      </div>
+      <input class="custom-clue-value-input" value="${escapeHtml(draft.value || "")}" placeholder="描述这项设定……" aria-label="自定义设定描述" data-free-draft-value="${index}" ${disabled} />
+    </div>`;
+}
+
+function freeErrorMarkup() {
+  return freeSettleErrorText
+    ? `<p class="guided-error" role="alert">${escapeHtml(freeSettleErrorText)}</p>`
+    : "";
+}
+
+function showFreeInlineError(text) {
+  const dialogue = document.querySelector(".explore-dialogue");
+  if (!dialogue) return;
+  let bar = dialogue.querySelector("[data-free-error]");
+  if (!bar) {
+    bar = document.createElement("p");
+    bar.className = "guided-error";
+    bar.setAttribute("data-free-error", "");
+    bar.setAttribute("role", "alert");
+    dialogue.prepend(bar);
+  }
+  bar.textContent = text;
+}
+
+async function syncFreeMessages(projectId, seq, startedHash) {
+  const messages = await explorationApi.listFreeMessages(projectId);
+  if (!isCurrentFreeExploration(projectId, seq, startedHash)) return false;
+  freeConversation = Array.isArray(messages)
+    ? messages.map(freeMessageFromBackend)
+    : [];
+  return true;
+}
+
+async function refreshFreeClues(projectId, seq, startedHash) {
+  const clues = await explorationApi.refreshClues(projectId);
+  if (!isCurrentFreeExploration(projectId, seq, startedHash)) return false;
+  replaceFreeClues(clues);
+  return true;
+}
+
+async function refreshGuidance(projectId, seq, startedHash) {
+  const state = await explorationApi.getGuidance(projectId);
+  if (!isCurrentFreeExploration(projectId, seq, startedHash)) return false;
+  applyGuidanceState(state);
+  return true;
+}
+
+// 零对话四入口（AC2/AC3）：点击后调 2.8 的开场问题生成能力，得到导航状态后转入常规
+// 「当前具体问题 + 输入框」态。不调用 submitFreeMessage，本操作不产生对话消息。
+async function startFreeGuidanceEntry(entry) {
+  if (
+    guidanceStartingEntry ||
+    freeMessageSending ||
+    !explorationProjectId ||
+    !entry
+  )
+    return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  guidanceStartingEntry = entry;
+  renderExploration();
+  try {
+    const state = await explorationApi.startGuidance(projectId, { entry });
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    applyGuidanceState(state);
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    showFreeInlineError(explorationErrorText(err));
+  } finally {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    guidanceStartingEntry = null;
+    renderExploration();
+  }
+}
+
+// 按需回答思路（AC4）：仅点击时请求，不随每轮自动生成。无当前问题时后端 400
+// no_current_question——按中性提示处理，不视为异常错误态。
+async function requestGuidanceSuggestions() {
+  if (
+    guidanceSuggestionsLoading ||
+    freeMessageSending ||
+    !explorationProjectId ||
+    !guidanceCurrentQuestion
+  )
+    return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  guidanceSuggestionsLoading = true;
+  renderExploration();
+  try {
+    const { suggestions } = await explorationApi.suggestGuidance(projectId);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    guidanceSuggestions = Array.isArray(suggestions) ? suggestions : [];
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    if (err && err.code === "no_current_question") {
+      guidanceSuggestions = [];
+    } else {
+      showFreeInlineError(explorationErrorText(err));
+    }
+  } finally {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    guidanceSuggestionsLoading = false;
+    renderExploration();
+  }
+}
+
+// 跳过当前问题（AC4）：标记该字段 skipped，原地刷新导航状态（可能是下一问，也可能是收束
+// 态）。不调用 submitFreeMessage、不新增对话消息。
+async function skipFreeGuidanceQuestion() {
+  if (
+    guidanceSkipping ||
+    freeMessageSending ||
+    !explorationProjectId ||
+    !guidanceCurrentQuestion
+  )
+    return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  guidanceSkipping = true;
+  renderExploration();
+  try {
+    const state = await explorationApi.skipGuidance(projectId);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    applyGuidanceState(state);
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    if (err && err.code !== "no_current_question") {
+      showFreeInlineError(explorationErrorText(err));
+    }
+  } finally {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    guidanceSkipping = false;
+    renderExploration();
+  }
+}
+
+async function submitFreeMessage(content) {
+  const text = String(content || "").trim();
+  if (!text || freeMessageSending || !explorationProjectId) return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  freeMessageSending = true;
+  freeSettleErrorText = "";
+  freeConversation = [...freeConversation, { role: "user", text }];
+  freeMessageAbortController = new AbortController();
+  const signal = freeMessageAbortController.signal;
+  let gotTerminal = false;
+  let streamError = null;
+  let agentText = "";
+  let keepEditingDom = false;
+  renderExploration();
+  try {
+    await explorationApi.sendFreeMessage(
+      projectId,
+      { content: text },
+      {
+        signal,
+        onEvent: (type, data) => {
+          if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted)
+            return;
+          if (type === "delta" && data && typeof data.text === "string") {
+            agentText += data.text;
+            const last = freeConversation[freeConversation.length - 1];
+            if (last && last.role === "agent" && last.pending) last.text = agentText;
+            else freeConversation = [...freeConversation, { role: "agent", text: agentText, pending: true }];
+            if (!freeClueFocusedIds.size) renderExploration();
+          } else if (type === "done" && data && typeof data.text === "string") {
+            gotTerminal = true;
+          } else if (type === "error") {
+            gotTerminal = true;
+            streamError = { code: data && data.code, message: data && data.message };
+          }
+        },
+      },
+    );
+    if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted) return;
+    if (!gotTerminal) streamError = { code: "generate_failed" };
+    if (!streamError) {
+      const messagesSynced = await syncFreeMessages(projectId, seq, startedHash);
+      if (!messagesSynced) return;
+      const cluesRefreshed = await refreshFreeClues(projectId, seq, startedHash);
+      if (!cluesRefreshed) return;
+      // AC3 第 3 步：后端 stream_free_chat 已在落库后同步调用 guidance_agent.refresh_guidance，
+      // 此处重新 GET 一次即可拿到本轮判定后的当前具体问题/完成度/就绪位。失败不影响本轮已
+      // 成功的对话与线索（同后端「主链路成功、副作用降级」的容忍粒度），静默保留旧导航态。
+      await refreshGuidance(projectId, seq, startedHash).catch(() => false);
+      keepEditingDom = freeClueFocusedIds.size > 0;
+    } else {
+      await syncFreeMessages(projectId, seq, startedHash).catch(() => false);
+    }
+  } catch (err) {
+    if (signal.aborted || !isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    streamError = err;
+    await syncFreeMessages(projectId, seq, startedHash).catch(() => false);
+  } finally {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted) return;
+    freeMessageSending = false;
+    freeMessageAbortController = null;
+    if (!keepEditingDom) renderExploration();
+    if (streamError) showFreeInlineError(explorationErrorText(streamError));
+  }
+}
+
+async function updateFreeClue(clueId, value, label) {
+  if (!clueId) return;
+  const pending = freeClueEditingIds.get(clueId);
+  if (pending) {
+    pending.value = value;
+    pending.label = label;
+    pending.revision += 1;
+    return;
+  }
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  const request = { value, label, revision: 0 };
+  freeClueEditingIds.set(clueId, request);
+  try {
+    while (true) {
+      const revision = request.revision;
+      const body = { value: String(request.value || ""), label: request.label };
+      const updated = await explorationApi.editClue(projectId, clueId, body);
+      if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+      replaceFreeClue(updated);
+      if (request.revision === revision) {
+        renderExploration();
+        return;
+      }
+    }
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    renderExploration();
+    showFreeInlineError(explorationErrorText(err));
+  } finally {
+    freeClueEditingIds.delete(clueId);
+  }
+}
+
+async function createFreeCustomClue(draft) {
+  const label = String(draft.label || "").trim();
+  if (!label || draft.creating) return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  const submittedValue = String(draft.value || "");
+  const submittedLabel = label;
+  draft.creating = true;
+  try {
+    const created = await explorationApi.createCustomClue(projectId, {
+      label: submittedLabel,
+      value: submittedValue,
+    });
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    const index = customStoryClues.indexOf(draft);
+    if (index !== -1) customStoryClues.splice(index, 1);
+    replaceFreeClue(created);
+    renderExploration();
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    draft.creating = false;
+    renderExploration();
+    showFreeInlineError(explorationErrorText(err));
+  }
+}
+
+async function deleteFreeCustomClue(clueId) {
+  if (!clueId) return;
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  try {
+    await explorationApi.deleteClue(projectId, clueId);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    freeClues = freeClues.filter((clue) => clue.id !== clueId);
+    renderExploration();
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash)) return;
+    showFreeInlineError(explorationErrorText(err));
+  }
+}
+
+async function startFreeSettleFlow() {
+  if (freeSettlePending || !explorationProjectId) return;
+  if (settleAbortController) settleAbortController.abort();
+  const projectId = explorationProjectId;
+  const seq = freeLoadSeq;
+  const startedHash = location.hash;
+  freeSettlePending = true;
+  freeSettleErrorText = "";
+  settleAbortController = new AbortController();
+  const signal = settleAbortController.signal;
+  let gotTerminal = false;
+  renderExploration();
+  try {
+    const { taskId } = await explorationApi.settleFree(projectId);
+    if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted) return;
+    await explorationApi.taskEvents(taskId, {
+      signal,
+      onEvent: (type, data) => {
+        if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted)
+          return;
+        if (type === "result" && data && data.profile) {
+          gotTerminal = true;
+          freeSettlePending = false;
+          settleAbortController = null;
+          openStoryProfileFromBackend(data.profile);
+        } else if (type === "error") {
+          gotTerminal = true;
+          freeSettlePending = false;
+          settleAbortController = null;
+          freeSettleErrorText = explorationErrorText({ code: data && data.code });
+          renderExploration();
+        }
+      },
+    });
+    if (
+      isCurrentFreeExploration(projectId, seq, startedHash) &&
+      !signal.aborted &&
+      !gotTerminal
+    ) {
+      freeSettleErrorText = explorationErrorText({ code: "settle_failed" });
+    }
+  } catch (err) {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted)
+      return;
+    if (err && err.code === "exploration_not_ready") {
+      await syncFreeMessages(projectId, seq, startedHash).catch(() => false);
+    }
+    freeSettleErrorText = explorationErrorText(err);
+  } finally {
+    if (!isCurrentFreeExploration(projectId, seq, startedHash) || signal.aborted)
+      return;
+    if (gotTerminal) return;
+    freeSettlePending = false;
+    settleAbortController = null;
+    renderExploration();
+  }
 }
 
 // 落库一条引导答案（选项 / 自述凝练结果通用）。幂等 upsert：同 questionIndex 覆盖。
@@ -1118,7 +1611,6 @@ function confirmStoryProfileAndEnterChapter() {
   window.sessionStorage.removeItem(explorationModeKey);
   pendingStoryProfile = false;
   clearPendingStoryProfile();
-  showInspirationDirections = false;
   // 确保第一章从头开始渲染
   chapterCreationState = "input";
   chapterIdea = "";
@@ -1447,70 +1939,131 @@ function renderExploration() {
         ${toolbar ? `<div class="guided-footer-nav">${toolbar}</div>` : ""}
       </section>`;
     } // 结束 guidedLoadState ready 分支（Story 7.5）
+  } else if (freeLoadState === "loading") {
+    mainContent = `
+      <section class="explore-dialogue" aria-labelledby="explore-title">
+        <h1 id="explore-title" class="visually-hidden">自由探索</h1>
+        <div class="guided-stage"><div class="guided-current" role="status" aria-live="polite"><span class="guided-settling-spinner" aria-hidden="true"></span><p class="guided-question">正在准备你的自由探索……</p></div></div>
+      </section>`;
+  } else if (freeLoadState === "error") {
+    mainContent = `
+      <section class="explore-dialogue" aria-labelledby="explore-title">
+        <h1 id="explore-title" class="visually-hidden">自由探索</h1>
+        <div class="guided-stage"><div class="guided-current"><p class="guided-question">没能载入自由探索</p><p class="guided-complete-hint">${escapeHtml(explorationErrorText(freeLoadError))}</p></div><div class="guided-complete-actions"><button class="primary-button" type="button" data-free-reload>重新加载 <span>→</span></button></div></div>
+      </section>`;
   } else {
-    // 自由探索：完全保持原有界面与右侧故事线索侧边栏（本次改动不触碰）。
-    const canFinish = freeConversation.some((entry) => entry.role === "user");
+    const hasConversation = freeConversation.length > 0;
+    // 零对话起点（AC2）：无对话且导航状态尚无 currentQuestion 时展示四个固定入口；
+    // 点击 startGuidance 生成开场问题后即使仍无对话消息，也按「已开始」渲染当前问题 + 常规输入框
+    // （幂等重放/刷新恢复见 loadFreeExploration→applyGuidanceState）。
+    const showEntryPoints = !hasConversation && !guidanceCurrentQuestion;
+    const missingFieldCount = Object.values(guidanceFields).filter(
+      (status) => status === "missing",
+    ).length;
+    const canFinish = !freeMessageSending && guidanceReadyToSettle;
     const formingHint = canFinish
-      ? "故事线索已经足够，可以整理成一份故事设定。"
-      : "继续和 Agent 讨论，线索足够时就能整理为故事设定。";
+      ? "7 项设定主干已经齐备，可以整理成一份故事设定。"
+      : missingFieldCount > 0
+        ? `还差 ${missingFieldCount} 项设定主干，继续和 Agent 讨论就能整理为故事设定。`
+        : "继续和 Agent 讨论，线索足够时就能整理为故事设定。";
+    const presetClues = freeClues
+      .filter((clue) => clue.kind === "preset")
+      .sort((a, b) => a.displayOrder - b.displayOrder)
+      .map(freePresetClue)
+      .join("");
+    const customClues = freeClues
+      .filter((clue) => clue.kind === "custom")
+      .map(freeCustomClue)
+      .join("");
+    const customDrafts = customStoryClues.map(freeCustomDraftClue).join("");
     storyForming = `
     <aside class="story-forming" aria-labelledby="story-forming-title">
       <div class="story-forming-head"><div><span>Living notes / draft</span><h2 id="story-forming-title">美好的故事即将展开</h2></div><strong>01</strong></div>
       <p class="story-forming-intro">Agent 会根据对话整理线索。这里的内容由你决定，也可以直接修改。</p>
       <div class="story-clues">
-        ${storyClue("最初的念头", explorationHistory[0]?.answer || "")}
-        ${storyClue("主角", explorationHistory[1]?.answer || "")}
-        ${storyClue("核心冲突", explorationHistory[2]?.answer || "")}
-        ${storyClue("世界与氛围", explorationHistory[4]?.answer || "")}
-        ${customStoryClues.map(customStoryClue).join("")}
-        <button class="add-story-clue" type="button" data-add-custom-clue><span>＋</span> 添加自定义设定</button>
+        ${presetClues}
+        ${customClues}
+        ${customDrafts}
+        <button class="add-story-clue" type="button" data-add-free-custom-clue><span>＋</span> 添加自定义设定</button>
       </div>
       <div class="forming-footer">
-        <p>${formingHint}</p>
-        <button class="finish-exploration" type="button" ${canFinish ? "" : "disabled"}>整理为故事设定 <span>→</span></button>
+        ${freeErrorMarkup()}
+        <p>${freeSettlePending ? "正在整理你的故事线索……" : formingHint}</p>
+        <button class="finish-exploration" type="button" ${canFinish && !freeSettlePending ? "" : "disabled"}>整理为故事设定 <span>→</span></button>
       </div>
     </aside>`;
-    // 自由探索：进入即为自由讨论状态，沿用连续对话记录界面。
     const freeMessages = freeConversation
       .map(
-        (
-          entry,
-        ) => `<article class="conversation-message ${entry.role === "agent" ? "agent-message" : "user-message"}">
+        (entry) => `<article class="conversation-message ${entry.role === "agent" ? "agent-message" : "user-message"}">
           <div class="message-meta"><span>${entry.role === "agent" ? "Agent / 自由讨论" : "你"}</span></div>
-          <p>${entry.text}</p>
+          <p>${escapeHtml(entry.text)}</p>
         </article>`,
       )
       .join("");
-    const freeOpening = `<article class="conversation-message agent-message">
-      <div class="message-meta"><span>Agent / 自由讨论</span></div>
-      <p>想到什么都可以先说出来。我们边聊边把人物、冲突和世界一点点理清楚。</p>
-    </article>`;
-    const inspirationOptions = [
-      ["讨论人物", "我想让主角的性格更矛盾一些。"],
-      ["讨论冲突", "这个核心冲突还能怎样变得更尖锐？"],
-      ["讨论世界", "这个世界里还有哪些值得展开的规则？"],
+    // 四个产品固定入口（AC2，不得渲染成/命名为 AI 建议）：entry key 对齐后端
+    // GuidanceStartRequest.entry 的 Literal 取值。
+    const entryPoints = [
+      ["story_idea", "故事想法"],
+      ["protagonist", "主角"],
+      ["conflict", "核心冲突"],
+      ["world", "世界与氛围"],
     ];
+    const entryPointsBlock = showEntryPoints
+      ? `<div class="guidance-entry-points" role="group" aria-label="你想从哪里开始？">
+          ${entryPoints
+            .map(
+              ([entry, label]) =>
+                `<button type="button" class="guidance-entry-button" data-guidance-entry="${entry}" ${guidanceStartingEntry ? "disabled" : ""}>${label}</button>`,
+            )
+            .join("")}
+        </div>`
+      : "";
+    // 当前具体问题区（AC3/AC4/AC7）：只在导航状态给出 currentQuestion 时展示；按需思路与
+    // 跳过是这一区域的两个入口，绑定见 bindExplorationInteractions（Task 10）。
+    const suggestionsBlock = guidanceSuggestionsLoading
+      ? `<p class="guidance-suggestions-loading">正在想几个思路……</p>`
+      : guidanceSuggestions === null
+        ? ""
+        : guidanceSuggestions.length
+          ? `<div class="guidance-suggestions" role="group" aria-label="回答思路">${guidanceSuggestions
+              .map(
+                (text, index) =>
+                  `<button type="button" class="guidance-suggestion-option" data-guidance-suggestion="${index}" ${freeMessageSending ? "disabled" : ""}>${escapeHtml(text)}</button>`,
+              )
+              .join("")}</div>`
+          : `<p class="guidance-suggestions-empty">暂时没想到合适的思路，直接说说你的想法也可以。</p>`;
+    const currentQuestionBlock = guidanceCurrentQuestion
+      ? `<div class="guidance-current-question" role="status" aria-live="polite">
+          <p class="guidance-question-text">${escapeHtml(guidanceCurrentQuestion)}</p>
+          <div class="guidance-question-actions">
+            <button type="button" class="guidance-suggest-toggle" data-guidance-suggest ${guidanceSuggestionsLoading || freeMessageSending ? "disabled" : ""}>没想好？看看几个思路</button>
+            <button type="button" class="guidance-skip" data-guidance-skip ${guidanceSkipping || freeMessageSending ? "disabled" : ""}>先跳过这个问题</button>
+          </div>
+          ${suggestionsBlock}
+        </div>`
+      : hasConversation && canFinish
+        ? `<div class="guidance-current-question is-complete" role="status" aria-live="polite"><p class="guidance-question-text">7 项设定主干都聊得差不多了，可以在右侧整理为故事设定了。</p></div>`
+        : "";
     mainContent = `
       <section class="explore-dialogue" aria-labelledby="explore-title">
         <div class="explore-overline">Free exploration / 自由探索</div>
         <div class="explore-heading"><h1 id="explore-title">把故事聊出来</h1><span>自由探索</span></div>
         <section class="exploration-conversation" aria-label="自由讨论">
-          <div class="conversation-scroll" data-conversation-scroll>
-            ${freeOpening}
-            ${freeMessages}
-          </div>
+          <div class="conversation-scroll" data-conversation-scroll>${freeMessages || '<p class="guided-complete-hint">想到什么都可以先说出来。我们边聊边把人物、冲突和世界一点点理清楚。</p>'}</div>
         </section>
-        <form class="explore-response compact-composer" id="explore-response" data-free-mode="true">
+        ${entryPointsBlock}
+        ${currentQuestionBlock}
+        ${
+          showEntryPoints
+            ? ""
+            : `<form class="explore-response compact-composer" id="explore-response" data-free-mode="true">
           <label for="explore-answer">继续讨论</label>
-          <textarea id="explore-answer" placeholder="继续回答，或者和 Agent 讨论其他故事想法……" required></textarea>
-          <div class="inspiration-list" ${showInspirationDirections ? "" : "hidden"}>
-            ${inspirationOptions.map(([label, value]) => `<button type="button" data-direction="${value}">${label}</button>`).join("")}
-          </div>
+          <textarea id="explore-answer" placeholder="继续回答，或者和 Agent 讨论其他故事想法……" required ${freeMessageSending ? "disabled" : ""}></textarea>
           <div class="response-actions">
-            <label class="inspiration-toggle"><span>给我一些讨论方向</span><input type="checkbox" data-inspiration aria-label="显示灵感方向" ${showInspirationDirections ? "checked" : ""} /><i aria-hidden="true"></i></label>
-            <button class="primary-button explore-submit" type="submit">发送 <span>→</span></button>
+            <button class="primary-button explore-submit" type="submit" ${freeMessageSending ? "disabled" : ""}>${freeMessageSending ? "正在回复…" : "发送"} <span>→</span></button>
           </div>
-        </form>
+        </form>`
+        }
       </section>`;
   }
 
@@ -1590,85 +2143,124 @@ function bindExplorationInteractions() {
       if (explorationProjectId) loadGuidedExploration(explorationProjectId);
     });
 
-  // —— 自由探索：以下逻辑保持原样 ——
+  // —— 自由探索：真实 SSE 对话、线索 CRUD 与整理门禁 ——
+  document
+    .querySelector("[data-free-reload]")
+    ?.addEventListener("click", () => {
+      if (explorationProjectId) loadFreeExploration(explorationProjectId);
+    });
   document
     .querySelector(".finish-exploration:not(:disabled)")
-    ?.addEventListener("click", () => openStoryProfileDialog());
+    ?.addEventListener("click", () => startFreeSettleFlow());
   document
-    .querySelector("[data-add-custom-clue]")
+    .querySelector("[data-add-free-custom-clue]")
     ?.addEventListener("click", () => {
       customStoryClues.push({ label: "", value: "" });
       renderExploration();
       document
-        .querySelector(
-          `[data-custom-clue-label="${customStoryClues.length - 1}"]`,
-        )
+        .querySelector(`[data-free-draft-label="${customStoryClues.length - 1}"]`)
         ?.focus();
     });
-  document.querySelectorAll("[data-remove-custom-clue]").forEach((button) => {
+  document.querySelectorAll("[data-remove-free-draft]").forEach((button) => {
     button.addEventListener("click", () => {
-      customStoryClues.splice(Number(button.dataset.removeCustomClue), 1);
+      customStoryClues.splice(Number(button.dataset.removeFreeDraft), 1);
       renderExploration();
     });
   });
-  document.querySelectorAll("[data-custom-clue-label]").forEach((input) => {
-    input.addEventListener("input", () => {
-      customStoryClues[Number(input.dataset.customClueLabel)].label =
-        input.value;
+  document.querySelectorAll("[data-free-draft-label]").forEach((input) => {
+    const focusKey = `draft-${input.dataset.freeDraftLabel}`;
+    input.addEventListener("focus", () => freeClueFocusedIds.add(focusKey));
+    input.addEventListener("input", (event) => {
+      customStoryClues[Number(event.currentTarget.dataset.freeDraftLabel)].label =
+        event.currentTarget.value;
+    });
+    input.addEventListener("blur", (event) => {
+      const index = Number(event.currentTarget.dataset.freeDraftLabel);
+      freeClueFocusedIds.delete(`draft-${index}`);
+      if (applyDeferredFreeClues()) renderExploration();
+      const draft = customStoryClues[index];
+      if (!draft) return;
+      const label = event.currentTarget.value.trim();
+      if (!label || draft.creating) return;
+      createFreeCustomClue(draft);
     });
   });
-  document.querySelectorAll("[data-custom-clue-value]").forEach((input) => {
-    input.addEventListener("input", () => {
-      customStoryClues[Number(input.dataset.customClueValue)].value =
-        input.value;
+  document.querySelectorAll("[data-free-draft-value]").forEach((input) => {
+    input.addEventListener("input", (event) => {
+      customStoryClues[Number(event.currentTarget.dataset.freeDraftValue)].value =
+        event.currentTarget.value;
     });
   });
-  document
-    .querySelector("[data-inspiration]")
-    ?.addEventListener("change", (event) => {
-      const list = document.querySelector(".inspiration-list");
-      showInspirationDirections = event.currentTarget.checked;
-      list.hidden = !event.currentTarget.checked;
+  document.querySelectorAll("[data-remove-free-custom-clue]").forEach((button) => {
+    button.addEventListener("click", () =>
+      deleteFreeCustomClue(button.closest("[data-free-custom-index]")?.querySelector("[data-free-clue-id]")?.dataset.freeClueId),
+    );
+  });
+  document.querySelectorAll("[data-free-custom-label]").forEach((input) => {
+    input.addEventListener("blur", (event) => {
+      const clueId = event.currentTarget.dataset.freeClueId;
+      const value = event.currentTarget
+        .closest("[data-free-custom-index]")
+        ?.querySelector("[data-free-custom-value]")?.value;
+      updateFreeClue(clueId, value || "", event.currentTarget.value.trim());
     });
-  document.querySelectorAll("[data-direction]").forEach((button) =>
-    button.addEventListener("click", () => {
-      const answer = document.querySelector("#explore-answer");
-      answer.value = button.dataset.direction;
-      answer.focus();
-    }),
-  );
-  document
-    .querySelector("#explore-response")
-    ?.addEventListener("submit", (event) => {
-      // 该表单仅存在于自由探索模式（引导模式已改为选项式，不再渲染此表单）。
-      event.preventDefault();
-      const answer = event.currentTarget
-        .querySelector("#explore-answer")
-        .value.trim();
-      if (!answer) return;
-      freeConversation.push(
-        { role: "user", text: answer },
-        {
-          role: "agent",
-          text: "这个方向值得继续展开。我先把它保留在讨论里，不会替你直接改动设定。你更希望下一步把它落实到人物、冲突，还是世界规则中？",
-        },
-      );
-      renderExploration();
+  });
+  document.querySelectorAll("[data-free-custom-value]").forEach((input) => {
+    input.addEventListener("blur", (event) => {
+      const clueId = event.currentTarget.dataset.freeClueId;
+      const label = event.currentTarget
+        .closest("[data-free-custom-index]")
+        ?.querySelector("[data-free-custom-label]")?.value;
+      updateFreeClue(clueId, event.currentTarget.value, label || undefined);
     });
-  document.querySelectorAll(".story-clue-value").forEach((field) => {
+  });
+  document.querySelectorAll("[data-free-clue-id][contenteditable]").forEach((field) => {
     field.addEventListener("focus", () => {
+      freeClueFocusedIds.add(field.dataset.freeClueId);
       if (field.classList.contains("is-empty")) {
         field.textContent = "";
         field.classList.remove("is-empty");
       }
     });
     field.addEventListener("blur", () => {
-      if (!field.textContent.trim()) {
+      const clueId = field.dataset.freeClueId;
+      const value = field.textContent.trim();
+      if (value !== field.dataset.freeClueValue) {
+        updateFreeClue(clueId, value);
+      }
+      freeClueFocusedIds.delete(clueId);
+      if (applyDeferredFreeClues()) renderExploration();
+      if (!value) {
         field.textContent = field.dataset.placeholder;
         field.classList.add("is-empty");
       }
     });
   });
+  document.querySelectorAll("[data-guidance-entry]").forEach((button) =>
+    button.addEventListener("click", () =>
+      startFreeGuidanceEntry(button.dataset.guidanceEntry),
+    ),
+  );
+  document
+    .querySelector("[data-guidance-suggest]")
+    ?.addEventListener("click", () => requestGuidanceSuggestions());
+  document.querySelectorAll("[data-guidance-suggestion]").forEach((button) =>
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.guidanceSuggestion);
+      const text = guidanceSuggestions && guidanceSuggestions[index];
+      if (text) submitFreeMessage(text);
+    }),
+  );
+  document
+    .querySelector("[data-guidance-skip]")
+    ?.addEventListener("click", () => skipFreeGuidanceQuestion());
+  document
+    .querySelector("#explore-response")
+    ?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const answer = event.currentTarget.querySelector("#explore-answer").value;
+      submitFreeMessage(answer);
+    });
   const conversation = document.querySelector("[data-conversation-scroll]");
   if (conversation) conversation.scrollTop = conversation.scrollHeight;
 }
@@ -2358,8 +2950,29 @@ function resetExplorationStateForNewProject(mode) {
   window.sessionStorage.setItem(explorationEntryModeKey, explorationEntryMode);
   explorationHistory = [];
   freeConversation = [];
+  freeClues = [];
+  freeLoadState = "loading";
+  freeLoadError = null;
+  freeLoadSeq += 1;
+  freeMessageSending = false;
+  freeSettlePending = false;
+  freeSettleErrorText = "";
+  freeClueEditingIds.clear();
+  freeClueFocusedIds.clear();
+  deferredFreeClues = null;
+  guidanceFields = {};
+  guidanceCurrentField = null;
+  guidanceCurrentQuestion = null;
+  guidanceReadyToSettle = false;
+  guidanceSuggestions = null;
+  guidanceSuggestionsLoading = false;
+  guidanceSkipping = false;
+  guidanceStartingEntry = null;
+  if (freeMessageAbortController) {
+    freeMessageAbortController.abort();
+    freeMessageAbortController = null;
+  }
   explorationView = 0;
-  showInspirationDirections = false;
   guidedSettling = false;
   // Story 7.5：重置引导接线态，防新建作品跨会话残留（仿 7.4 logout 态重置）。
   guidedLoadState = "loading";
@@ -2372,6 +2985,10 @@ function resetExplorationStateForNewProject(mode) {
   if (interpretAbortController) {
     interpretAbortController.abort();
     interpretAbortController = null;
+  }
+  if (freeMessageAbortController) {
+    freeMessageAbortController.abort();
+    freeMessageAbortController = null;
   }
   if (settleAbortController) {
     settleAbortController.abort();
@@ -2445,8 +3062,24 @@ function bindProjectInteractions() {
       // review R2 P3：清引导探索态防跨用户残留（违反 7.4 review P3 先例 + 触碰 AC8 多租户）。
       // A 设定卡 pending 时 logout → B 同标签页登录进引导项目 → render 先判 pending 为真直接
       // 给 B 弹 A 的卡。须 abort 在途 SSE（teardown）+ 清 pending 内存态与 sessionStorage。
-      teardownGuidedInflight();
+      teardownExplorationInflight();
       clearPendingStoryProfile();
+      freeConversation = [];
+      freeClues = [];
+      freeLoadState = "loading";
+      freeLoadError = null;
+      freeSettleErrorText = "";
+      freeClueEditingIds.clear();
+      freeClueFocusedIds.clear();
+      deferredFreeClues = null;
+      guidanceFields = {};
+      guidanceCurrentField = null;
+      guidanceCurrentQuestion = null;
+      guidanceReadyToSettle = false;
+      guidanceSuggestions = null;
+      guidanceSuggestionsLoading = false;
+      guidanceSkipping = false;
+      guidanceStartingEntry = null;
       finalStoryProfile = null;
       finalStoryProfileSignature = "";
       pendingStoryProfile = false;
@@ -3353,10 +3986,10 @@ function render() {
     /^#\/projects\/([^/]+)\/chapters\/(\d+)$/,
   );
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
-  // review R2 P2：离开探索页时清理在途 SSE + 门禁（teardownGuidedInflight 原为死代码，此处挂载）。
+  // review R2 P2：离开探索页时清理在途 SSE + 门禁（teardownExplorationInflight 原为死代码，此处挂载）。
   // 防 settle/interpret 在途时切走 → 流不 abort 连接悬挂 + 陈旧回调污染。teardown 不动 pending
   // 设定卡（会话内恢复态，导航离开应保留）。进 explore 分支由 loadGuidedExploration 自管清理。
-  if (!exploreMatch) teardownGuidedInflight();
+  if (!exploreMatch) teardownExplorationInflight();
   if (hashPath() === "#/projects") {
     // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
     projectsLoadState = "loading";
@@ -3379,7 +4012,7 @@ function render() {
     // 覆盖三条子分支（pending 恢复 / 引导加载 / 自由）——尤其 pending 恢复分支不走
     // loadGuidedExploration，若无此清理，A interpret 在途时导航到有 pending 卡的 B → saving
     // 卡死 + 旧流不 abort。teardown 幂等且不动 pending 卡（会话内恢复态保留）。
-    teardownGuidedInflight();
+    teardownExplorationInflight();
     // review R2 D1：从路由项目派生 entryMode，不信残留 sessionStorage 值（防模式错配）。
     // projects 已加载且命中该项目时以其真实 mode 为准；找不到（直接 URL 访问 / 列表未加载）
     // 才回退残留值（继续创作路径已在 data-continue 按 project.mode 校准，此处双保险）。
@@ -3402,9 +4035,7 @@ function render() {
         loadGuidedExploration(routeProjectId);
       }
     } else {
-      explorationProjectId = routeProjectId;
-      guidedLoadState = "ready";
-      renderExploration();
+      loadFreeExploration(routeProjectId);
     }
   } else if (archiveMatch) {
     const archiveProject = projects.find(
