@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-04 (Story 7.7 code review 13 项 patch 全部修复：review → done)
+last_updated: 2026-08-04 (收口：Epic 2/3 story 全清 + 7-6 review→done，Epic 2/3/7 epic 级 in-progress → done)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -67,7 +67,7 @@ development_status:
   epic-1-retrospective: done
 
   # ---------- Epic 2: 探索（含 LLM / 编排底座）----------
-  epic-2: in-progress
+  epic-2: done
   2-1-LLMProvider抽象-DeepSeek实现-ARQ-SSE异步底座: done
   2-2-探索会话根与模式分叉模式独立: done
   2-3-引导探索-真实Agent理解自由作答-沉浸问答: done
@@ -79,7 +79,7 @@ development_status:
   epic-2-retrospective: optional
 
   # ---------- Epic 3: 故事设定与文风锚点 ----------
-  epic-3: in-progress
+  epic-3: done
   3-1-story_bible表落地12字段schema-clean-room: done
   3-2-文风锚点入口全新UI-style_profile抽取: done
   3-3-探索整理为12字段故事设定候选卡: done
@@ -116,12 +116,12 @@ development_status:
 
   # ---------- Epic 7: 前端真实接线与端到端集成（2026-07-30 Correct Course 新增）----------
   # 执行时序介于 E3/E4 之间：偿还 E1-3 接线债，跑通闭环。7.1 地基为硬前置。
-  epic-7: in-progress
+  epic-7: done
   7-1-统一请求工具地基token-401跳转-errorenvelope-camelCase边界: done
   7-2-登录注册接线真实会话替换mock: done
   7-3-作品库接线列表-新建-重命名-删除-空失败态-继续创作跳转: done
   7-4-BYOK设置页-托管用量入口接线含UX-DR2新增UI: done
   7-5-引导探索接线SSE问答-翻页持久化-整理中过渡-设定卡弹出: done
-  7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: review
+  7-6-自由探索接线SSE对话-线索区编辑持久化-给方向-整理门禁: done
   7-7-设定卡-文风锚点接线12字段-编辑升版本-确认圣经-回到探索丢弃含UX-DR1新增UI: done
   epic-7-retrospective: optional
