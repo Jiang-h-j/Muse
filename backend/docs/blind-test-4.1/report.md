@@ -2,6 +2,8 @@
 
 **GATE: PASS**  ·  临时词表 temp-4.1-2026-08-04
 
+> ✅ **创始人已确认（2026-08-04）**：创始人本人过目 12 篇匿名样本，判定「没问题」——DeepSeek 文字质量达 NFR1 红线、读者视角挑不出与 Claude 参照的差距。本 GATE=PASS 为**正式门禁结论**，据此放行 Story 4.4 正文接入。
+>
 > GATE=PASS 解锁 Story 4.4 正文接入；GATE=BLOCK 阻断 4.4，须调整方案（调 prompt / 调词表 / 评估换模型）重测。
 > **Claude 侧为参照上界对照（非门禁条件）**，门禁只卡 DeepSeek。Claude 侧参照系 = Claude Code 当前模型档，非固定 Anthropic API 档。
 

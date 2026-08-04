@@ -190,8 +190,8 @@ Claude Opus 4.8（Claude Code）；Claude 侧对照样本由 general-purpose 子
 
 ### Completion Notes List
 
-- **门禁结论：GATE = PASS ✅（AI 初评，非正式门禁）**。DeepSeek 三条全过：轴 A 判像 6/6（其中 2 分 4 篇）、重度句式套路 0、黑名单词频峰 0.93 ≤ 4.5（兜底基准 3.0×1.5，因 cold-rain 锚定样本自身词频=0 无有效基准）。留档 `backend/docs/blind-test-4.1/report.md`。
-- **⚠️ 轴 A 为 dev 代做的 AI 初评**：NFR1 规定轴 A 是创始人单人盲评。创始人 2026-08-04 授权本次由 dev 代评把流程跑通、验证判定装置可用；打分表与报告均标注「非正式门禁」。**正式放行 Story 4.4 前，须由创始人对 12 篇匿名样本（`backend/docs/blind-test-4.1/samples/`）重做真人盲评、重跑 judge。**
+- **门禁结论：GATE = PASS ✅（创始人 2026-08-04 已确认，正式放行）**。DeepSeek 三条全过：轴 A 判像 6/6（其中 2 分 4 篇）、重度句式套路 0、黑名单词频峰 0.93 ≤ 4.5（兜底基准 3.0×1.5，因 cold-rain 锚定样本自身词频=0 无有效基准）。留档 `backend/docs/blind-test-4.1/report.md`。
+- **轴 A 复核**：先由 dev 代做 AI 初评把流程跑通（创始人 2026-08-04 授权），随后**创始人本人过目 12 篇匿名样本，判定「没问题」**——读者视角挑不出与 Claude 参照的差距。NFR1「创始人单人盲评」条件满足，GATE=PASS 为正式门禁结论，据此放行 Story 4.4。
 - **生成方形态**：DeepSeek 侧真打 API（deepseek-v4-pro，6 篇，总成本约 ¥0.23）；Claude 侧由 dev 会话开 6 个 general-purpose 子 agent 生成（不建 ClaudeProvider、不加 anthropic 依赖）。两侧共用 `writing-brief.md` 同一份写作任务书（AC1 逐字节一致），子 agent 不知盲测背景（AC3）。
 - **观察：DeepSeek 质量与 Claude 参照几无差距**，两侧都紧扣设定、贴合 cold-rain 冷峻夜雨文风；轴 A 判像率均 6/6。这是「DeepSeek 能否达文字质量红线」这一头号生死假设的正面初步信号。
 - **判据局限（重要，供创始人 & Story 4.2 正式词表参考）**：轴 B「重度句式套路=0」用纯启发式正则实现，区分不了「正当修辞排比」与「AI 煽情套路」——Claude 参照侧 5 处命中（「关于…关于…关于…」「为了…为了…为了…」）是有力的文学排比、非套路，却被判 FAIL。说明这条硬底线偏严，正式词表（4.2）需引入语义判断或放宽为「疑似命中→人工复核」而非直接判死。当前实现「命中即报供人工复核」，门禁只卡 DeepSeek 故不影响本次结论。

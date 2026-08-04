@@ -333,6 +333,6 @@
 
 ## Story 4.1 盲测门禁（launch blocker）
 
-- **【门禁结论】GATE = PASS（AI 初评，非正式）** [backend/docs/blind-test-4.1/report.md] — 2026-08-04 跑通一轮盲测：DeepSeek 侧真打 API 6 篇 + Claude 侧子 agent 6 篇，共用同一写作任务书（cold-rain 文风锚点 + 都市悬疑测试设定）。DeepSeek 三条判据全过（轴A判像6/6、套路0、词频0.93≤4.5）。**但轴 A 由 dev 代做 AI 初评（NFR1 规定为创始人单人盲评）**。**⚠️ 正式放行 Story 4.4 前，创始人须对 `backend/docs/blind-test-4.1/samples/` 12 篇匿名样本重做真人盲评、重跑 `judge_blind_test.py`**，以真人结论替换 AI 初评结论。当前 PASS 仅为「装置可用 + 初步正面信号」，不作正式放行依据。
+- **【门禁结论】GATE = PASS（创始人 2026-08-04 已确认，正式放行）** [backend/docs/blind-test-4.1/report.md] — 2026-08-04 跑通一轮盲测：DeepSeek 侧真打 API 6 篇 + Claude 侧子 agent 6 篇，共用同一写作任务书（cold-rain 文风锚点 + 都市悬疑测试设定）。DeepSeek 三条判据全过（轴A判像6/6、套路0、词频0.93≤4.5）。轴 A 先由 dev 代做 AI 初评，**创始人本人已过目 12 篇匿名样本并判定「没问题」**——读者视角挑不出与 Claude 参照的差距。**门禁正式放行 Story 4.4**（NFR1 创始人单人盲评条件满足）。
 - **临时词表轴 B「套路=0」判据偏严，正式词表（4.2）需改进** [backend/scripts/blind_test/ai_taste_lexicon_temp.py] — 句式套路检测用纯启发式正则，区分不了正当文学排比与 AI 煽情套路：Claude 高质量参照侧的「关于…关于…关于…」「为了…为了…为了…」被判 5 处 FAIL，实为有力修辞非套路。**归 Story 4.2 正式去 AI 味词表**：引入语义判断，或把硬底线「套路=0」放宽为「疑似命中→人工复核」，避免误伤高质量文本。
 - **托管免费额度 `free_quota_tokens` 真实数值待本盲测出单章成本后定档** [backend/src/muse/core/settings.py:69] — 本轮 DeepSeek 单篇约 2500-3000 tokens、成本约 ¥0.037/篇（deepseek-v4-pro 思考档，含 reasoning）。真实单章成本口径可据此估算，供额度线定档（承 settings.py:69、本文件既有 1.8 条目）。
