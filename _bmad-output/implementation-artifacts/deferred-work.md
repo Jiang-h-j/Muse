@@ -328,3 +328,11 @@
 - **删除孤立的 `renderStyleAnchor` 独立页（`#/projects/demo/style-anchor`）而非改造它** [prototype/app/app.js 原 `renderStyleAnchor`/`bindStyleAnchorInteractions`/`styleSampleLibrary`/`styleAnchorProfileMarkup`] — 该页硬编码 `demo` 作品 id（真实作品是 UUID，此页在真实流程中不可达）、样本库写死 mock、抽取结果假造。本 story 按 UX-DR1「文风锚点入口须在设定卡阶段出现」把入口做进设定卡对话框（`styleAnchorEntryMarkup` + `bindStyleAnchorEntryInteractions`），删除孤立页。**非债务，登记决策**：若未来产品需要独立的文风锚点全屏页（脱离设定卡），须重新设计并消费真实路由 id + `storyApi`，勿复活已删的 `demo` 硬编码页。
 - **文风锚点抽取 + 反馈升版本触发端点无前端提交去重（仅按钮 disable，无幂等键）** [prototype/app/app.js `submitStyleAnchor`/`submitProfileFeedback`/`persistProfileFieldEdits`] — 本 story 已用 `styleAnchorSaving`/`profileReviseBusy`/`profileFieldEditing` 在途标志 + 按钮 disable 防单页快速双击，但无跨标签页/网络重发的幂等键。与后端 revise/style-anchor 端点「零幂等 + 无限流」defer（本文件 3.4 revise 条目、3.2 style-anchor）对称。内测期单用户无并发面。**归开放注册前加固批次**：后端触发端点接入限流 + 前端加提交幂等键，与既有接口限流 defer 同批。
 - **设定卡编辑/文风抽取错误用 `window.alert` 兜底（discard/PATCH project_not_found）** [prototype/app/app.js `discardStoryProfileAndReturn`/`persistProfileFieldEdits`] — 部分错误路径（丢弃失败、编辑遇 project_not_found）用 `window.alert` 提示而非页内内联错误区，与设定卡整体的内联错误（`profileFeedbackStatus`/`styleAnchorErrorText`）风格不完全统一。功能正确、错误可见，仅呈现风格差异。**归后续 UX 细节打磨批次**：统一为页内内联提示。
+
+---
+
+## Story 4.1 盲测门禁（launch blocker）
+
+- **【门禁结论】GATE = PASS（AI 初评，非正式）** [backend/docs/blind-test-4.1/report.md] — 2026-08-04 跑通一轮盲测：DeepSeek 侧真打 API 6 篇 + Claude 侧子 agent 6 篇，共用同一写作任务书（cold-rain 文风锚点 + 都市悬疑测试设定）。DeepSeek 三条判据全过（轴A判像6/6、套路0、词频0.93≤4.5）。**但轴 A 由 dev 代做 AI 初评（NFR1 规定为创始人单人盲评）**。**⚠️ 正式放行 Story 4.4 前，创始人须对 `backend/docs/blind-test-4.1/samples/` 12 篇匿名样本重做真人盲评、重跑 `judge_blind_test.py`**，以真人结论替换 AI 初评结论。当前 PASS 仅为「装置可用 + 初步正面信号」，不作正式放行依据。
+- **临时词表轴 B「套路=0」判据偏严，正式词表（4.2）需改进** [backend/scripts/blind_test/ai_taste_lexicon_temp.py] — 句式套路检测用纯启发式正则，区分不了正当文学排比与 AI 煽情套路：Claude 高质量参照侧的「关于…关于…关于…」「为了…为了…为了…」被判 5 处 FAIL，实为有力修辞非套路。**归 Story 4.2 正式去 AI 味词表**：引入语义判断，或把硬底线「套路=0」放宽为「疑似命中→人工复核」，避免误伤高质量文本。
+- **托管免费额度 `free_quota_tokens` 真实数值待本盲测出单章成本后定档** [backend/src/muse/core/settings.py:69] — 本轮 DeepSeek 单篇约 2500-3000 tokens、成本约 ¥0.037/篇（deepseek-v4-pro 思考档，含 reasoning）。真实单章成本口径可据此估算，供额度线定档（承 settings.py:69、本文件既有 1.8 条目）。

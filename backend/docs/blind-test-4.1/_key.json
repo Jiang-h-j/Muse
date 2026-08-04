@@ -1,0 +1,223 @@
+[
+  {
+    "anon_id": "d00ebf6ccda6",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 2581,
+      "blacklist_total": 1,
+      "blacklist_per_kchar": 0.39,
+      "blacklist_hits": [
+        {
+          "word": "淡淡的",
+          "count": 1
+        }
+      ],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2581
+  },
+  {
+    "anon_id": "5959f716ec94",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 2002,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2002
+  },
+  {
+    "anon_id": "0ba25de3f7b9",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 2830,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2830
+  },
+  {
+    "anon_id": "167c74c56f62",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 2444,
+      "blacklist_total": 2,
+      "blacklist_per_kchar": 0.82,
+      "blacklist_hits": [
+        {
+          "word": "某种",
+          "count": 2
+        }
+      ],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2444
+  },
+  {
+    "anon_id": "b09fd4cc6e3e",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 2452,
+      "blacklist_total": 1,
+      "blacklist_per_kchar": 0.41,
+      "blacklist_hits": [
+        {
+          "word": "某种",
+          "count": 1
+        }
+      ],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2452
+  },
+  {
+    "anon_id": "3ed78f387756",
+    "generator": "deepseek",
+    "model": "deepseek-v4-pro",
+    "axis_b": {
+      "char_count": 3209,
+      "blacklist_total": 3,
+      "blacklist_per_kchar": 0.93,
+      "blacklist_hits": [
+        {
+          "word": "某种",
+          "count": 3
+        }
+      ],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 3209
+  },
+  {
+    "anon_id": "b37a92d95f13",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 1848,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 1848
+  },
+  {
+    "anon_id": "0899bfea48ff",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 1812,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 1,
+      "pattern_hits": [
+        {
+          "rule_name": "forced_parallel",
+          "note": "连续三段同引导词排比（强行排比）",
+          "snippets": [
+            "关于养父,关于九三年,关于这台收音机里的女人是谁,又为什"
+          ]
+        }
+      ]
+    },
+    "char_count": 1812
+  },
+  {
+    "anon_id": "d60d1067cd9f",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 1987,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 1,
+      "pattern_hits": [
+        {
+          "rule_name": "forced_parallel",
+          "note": "连续三段同引导词排比（强行排比）",
+          "snippets": [
+            "为了那半个名字,为了养父那句没说完的话,为了三点十七分那只发抖的手"
+          ]
+        }
+      ]
+    },
+    "char_count": 1987
+  },
+  {
+    "anon_id": "aad2318608ec",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 1469,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 1,
+      "pattern_hits": [
+        {
+          "rule_name": "forced_parallel",
+          "note": "连续三段同引导词排比（强行排比）",
+          "snippets": [
+            "记得雨，记得那块表，记得三点十七分——可他想不起自己今"
+          ]
+        }
+      ]
+    },
+    "char_count": 1469
+  },
+  {
+    "anon_id": "889f0f233170",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 2074,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 2,
+      "pattern_hits": [
+        {
+          "rule_name": "forced_parallel",
+          "note": "连续三段同引导词排比（强行排比）",
+          "snippets": [
+            "想问三十年前那晚是什么，想问养父到底牵进了什么事，想问那句\"都没剩几个\"里",
+            "想着那个停在三点十七分的时刻，想着哼歌的女人，想着自己刚才究竟丢了哪一段——他试"
+          ]
+        }
+      ]
+    },
+    "char_count": 2074
+  },
+  {
+    "anon_id": "c4c94129e3e4",
+    "generator": "claude",
+    "model": "claude-code-subagent",
+    "axis_b": {
+      "char_count": 2156,
+      "blacklist_total": 0,
+      "blacklist_per_kchar": 0.0,
+      "blacklist_hits": [],
+      "pattern_total": 0,
+      "pattern_hits": []
+    },
+    "char_count": 2156
+  }
+]

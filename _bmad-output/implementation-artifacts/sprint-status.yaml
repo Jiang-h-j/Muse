@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-04 (收口：Epic 2/3 story 全清 + 7-6 review→done，Epic 2/3/7 epic 级 in-progress → done)
+last_updated: 2026-08-04 (Story 4.1 盲测门禁开发完成待评审：4-1 in-progress → review，GATE=PASS 非正式待创始人真人复核)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -88,8 +88,8 @@ development_status:
   epic-3-retrospective: optional
 
   # ---------- Epic 4: 章节创作（含盲测门禁）----------
-  epic-4: backlog
-  4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: backlog
+  epic-4: in-progress
+  4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: review
   4-2-五段流水线编排底座V1四段-去AI味词表: backlog
   4-3-首章无缝进入-幕后阶段规划: backlog
   4-4-本章想法输入-真实生成章节正文: backlog

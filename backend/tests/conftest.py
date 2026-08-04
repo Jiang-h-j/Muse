@@ -16,6 +16,16 @@ os.environ.setdefault("DEBUG", "true")
 # 不依赖本机 .env、且加解密可确定往返（同法参照上方 JWT_SECRET/DEBUG 注入）。
 os.environ.setdefault("BYOK_MASTER_KEY", "bXVzZS1ieW9rLXRlc3QtbWFzdGVyLWtleS0zMmJ5dGU=")
 
+# 盲测装置（Story 4.1）放 backend/scripts/blind_test/，不在 src/ 包内（pythonpath=["src"]
+# 不含它）。把 scripts/ 加进 sys.path，使 `from blind_test.xxx import ...` 可被单测导入
+# ——装置纯逻辑（词表统计、判定聚合）须可离线单测，同时装置本身仍留在 scripts/ 不进 src。
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
 from collections.abc import Callable  # noqa: E402
 from datetime import datetime  # noqa: E402
 from functools import lru_cache  # noqa: E402
