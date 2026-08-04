@@ -587,6 +587,62 @@ const explorationApi = {
 };
 
 // ---------------------------------------------------------------------
+// 故事设定卡 + 文风锚点 API 薄封装（Story 7.7）：设定卡恢复/编辑/反馈升版本/确认/丢弃 +
+// 文风锚点样本库/抽取。全部走 apiFetch（默认 auth=true，token/401/error 由 7.1 地基处理）——
+// 设定卡编辑/反馈/确认/丢弃与文风抽取都是同步 REST（受控决策 2/3，非 ARQ/SSE），不引第二套请求工具。
+// 后端契约（backend/src/muse/routers/story.py，Story 3.2/3.4/3.5 已 done）：
+//   GET   /api/projects/{id}/story-profile          → 200 StoryProfileCardResponse（12 字段+revision/changedFields/status）/ 204（无待确认卡→null）
+//   PATCH /api/projects/{id}/story-profile          → 200 StoryProfileCardResponse（只传改动字段，revision 不变）
+//   POST  /api/projects/{id}/story-profile/revise   → 200 StoryProfileCardResponse（body {feedback}，revision+1、changedFields 返）
+//   POST  /api/projects/{id}/story-profile/confirm  → 200 StoryProfileCardResponse（无请求体，status=confirmed，同事务推 phase explore→chapter）
+//   POST  /api/projects/{id}/story-profile/discard  → 204（无请求体，幂等：无卡也 204）
+//   GET   /api/projects/{id}/style-anchor/samples   → 200 [{id, name, note, excerpt}]（全局样本库常量）
+//   POST  /api/projects/{id}/style-anchor           → 200 {styleProfile, anchored}（body {sampleId} 或 {sampleText} 互斥）
+const storyApi = {
+  getProfile(projectId) {
+    return apiFetch(`/api/projects/${projectId}/story-profile`);
+  },
+  // 只传改动的字段（camelCase key），revision 不变（后端 AC2）。
+  editProfile(projectId, fields) {
+    return apiFetch(`/api/projects/${projectId}/story-profile`, {
+      method: "PATCH",
+      body: fields,
+    });
+  },
+  reviseProfile(projectId, { feedback }) {
+    return apiFetch(`/api/projects/${projectId}/story-profile/revise`, {
+      method: "POST",
+      body: { feedback },
+    });
+  },
+  // 确认设定：无请求体（幂等动作，作用对象由 path project + 会话 user 唯一确定）。
+  confirmProfile(projectId) {
+    return apiFetch(`/api/projects/${projectId}/story-profile/confirm`, {
+      method: "POST",
+    });
+  },
+  // 回到探索丢弃：无请求体，幂等 204（无 pending 卡也 204）。
+  discardProfile(projectId) {
+    return apiFetch(`/api/projects/${projectId}/story-profile/discard`, {
+      method: "POST",
+    });
+  },
+  listStyleSamples(projectId) {
+    return apiFetch(`/api/projects/${projectId}/style-anchor/samples`);
+  },
+  // 文风锚点抽取：库选传 {sampleId}、粘贴传 {sampleText}（互斥，后端 model_validator 校验）。
+  anchorStyle(projectId, { sampleId, sampleText } = {}) {
+    const body = {};
+    if (sampleId !== undefined) body.sampleId = sampleId;
+    if (sampleText !== undefined) body.sampleText = sampleText;
+    return apiFetch(`/api/projects/${projectId}/style-anchor`, {
+      method: "POST",
+      body,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------
 // 全局暴露（受控决策 1：全局脚本，非 module）。app.js 及 7.2–7.7 直接引用这些符号。
 // ---------------------------------------------------------------------
 if (typeof window !== "undefined") {
@@ -599,6 +655,7 @@ if (typeof window !== "undefined") {
   window.apiStream = apiStream;
   window.parseSSEFrame = parseSSEFrame;
   window.explorationApi = explorationApi;
+  window.storyApi = storyApi;
   window.getAccessToken = getAccessToken;
   window.getRefreshToken = getRefreshToken;
   window.setTokens = setTokens;

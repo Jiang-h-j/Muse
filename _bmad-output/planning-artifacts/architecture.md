@@ -234,6 +234,7 @@ cd ../prototype/app && npm create vite@latest . -- --template vanilla
 - **一致性投影事务**：章节定稿触发一次 `chapter-commit`，在**单事务**内投影回
   story_state / chapter_cards / story_threads / embeddings，保证多存储面原子一致（防半更新穿帮）。
 - **探索会话**：`exploration_sessions` + `exploration_messages` + `story_clues`（对话与线索持久化）。
+- **自由探索导航状态（2026-07-31 Correct Course 新增，Story 2.8）**：`exploration_session` 新增窄范围 `guidance_state`（JSONB）列，记录 7 项通用主干字段（题材/核心吸引力/主角/主要冲突/关键世界规则/整体气质/开篇钩子）的完成度（`missing`/`filled`/`skipped`）、当前待补字段、当前问题文本与 `readyToSettle` 布尔位。这是完成度与「下一问」的后端事实源，供 free settle 门禁与自由探索前端消费；**不与 `story_clues` 合并**——`story_clues` 仍是用户可直接编辑的事实展示区（含 `user_edited` 优先保护），`guidance_state` 只服务导航与门禁，两者职责边界不交叉。V1 不落完整置信度、证据来源或问题历史（EXP-P02 V2 范围）。
 
 ### ⭐ 焦点四：一致性机制迁移（借骨架 + 词表，丢网文审美）
 

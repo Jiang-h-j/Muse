@@ -202,7 +202,6 @@ let archiveDialogOpen = false;
 let styleAnchorTab = "library";
 let styleAnchorSelected = null;
 let styleAnchorPasteText = "";
-let styleAnchorResult = null;
 let byokTab = "hosted";
 let byokKeyDraft = "";
 // Story 7.4 接线态：绑定状态与用量由后端驱动（替换原写死占位）。
@@ -231,6 +230,25 @@ let finalStoryProfileRevision = restoredStoryProfile?.revision || 1;
 let pendingStoryProfile = Boolean(restoredStoryProfile?.profile);
 let lastProfileChangedFields = restoredStoryProfile?.changedFields || [];
 let profileFeedbackStatus = restoredStoryProfile?.feedbackStatus || "";
+// Story 7.7：设定卡字段编辑落库的在途去合并（仿 7.6 freeClueEditingIds）：同一字段 blur 落库
+// 在途时再次 blur 只更新排队值、不并发双 PATCH；key 为字段 camelCase key。
+let profileFieldEditing = new Map();
+// 反馈升版本 / 确认 / 丢弃的在途标志：防按钮在途被重复触发产生并发请求。
+let profileReviseBusy = false;
+let profileConfirmBusy = false;
+let profileDiscardBusy = false;
+// 文风锚点抽取在途标志（Task 6）。
+let styleAnchorSaving = false;
+let styleAnchorErrorText = "";
+// #6：文风抽取代次守卫。discard/切作品时递增，使在途 anchorStyle/editProfile 回调识别到
+// 「卡已丢弃」而不重挂已关闭的弹窗（hash/projectId 守卫挡不住同页内 discard 的情形）。
+let styleAnchorSeq = 0;
+// Story 7.7：设定卡内文风锚点入口从后端拉取的真实样本库（GET style-anchor/samples）。
+// null=未拉取（含拉取失败，保持 null 以允许重试，#4）；[]=已拉取且后端确为空。
+let styleAnchorSamples = null;
+let styleAnchorSamplesLoading = false;
+// 设定卡内文风锚点区展开态（默认收起，避免抢占 12 字段编辑焦点）。
+let styleAnchorPanelOpen = false;
 
 function readStoredJson(key) {
   try {
@@ -647,6 +665,27 @@ function explorationErrorText(err) {
   }
 }
 
+// Story 7.7：设定卡 + 文风锚点端点的 error code → 中文提示映射（仿 explorationErrorText）。
+// 只按 err.code 判定（后端恒字符串）。no_pending_card 含「确认后对 confirmed 行再编辑/反馈」的
+// 情形（后端 get_pending_by_project 只查 status='pending'，无独立 already_confirmed 码，AC8）。
+function storyErrorText(err) {
+  const code = err && err.code;
+  switch (code) {
+    case "no_pending_card":
+      return "没有待确认的设定卡，请先整理故事设定。";
+    case "unknown_style_sample":
+      return "所选文风样本不存在。";
+    case "generate_failed":
+      return "生成失败，请稍后重试。";
+    case "quota_exceeded":
+      return "已用完当前免费额度。可到设置页绑定自己的 API Key 后继续。";
+    case "project_not_found":
+      return "找不到这部作品，请回到作品库重试。";
+    default:
+      return "操作未能完成，请检查网络后稍后重试。";
+  }
+}
+
 // 把后端一条引导答案映射为前端 explorationHistory 项。后端行：
 // {questionIndex, question, answer, answerType}；前端项：{question, answer}
 // （answer 即用户所选选项 value 或自述凝练文本，翻页高亮按 value 匹配选项、不匹配即自述）。
@@ -679,6 +718,14 @@ function teardownExplorationInflight() {
   // 复位同样会被挡住——须在此显式复位，否则重进该项目后按钮永久卡在 disabled。
   guidanceStartingEntry = null;
   guidanceSkipping = false;
+  // Story 7.7：复位设定卡/文风锚点操作的在途门禁（均是常规 apiFetch，无 AbortController）。
+  // 与 saving 门禁同理——teardown 后代次/hash 校验会丢弃在途回调的状态写入，但门禁复位也会被挡，
+  // 须显式复位，否则重进后按钮永久卡 disabled。pending 卡本身是会话内恢复态、此处不清（logout 才清）。
+  profileFieldEditing.clear();
+  profileReviseBusy = false;
+  profileConfirmBusy = false;
+  profileDiscardBusy = false;
+  styleAnchorSaving = false;
   guidedLoadSeq += 1;
   freeLoadSeq += 1;
 }
@@ -727,6 +774,38 @@ function loadGuidedExploration(projectId) {
 
 function freeMessageFromBackend(row) {
   return { role: row.role, text: row.content };
+}
+
+// Story 7.7：进探索页时以后端 GET /story-profile 为待确认卡的权威来源（AC1/AC7/AC8）。
+// sessionStorage 缓存卡先即时渲染（刷新无闪烁），再 GET 对账：
+//   · 后端返卡 → openStoryProfileFromBackend 用权威卡覆盖（含最新 revision/changedFields/status）。
+//   · 后端 204（卡已确认/丢弃，可能发生在别的标签页）→ 清陈旧 pending 缓存，回落正常探索加载。
+//   · GET 失败（非 401，401 已由 apiFetch 跳登录）→ 保留缓存卡，不打断本地恢复。
+// hash + explorationProjectId 双守卫（同 7.5/7.6 时序范式），防用户切走 / 换作品后旧回调污染。
+function reconcilePendingStoryProfile(projectId) {
+  const startedHash = location.hash;
+  (async () => {
+    let card;
+    try {
+      card = await storyApi.getProfile(projectId);
+    } catch {
+      return;
+    }
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    if (card) {
+      openStoryProfileFromBackend(card);
+    } else {
+      pendingStoryProfile = false;
+      finalStoryProfile = null;
+      finalStoryProfileSignature = "";
+      lastProfileChangedFields = [];
+      profileFeedbackStatus = "";
+      clearPendingStoryProfile();
+      closeStoryProfileDialog();
+      if (explorationEntryMode !== "free") loadGuidedExploration(projectId);
+      else loadFreeExploration(projectId);
+    }
+  })();
 }
 
 function isCurrentFreeExploration(projectId, seq, startedHash) {
@@ -1468,61 +1547,12 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-function collectStoryDraft() {
-  const readClue = (label) => {
-    const value = document
-      .querySelector(`[aria-label="编辑${label}"]`)
-      ?.textContent.trim();
-    return value === "尚未确定" ? "" : value || "";
-  };
-  return {
-    opening: readClue("最初的念头"),
-    protagonist: readClue("主角"),
-    conflict: readClue("核心冲突"),
-    atmosphere: readClue("世界与氛围"),
-    custom: customStoryClues.filter((clue) => clue.label || clue.value),
-  };
-}
 
-function buildFinalStoryProfile(draft) {
-  const opening = draft.opening || "一个尚待展开的故事念头";
-  const protagonist = draft.protagonist || "一位被异常事件推离原有生活的人";
-  const conflict = draft.conflict || "主角必须在欲望与代价之间做出选择";
-  const atmosphere = draft.atmosphere || "克制、悬而未决，并保留逐步揭示的空间";
-  const fields = [
-    {
-      label: "一句话构想",
-      value: `${opening}，并在追寻答案的过程中面对${conflict}。`,
-      added: true,
-    },
-    {
-      label: "故事概述",
-      value: `故事从“${opening}”展开。${protagonist}被卷入其中，随着线索逐渐显现，${conflict}。故事将以人物选择推动情节，而不是一次性解释全部真相。`,
-      added: true,
-    },
-    { label: "主角", value: protagonist, added: !draft.protagonist },
-    { label: "核心冲突", value: conflict, added: !draft.conflict },
-    { label: "世界与氛围", value: atmosphere, added: !draft.atmosphere },
-    {
-      label: "叙事风格",
-      value: "以人物视角推进，保持细节感与悬念，让设定通过行动和选择自然显现。",
-      added: true,
-    },
-  ];
-  draft.custom.forEach((clue) =>
-    fields.push({
-      label: clue.label || "自定义设定",
-      value: clue.value || "尚待补充",
-      added: false,
-    }),
-  );
-  return fields;
-}
-
-// Story 7.5：把后端 settle result 的 12 字段候选卡（StoryProfileCard，camelCase）转成
-// 设定卡对话框渲染用的 [{label, value}] 结构。主干 7 恒显（缺料后端为空串）；题材特化 4
+// Story 7.5/7.7：把后端候选卡（StoryProfileCard 或 StoryProfileCardResponse，camelCase）转成
+// 设定卡对话框渲染用的 [{key, label, value}] 结构。主干 7 恒显（缺料后端为空串）；题材特化 4
 // 按值非空显（后端按 genre 激活、不匹配为 null）；⑫ 文风锚点非空才显。字段顺序对齐
-// [[project_muse_setting_fields]] 的 ①-⑫ 编号。本 story emit-only 展示，不含 revision。
+// [[project_muse_setting_fields]] 的 ①-⑫ 编号。每项带 camelCase key，供编辑落库 / 变化高亮
+// 按字段身份而非数组下标定位（渲染列表长度随特化字段激活而变，下标不稳）。
 const PROFILE_FIELD_LABELS = [
   ["genre", "题材"],
   ["coreAppeal", "核心吸引力"],
@@ -1548,6 +1578,12 @@ const PROFILE_TRUNK_KEYS = new Set([
   "openingHook",
 ]);
 
+// 后端 changedFields 是 snake_case 列名（如 core_appeal）；前端字段身份用 camelCase key。
+// 通用 snake→camel 转换（core_appeal→coreAppeal / style_profile→styleProfile），映射到前端 key。
+function snakeToCamel(name) {
+  return String(name || "").replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
+}
+
 function buildProfileFromBackend(profile) {
   const fields = [];
   for (const [key, label] of PROFILE_FIELD_LABELS) {
@@ -1555,27 +1591,264 @@ function buildProfileFromBackend(profile) {
     const value = typeof raw === "string" ? raw.trim() : "";
     if (PROFILE_TRUNK_KEYS.has(key)) {
       // 主干恒显：空串回落占位文案，提示这项还没聊清楚。
-      fields.push({ label, value: value || "（尚未聊到，可继续补充）", added: false });
+      fields.push({ key, label, value: value || "（尚未聊到，可继续补充）", added: false });
     } else if (value) {
       // 题材特化 + 文风锚点：仅在后端给了非空值时显（按 genre 激活 / 已锚定文风）。
-      fields.push({ label, value, added: false });
+      fields.push({ key, label, value, added: false });
     }
   }
   return fields;
 }
 
-// 用后端真实候选卡弹出设定卡（替换 mock 的 openStoryProfileDialog 走 buildFinalStoryProfile）。
+// 用后端真实候选卡弹出/刷新设定卡（会话内恢复用 AC7：写 finalStoryProfile + pending 态 + persist）。
 // 会话内恢复用（AC7）：写 finalStoryProfile + pending 态 + persist 到 sessionStorage。
+// Story 7.7：消费后端 revision/changedFields（缺省时回落 1/[]，保证 7.5/7.6 只传 12 内容字段的
+// StoryProfileCard 调用方不因本改动挂掉——向后兼容，AC2 Task2 注意项）。changedFields 从后端
+// snake_case 列名映射为前端 camelCase key，驱动 is-updated 高亮。
 function openStoryProfileFromBackend(profile) {
+  // #2：重建前捕获正在编辑（有焦点但未 blur）的字段——它的本地输入尚未 PATCH，后端权威卡
+  // 里没有，直接用后端值重建会吞掉用户正打的字。重建后保留其在编辑文本，重挂后恢复焦点。
+  const active = document.activeElement;
+  const editingKey =
+    active && active.dataset ? active.dataset.finalProfileField : null;
+  const editingText = editingKey ? active.textContent.trim() : null;
   finalStoryProfile = buildProfileFromBackend(profile);
+  if (editingKey) {
+    const editingField = finalStoryProfile.find((f) => f.key === editingKey);
+    if (editingField) editingField.value = editingText;
+  }
   // signature 用后端 profile 序列化，标识「这份候选卡」；恢复时据此判定是否同一份。
   finalStoryProfileSignature = JSON.stringify(profile);
-  finalStoryProfileRevision = 1;
+  finalStoryProfileRevision =
+    profile && typeof profile.revision === "number" ? profile.revision : 1;
   pendingStoryProfile = true;
-  lastProfileChangedFields = [];
+  lastProfileChangedFields = Array.isArray(profile && profile.changedFields)
+    ? profile.changedFields.map(snakeToCamel)
+    : [];
   profileFeedbackStatus = "";
   persistPendingStoryProfile();
   mountStoryProfileDialog();
+  if (editingKey) restoreProfileFieldFocus(editingKey);
+}
+
+// #2：重挂后把焦点+光标恢复到重挂前正在编辑的字段末尾（重挂重建了全部 DOM，焦点会丢）。
+function restoreProfileFieldFocus(key) {
+  const el = document.querySelector(`[data-final-profile-field="${key}"]`);
+  if (!el) return;
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+// Story 7.7 文风锚点入口（UX-DR1 全新 UI）：设定卡内新增「从预置样本库选 / 粘贴范文」锚点区。
+// 抽取后端返回的 styleProfile 是五维「标签：内容」多行文本（style_anchor_agent._parse_style_profile），
+// 逐行渲染。当前已锚定值取自 finalStoryProfile 第⑫字段（styleProfile）——与设定卡编辑同源。
+function currentStyleProfileValue() {
+  const field = finalStoryProfile
+    ? finalStoryProfile.find((f) => f.key === "styleProfile")
+    : null;
+  return field ? field.value : "";
+}
+
+function styleProfileLinesMarkup(text) {
+  const lines = String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+  return `<dl class="style-anchor-profile">${lines
+    .map((line) => {
+      const sep = line.includes("：") ? "：" : line.includes(":") ? ":" : "";
+      if (!sep) return `<dd>${escapeHtml(line)}</dd>`;
+      const [label, ...rest] = line.split(sep);
+      return `<div class="style-anchor-profile-row"><dt>${escapeHtml(label.trim())}</dt><dd>${escapeHtml(rest.join(sep).trim())}</dd></div>`;
+    })
+    .join("")}</dl>`;
+}
+
+function styleAnchorEntryMarkup() {
+  const anchored = currentStyleProfileValue().trim();
+  const summary = `<button type="button" class="style-anchor-toggle" data-style-anchor-toggle aria-expanded="${styleAnchorPanelOpen}">
+    <span>文风锚点${anchored ? "（已锚定）" : "（可选）"}</span><i>${styleAnchorPanelOpen ? "－" : "＋"}</i>
+  </button>`;
+  if (!styleAnchorPanelOpen) {
+    return `<section class="style-anchor-entry">${summary}</section>`;
+  }
+  const errorLine = styleAnchorErrorText
+    ? `<p class="style-anchor-error" aria-live="polite">${escapeHtml(styleAnchorErrorText)}</p>`
+    : "";
+  let picker;
+  if (styleAnchorTab === "library") {
+    let list;
+    if (styleAnchorSamplesLoading && styleAnchorSamples === null) {
+      list = `<p class="style-anchor-loading">正在载入样本库…</p>`;
+    } else if (!styleAnchorSamples || styleAnchorSamples.length === 0) {
+      list = `<p class="style-anchor-loading">暂无可选样本。</p>`;
+    } else {
+      list = `<ul class="style-sample-list">${styleAnchorSamples
+        .map(
+          (sample) =>
+            `<li><button type="button" class="style-sample-card ${styleAnchorSelected === sample.id ? "is-current" : ""}" data-style-sample="${escapeHtml(sample.id)}"><div class="style-sample-head"><strong>${escapeHtml(sample.name)}</strong><span>${escapeHtml(sample.note)}</span></div><p>${escapeHtml(sample.excerpt)}</p></button></li>`,
+        )
+        .join("")}</ul>`;
+    }
+    picker = list;
+  } else {
+    picker = `<div class="field style-paste-field"><div class="field-head"><label for="style-paste-inline">粘贴一段范文</label><span class="field-note">至少 20 字</span></div><textarea class="input" id="style-paste-inline" placeholder="贴一段你希望这本书读起来像的文字……">${escapeHtml(styleAnchorPasteText)}</textarea></div>`;
+  }
+  const canExtract =
+    styleAnchorTab === "paste"
+      ? styleAnchorPasteText.trim().length >= 20
+      : Boolean(styleAnchorSelected);
+  const resultMarkup = anchored
+    ? `<div class="style-anchor-result"><div class="style-anchor-result-head"><span>当前文风锚点</span></div>${styleProfileLinesMarkup(anchored)}</div>`
+    : "";
+  return `<section class="style-anchor-entry is-open">
+    ${summary}
+    <div class="style-anchor-panel">
+      <p class="style-anchor-copy">选一段你爱读的文字，或粘贴一段范文，抽取文风特征作为正文的锚（可留空用默认风格）。</p>
+      <div class="tabs" role="tablist" aria-label="文风锚定方式">
+        <button class="tab" role="tab" aria-selected="${styleAnchorTab === "library"}" data-style-tab="library">从样本库选</button>
+        <button class="tab" role="tab" aria-selected="${styleAnchorTab === "paste"}" data-style-tab="paste">粘贴我的范文</button>
+      </div>
+      ${picker}
+      ${errorLine}
+      <div class="style-anchor-actions"><button class="secondary-button" type="button" data-style-extract ${canExtract && !styleAnchorSaving ? "" : "disabled"}>${styleAnchorSaving ? "抽取中…" : "抽取文风"}</button></div>
+      ${resultMarkup}
+    </div>
+  </section>`;
+}
+
+// 拉取真实样本库（GET style-anchor/samples），仅在设定卡文风区展开且库 tab 时按需拉一次。
+async function loadStyleSamplesIfNeeded() {
+  if (styleAnchorSamples !== null || styleAnchorSamplesLoading) return;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  styleAnchorSamplesLoading = true;
+  try {
+    const samples = await storyApi.listStyleSamples(projectId);
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    styleAnchorSamples = Array.isArray(samples) ? samples : [];
+  } catch {
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    // #4：拉取失败保持 null（而非 []），使下次展开/切回库 tab 时 `!== null` 判据放行重拉，
+    // 不把瞬时网络错误固化成永久空态。设错误提示告知用户失败、可重试。
+    styleAnchorErrorText = "样本库加载失败，请稍后重试。";
+  } finally {
+    styleAnchorSamplesLoading = false;
+  }
+  // #11：收尾重挂加当前 tab 校验——库 tab 触发拉取后用户可能已切到粘贴 tab 开始打字，此时
+  // 样本返回不应重挂打断粘贴输入焦点。仅当仍停在库 tab 且面板展开时才重绘。
+  if (
+    location.hash === startedHash &&
+    explorationProjectId === projectId &&
+    styleAnchorPanelOpen &&
+    styleAnchorTab === "library"
+  ) {
+    mountStoryProfileDialog();
+  }
+}
+
+// 文风锚点抽取（AC6）：库选 POST {sampleId} / 粘贴 POST {sampleText}。成功把 styleProfile
+// 写入 finalStoryProfile 第⑫字段 + 落库（editProfile，与直接编辑同源，保证刷新恢复一致），并重绘。
+async function submitStyleAnchor() {
+  if (styleAnchorSaving) return;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  const startedSeq = styleAnchorSeq;
+  let payload;
+  if (styleAnchorTab === "paste") {
+    const text = styleAnchorPasteText.trim();
+    if (text.length < 20) return; // 前端 dual validate（后端 min_length=20）
+    payload = { sampleText: text };
+  } else {
+    if (!styleAnchorSelected) return;
+    payload = { sampleId: styleAnchorSelected };
+  }
+  styleAnchorSaving = true;
+  styleAnchorErrorText = "";
+  mountStoryProfileDialog();
+  // 三重守卫：hash（切页）/projectId（切作品）/seq（同页内 discard 丢弃卡）任一变即弃回调。
+  const stale = () =>
+    location.hash !== startedHash ||
+    explorationProjectId !== projectId ||
+    styleAnchorSeq !== startedSeq;
+  // #5：记录第一段 anchorStyle 已抽取并锚定的 styleProfile。若随后 editProfile（同步落库）失败，
+  // 后端其实已 upsert_style_profile 锚定，catch 里据此乐观回写第⑫字段，避免前后端不一致。
+  let anchoredStyle = null;
+  try {
+    const result = await storyApi.anchorStyle(projectId, payload);
+    if (stale()) return;
+    anchoredStyle = (result && result.styleProfile) || "";
+    // 把抽取结果落到候选卡第⑫字段（editProfile），后端权威行回来后覆盖重绘（含 styleProfile）。
+    // #3：不在此提前复位 styleAnchorSaving——否则 editProfile 在途时 paste input 监听会把
+    // 「抽取文风」按钮重新 enable，放行第二次并发提交。统一在 finally 复位。
+    const card = await storyApi.editProfile(projectId, { styleProfile: anchoredStyle });
+    if (stale()) return;
+    if (card) openStoryProfileFromBackend(card);
+    styleAnchorPanelOpen = true;
+    mountStoryProfileDialog();
+  } catch (err) {
+    if (stale()) return;
+    // #5：anchorStyle 成功但 editProfile 失败——后端已锚定，前端乐观把 styleProfile 写入第⑫
+    // 字段 + persist，避免「前端显示失败、刷新后却已锚定」的不一致。anchoredStyle 非 null 即
+    // 表示抽取已成功、仅同步落库这步失败（抽取本身失败则 anchoredStyle 仍为 null，不误写）。
+    if (anchoredStyle) {
+      const field = finalStoryProfile
+        ? finalStoryProfile.find((f) => f.key === "styleProfile")
+        : null;
+      if (field) {
+        field.value = anchoredStyle;
+        persistPendingStoryProfile();
+      }
+    }
+    styleAnchorErrorText = storyErrorText(err);
+    mountStoryProfileDialog();
+  } finally {
+    if (!stale()) styleAnchorSaving = false;
+  }
+}
+
+function bindStyleAnchorEntryInteractions() {
+  document
+    .querySelector("[data-style-anchor-toggle]")
+    ?.addEventListener("click", () => {
+      styleAnchorPanelOpen = !styleAnchorPanelOpen;
+      styleAnchorErrorText = "";
+      mountStoryProfileDialog();
+      if (styleAnchorPanelOpen && styleAnchorTab === "library") {
+        loadStyleSamplesIfNeeded();
+      }
+    });
+  if (!styleAnchorPanelOpen) return;
+  document.querySelectorAll("[data-style-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      styleAnchorTab = button.getAttribute("data-style-tab");
+      styleAnchorErrorText = "";
+      mountStoryProfileDialog();
+      if (styleAnchorTab === "library") loadStyleSamplesIfNeeded();
+    });
+  });
+  document.querySelectorAll("[data-style-sample]").forEach((button) => {
+    button.addEventListener("click", () => {
+      styleAnchorSelected = button.getAttribute("data-style-sample");
+      mountStoryProfileDialog();
+    });
+  });
+  const paste = document.querySelector("#style-paste-inline");
+  paste?.addEventListener("input", () => {
+    styleAnchorPasteText = paste.value;
+    const extract = document.querySelector("[data-style-extract]");
+    if (extract) extract.disabled = paste.value.trim().length < 20 || styleAnchorSaving;
+  });
+  document
+    .querySelector("[data-style-extract]")
+    ?.addEventListener("click", () => submitStyleAnchor());
+  if (styleAnchorTab === "library") loadStyleSamplesIfNeeded();
 }
 
 function storyProfileDialogMarkup() {
@@ -1584,9 +1857,9 @@ function storyProfileDialogMarkup() {
       (
         field,
         index,
-      ) => `<section class="profile-result-item ${lastProfileChangedFields.includes(index) ? "is-updated" : ""}">
+      ) => `<section class="profile-result-item ${lastProfileChangedFields.includes(field.key) ? "is-updated" : ""}">
         <div class="profile-result-label"><span>${String(index + 1).padStart(2, "0")} / ${escapeHtml(field.label)}</span></div>
-        <div contenteditable="true" role="textbox" aria-label="编辑${escapeHtml(field.label)}" data-final-profile-field="${index}">${escapeHtml(field.value)}</div>
+        <div contenteditable="true" role="textbox" aria-label="编辑${escapeHtml(field.label)}" data-final-profile-field="${escapeHtml(field.key)}" data-final-profile-value="${escapeHtml(field.value)}">${escapeHtml(field.value)}</div>
       </section>`,
     )
     .join("");
@@ -1595,7 +1868,7 @@ function storyProfileDialogMarkup() {
       <header class="profile-dialog-head">
         <div><span>Story profile / v${finalStoryProfileRevision}</span><h2 id="profile-dialog-title">确认故事设定</h2><p>直接编辑设定，或者告诉 Agent 你希望怎样调整。确认后将进入第一章创作。</p></div>
       </header>
-      <div class="profile-dialog-body">${items}</div>
+      <div class="profile-dialog-body">${items}${styleAnchorEntryMarkup()}</div>
       <footer class="profile-dialog-actions">
         <form class="profile-feedback" data-profile-feedback>
           <div class="profile-feedback-copy"><strong>你想调整什么？</strong></div>
@@ -1614,67 +1887,129 @@ function closeStoryProfileDialog() {
   document.body.classList.remove("dialog-open");
 }
 
-function discardStoryProfileAndReturn() {
+// Story 7.7：回到探索 + 后端丢弃（AC5）。7.5 遗留债在此补齐——7.5 当时基于「settle emit-only
+// 无落库副作用」的过时理解只做前端复位；实际 3.4 起 settle 既落库 pending 卡又推 SSE
+// （story_settle_agent.settle_into_profile），所以只要弹过设定卡后端必有一行 status='pending'，
+// 「确定返回」必须调后端 discard 删它。discard 幂等（无卡也 204），故无条件调用即安全——
+// 不必区分「settle 未落库完成」的竞态。先 abort 在途 settle SSE（若还在整理中被点），再 discard。
+async function discardStoryProfileAndReturn() {
+  if (profileDiscardBusy) return;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  // 先 abort 在途 settle SSE（若还在整理中被点回到探索，先断流再丢弃）。
+  if (settleAbortController) {
+    settleAbortController.abort();
+    settleAbortController = null;
+  }
+  // #6：递增文风代次，使在途 anchorStyle/editProfile 回调识别到卡已丢弃而不重挂已关闭的弹窗。
+  styleAnchorSeq += 1;
+  styleAnchorSaving = false;
+  profileDiscardBusy = true;
+  const confirmBtn = document.querySelector("[data-confirm-profile-return]");
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "返回中…";
+  }
+  try {
+    await storyApi.discardProfile(projectId);
+  } catch (err) {
+    // 丢弃失败（非 401，401 已跳登录）：提示后保留设定卡，不误清前端 pending 态。
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    profileDiscardBusy = false;
+    if (confirmBtn) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "确定返回";
+    }
+    window.alert(storyErrorText(err));
+    return;
+  }
+  if (location.hash !== startedHash || explorationProjectId !== projectId) {
+    profileDiscardBusy = false;
+    return;
+  }
+  // 后端已删 pending 行，前端复位所有设定卡态并回探索问答界面。
   finalStoryProfile = null;
   finalStoryProfileSignature = "";
   finalStoryProfileRevision = 1;
   pendingStoryProfile = false;
   lastProfileChangedFields = [];
   profileFeedbackStatus = "";
+  profileFieldEditing.clear();
+  // #9：复位全套文风锚点态（含展开/tab/样本），否则同会话再次 settle 弹卡时面板带旧残留展开。
+  styleAnchorSelected = null;
+  styleAnchorPasteText = "";
+  styleAnchorErrorText = "";
+  styleAnchorPanelOpen = false;
+  styleAnchorTab = "library";
+  styleAnchorSamples = null;
+  styleAnchorSamplesLoading = false;
   // 复位“整理中”过渡态：否则回到探索页会卡在整理动画上（弹窗由末题触发时留下的态）。
   guidedSettling = false;
-  // Story 7.5：abort 在途 settle SSE（若还在整理中被点回到探索）。settle 任务 emit-only
-  // 无落库副作用（后端 worker 不写 story_bible），前端丢弃 taskId + 断流即可，不调后端
-  // 丢弃端点（已确认设定的真实丢弃 FR15 归 7.7）。
-  if (settleAbortController) {
-    settleAbortController.abort();
-    settleAbortController = null;
-  }
   settleErrorText = "";
+  profileDiscardBusy = false;
   clearPendingStoryProfile();
   closeStoryProfileDialog();
-  // 回到探索页需重新渲染，回到正常问答界面（收尾态：可翻页修改、可再次整理）。
+  // 回到探索页需重新渲染 + 重载会话（#10）：内存 explorationHistory/freeConversation 可能已空
+  // （如刷新后由 sessionStorage 恢复卡的情形），仅 renderExploration 会显示空白问答界面、丢失
+  // 已答进度。仿 reconcile 的 204 分支按入口模式重载会话，把后端已答内容拉回。
   renderExploration();
+  if (explorationEntryMode !== "free") loadGuidedExploration(projectId);
+  else loadFreeExploration(projectId);
 }
 
-function confirmStoryProfileAndEnterChapter() {
-  // 确认故事设定：保留已确认设定（归档页与章节上下文依赖）。
-  // 阶段规划改为幕后逻辑，确认后直接进入第一章创作，不再展示阶段规划问答页。
+// Story 7.7：确认设定 → 后端翻 confirmed + 推 phase explore→chapter（同事务，Story 3.5 AC1）→
+// 进第一章创作页（AC4）。替换 mock（window.setTimeout→confirmedStoryProfile sessionStorage→硬编码
+// demo 跳转）。跳转用真实路由 projectId。
+async function confirmStoryProfileAndEnterChapter() {
+  if (profileConfirmBusy) return;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  profileConfirmBusy = true;
+  const button = document.querySelector("[data-confirm-profile]");
+  const note = document.querySelector("[data-profile-confirm-note]");
+  if (button) {
+    button.disabled = true;
+    button.querySelector("span").textContent = "✓";
+  }
+  if (note) note.textContent = "故事设定已确认，正在进入第一章创作。";
+  try {
+    await storyApi.confirmProfile(projectId);
+  } catch (err) {
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    profileConfirmBusy = false;
+    if (button) {
+      button.disabled = false;
+      button.querySelector("span").textContent = "→";
+    }
+    if (note) note.textContent = storyErrorText(err);
+    return;
+  }
+  if (location.hash !== startedHash || explorationProjectId !== projectId) {
+    profileConfirmBusy = false;
+    return;
+  }
+  // #7：防 confirm 与 discard 并发——若 discard 的 await 先 resolve 已把 finalStoryProfile 置 null，
+  // confirm 回来时 hash 未变会放行，此处 finalStoryProfile.map 会空指针。判空即中止后续跳转。
+  if (!finalStoryProfile) {
+    profileConfirmBusy = false;
+    return;
+  }
+  // 本地缓存只读副本（归档页 / 章节上下文展示依赖）；phase 已由后端同事务推进，前端只消费。
   confirmedStoryProfile = finalStoryProfile.map((field) => ({ ...field }));
   window.sessionStorage.setItem(
     confirmedStoryProfileKey,
     JSON.stringify(confirmedStoryProfile),
   );
-  // 幕后生成阶段计划，供章节创作页使用；用户看不到这一过程。
-  if (!currentStagePlan) currentStagePlan = buildCurrentStagePlan();
   explorationMode = "profile";
   window.sessionStorage.removeItem(explorationModeKey);
   pendingStoryProfile = false;
+  profileConfirmBusy = false;
   clearPendingStoryProfile();
   // 确保第一章从头开始渲染
   chapterCreationState = "input";
   chapterIdea = "";
   closeStoryProfileDialog();
-  location.hash = "#/projects/demo/chapters/1";
-}
-
-function openStoryProfileDialog({ regenerate = false } = {}) {
-  const draft = collectStoryDraft();
-  const signature = JSON.stringify(draft);
-  if (
-    regenerate ||
-    !finalStoryProfile ||
-    signature !== finalStoryProfileSignature
-  ) {
-    if (regenerate) finalStoryProfileRevision += 1;
-    finalStoryProfile = buildFinalStoryProfile(draft);
-    finalStoryProfileSignature = signature;
-  }
-  pendingStoryProfile = true;
-  lastProfileChangedFields = [];
-  profileFeedbackStatus = "";
-  persistPendingStoryProfile();
-  mountStoryProfileDialog();
+  location.hash = `#/projects/${projectId}/chapters/1`;
 }
 
 function mountStoryProfileDialog() {
@@ -1684,44 +2019,127 @@ function mountStoryProfileDialog() {
   bindStoryProfileDialogInteractions();
 }
 
-function applyStoryProfileFeedback(feedback) {
-  const changed = new Set([1]);
-  const includesAny = (...keywords) =>
-    keywords.some((keyword) => feedback.includes(keyword));
+// Story 7.7：收集当前 DOM 里所有已改动字段（对比渲染时写死的 data-final-profile-value 快照），
+// blur 时落库。返回 {camelCaseKey: newValue} 的改动集（空对象表示无改动）。变更基线用 DOM 属性
+// 快照（仿 7.6 线索编辑 data-free-clue-value）而非 finalStoryProfile[].value——后者被 input
+// 监听逐键改写、与 DOM 文本恒相等，拿它当基线会使改动检测恒为空、PATCH 永不发出。
+function collectProfileFieldEdits() {
+  const changes = {};
+  document.querySelectorAll("[data-final-profile-field]").forEach((el) => {
+    const key = el.dataset.finalProfileField;
+    const field = finalStoryProfile.find((f) => f.key === key);
+    if (!field) return;
+    const next = el.textContent.trim();
+    if (next !== el.dataset.finalProfileValue) {
+      field.value = next;
+      changes[key] = next;
+    }
+  });
+  return changes;
+}
 
-  if (includesAny("主角", "人物", "自私", "性格", "动机")) {
-    changed.add(2);
-    finalStoryProfile[2].value = `${finalStoryProfile[2].value} 他会优先保护自己的记忆与利益，但仍保留不愿伤害无辜者的底线。`;
+// 落库单次字段编辑（AC2）：blur 触发。PATCH 只传改动字段、revision 不变。在途去合并（防并发双
+// PATCH）：同一提交在途时排队最新值、结束后若又有新改动再发一轮。成功以后端权威行更新
+// finalStoryProfile 并重绘（保留用户输入 + 刷新 is-updated 等 UI）。
+async function persistProfileFieldEdits() {
+  const changes = collectProfileFieldEdits();
+  if (Object.keys(changes).length === 0) return;
+  const editKey = "__profile__";
+  const pending = profileFieldEditing.get(editKey);
+  if (pending) {
+    Object.assign(pending.changes, changes);
+    pending.revision += 1;
+    return;
   }
-  if (includesAny("冲突", "代价", "悬念", "危险")) {
-    changed.add(3);
-    finalStoryProfile[3].value = `${finalStoryProfile[3].value} 每一次推进都会带来更具体、且无法轻易撤销的代价。`;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  const request = { changes: { ...changes }, revision: 0 };
+  profileFieldEditing.set(editKey, request);
+  try {
+    while (true) {
+      const revision = request.revision;
+      const body = { ...request.changes };
+      const card = await storyApi.editProfile(projectId, body);
+      if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+      if (card) {
+        // 后端权威行覆盖：直接编辑 revision 不变、changedFields 清空（后端 AC2）。
+        openStoryProfileFromBackend(card);
+      }
+      if (request.revision === revision) return;
+    }
+  } catch (err) {
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    if (err && err.code === "project_not_found") {
+      // 作品已删/越权：回作品库。
+      window.alert(storyErrorText(err));
+      location.hash = "#/projects";
+      return;
+    }
+    // #13：编辑落库失败用 alert 呈现（与本函数 project_not_found 分支、discard 失败呈现一致），
+    // 不借用「你想调整什么？」反馈区状态行——那里语义是反馈升版本状态、与字段编辑无关。
+    // no_pending_card 等：提示但保留本地输入不清除（用户可稍后重整理），故不重挂/不复位字段。
+    window.alert(storyErrorText(err));
+  } finally {
+    profileFieldEditing.delete(editKey);
   }
-  if (includesAny("世界", "城市", "规则", "氛围")) {
-    changed.add(4);
-    finalStoryProfile[4].value = `${finalStoryProfile[4].value} 世界规则会先通过反常细节显现，再逐步揭露其边界。`;
-  }
-  if (includesAny("风格", "节奏", "克制", "视角")) {
-    changed.add(5);
-    finalStoryProfile[5].value =
-      "以人物视角缓慢逼近真相，减少直接解释，让冲突通过选择、停顿与细节自然显现。";
-  }
-  if (changed.size === 1) {
-    changed.add(5);
-    finalStoryProfile[5].value =
-      "保持人物选择的主动性，让新的调整方向通过场景与行动逐步显现。";
-  }
+}
 
-  finalStoryProfile[1].value = `${finalStoryProfile[1].value} 新一轮修订会进一步强化人物选择与故事代价之间的联系。`;
-  return [...changed];
+// 反馈升版本（AC3）：POST revise（同步 REST），真实凝练 Agent 重生成、revision+1、changedFields 返。
+async function submitProfileFeedback(feedback, textarea, button) {
+  if (profileReviseBusy) return;
+  const projectId = explorationProjectId;
+  const startedHash = location.hash;
+  profileReviseBusy = true;
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "调整中…";
+  try {
+    const card = await storyApi.reviseProfile(projectId, { feedback });
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    profileReviseBusy = false;
+    // #8：revise 契约恒返 200 StoryProfileCardResponse；但防御性加 if(card) 守卫（仿
+    // submitStyleAnchor/persistProfileFieldEdits），避免万一返回空体（apiFetch→null）时
+    // openStoryProfileFromBackend(null) 把卡重建成占位吞掉用户内容、且 card.changedFields 抛错。
+    if (card) {
+      // openStoryProfileFromBackend 会读 card.revision（后端 +1）+ card.changedFields（映射 key 高亮）
+      // + 重挂弹窗；反馈状态另行覆盖（openStoryProfileFromBackend 把 profileFeedbackStatus 清空）。
+      openStoryProfileFromBackend(card);
+      const changedCount = Array.isArray(card.changedFields)
+        ? card.changedFields.length
+        : 0;
+      profileFeedbackStatus = `已根据反馈更新 ${changedCount} 项设定。`;
+      persistPendingStoryProfile();
+      mountStoryProfileDialog();
+    } else {
+      profileFeedbackStatus = storyErrorText({});
+      button.disabled = false;
+      button.textContent = originalLabel;
+      const status = document.querySelector("[data-profile-feedback-status]");
+      if (status) status.textContent = profileFeedbackStatus;
+    }
+  } catch (err) {
+    if (location.hash !== startedHash || explorationProjectId !== projectId) return;
+    profileReviseBusy = false;
+    profileFeedbackStatus = storyErrorText(err);
+    button.disabled = false;
+    button.textContent = originalLabel;
+    const status = document.querySelector("[data-profile-feedback-status]");
+    if (status) status.textContent = profileFeedbackStatus;
+  }
 }
 
 function bindStoryProfileDialogInteractions() {
   document.querySelectorAll("[data-final-profile-field]").forEach((field) => {
+    // 落库时机 blur（同 7.6 线索编辑范式）：编辑中乐观写本地态即时反映，blur 才 PATCH 落库，
+    // 避免逐键并发 PATCH。input 只更新本地态 + persist（刷新恢复）；blur 收集所有改动一次落库。
     field.addEventListener("input", () => {
-      finalStoryProfile[Number(field.dataset.finalProfileField)].value =
-        field.textContent.trim();
+      const key = field.dataset.finalProfileField;
+      const target = finalStoryProfile.find((f) => f.key === key);
+      if (target) target.value = field.textContent.trim();
       persistPendingStoryProfile();
+    });
+    field.addEventListener("blur", () => {
+      persistProfileFieldEdits();
     });
   });
   document
@@ -1730,17 +2148,9 @@ function bindStoryProfileDialogInteractions() {
       event.preventDefault();
       const textarea = event.currentTarget.querySelector("textarea");
       const feedback = textarea.value.trim();
-      if (!feedback) return;
+      if (!feedback) return; // 前端 dual validate（后端 422 亦拦空反馈）
       const button = event.currentTarget.querySelector("button");
-      button.disabled = true;
-      button.textContent = "调整中…";
-      window.setTimeout(() => {
-        lastProfileChangedFields = applyStoryProfileFeedback(feedback);
-        finalStoryProfileRevision += 1;
-        profileFeedbackStatus = `已根据反馈更新 ${lastProfileChangedFields.length} 项设定。`;
-        persistPendingStoryProfile();
-        mountStoryProfileDialog();
-      }, 520);
+      submitProfileFeedback(feedback, textarea, button);
     });
   document
     .querySelector("[data-request-profile-return]")
@@ -1762,13 +2172,8 @@ function bindStoryProfileDialogInteractions() {
     ?.addEventListener("click", discardStoryProfileAndReturn);
   document
     .querySelector("[data-confirm-profile]")
-    ?.addEventListener("click", (event) => {
-      event.currentTarget.disabled = true;
-      event.currentTarget.querySelector("span").textContent = "✓";
-      document.querySelector("[data-profile-confirm-note]").textContent =
-        "故事设定已确认，正在进入第一章创作。";
-      window.setTimeout(confirmStoryProfileAndEnterChapter, 420);
-    });
+    ?.addEventListener("click", confirmStoryProfileAndEnterChapter);
+  bindStyleAnchorEntryInteractions();
 }
 
 function confirmedStoryProfileReference() {
@@ -3054,6 +3459,20 @@ function resetExplorationStateForNewProject(mode) {
   pendingStoryProfile = false;
   lastProfileChangedFields = [];
   profileFeedbackStatus = "";
+  // Story 7.7：新建作品时一并复位设定卡编辑门禁 + 文风锚点全套状态（防跨作品残留）。
+  profileFieldEditing.clear();
+  profileReviseBusy = false;
+  profileConfirmBusy = false;
+  profileDiscardBusy = false;
+  styleAnchorTab = "library";
+  styleAnchorSelected = null;
+  styleAnchorPasteText = "";
+  styleAnchorSaving = false;
+  styleAnchorErrorText = "";
+  styleAnchorSamples = null;
+  styleAnchorSamplesLoading = false;
+  styleAnchorPanelOpen = false;
+  styleAnchorSeq += 1;
   explorationMode = "profile";
   confirmedStoryProfile = null;
   stagePlanningHistory = [];
@@ -3117,6 +3536,8 @@ function bindProjectInteractions() {
       // 给 B 弹 A 的卡。须 abort 在途 SSE（teardown）+ 清 pending 内存态与 sessionStorage。
       teardownExplorationInflight();
       clearPendingStoryProfile();
+      // Story 7.7：一并清确认设定 sessionStorage（防 B 读到 A 的 confirmedStoryProfile 缓存）。
+      window.sessionStorage.removeItem(confirmedStoryProfileKey);
       freeConversation = [];
       freeClues = [];
       freeLoadState = "loading";
@@ -3135,6 +3556,23 @@ function bindProjectInteractions() {
       finalStoryProfile = null;
       finalStoryProfileSignature = "";
       pendingStoryProfile = false;
+      // Story 7.7：清设定卡/文风锚点全套状态，防 A 的待确认卡/已抽文风泄漏给 B（多租户，AC8）。
+      lastProfileChangedFields = [];
+      profileFeedbackStatus = "";
+      confirmedStoryProfile = null;
+      profileFieldEditing.clear();
+      profileReviseBusy = false;
+      profileConfirmBusy = false;
+      profileDiscardBusy = false;
+      styleAnchorTab = "library";
+      styleAnchorSelected = null;
+      styleAnchorPasteText = "";
+      styleAnchorSaving = false;
+      styleAnchorErrorText = "";
+      styleAnchorSamples = null;
+      styleAnchorSamplesLoading = false;
+      styleAnchorPanelOpen = false;
+      styleAnchorSeq += 1;
       guidedLoadState = "loading";
       guidedLoadError = null;
       settleErrorText = "";
@@ -3340,73 +3778,6 @@ function bindInlineProjectActions(row) {
     ?.addEventListener("click", () =>
       row.querySelector(".delete-confirm").remove(),
     );
-}
-
-// ============================================================
-// 文风锚点入口（FR16 / 模块 2 · 红线验收前提）
-// 用户从预置样本库选择或粘贴一段爱读的文字，系统抽取作品级 style_profile
-// （人称、语气、句式节奏、意象密度、段落长度倾向），作为 §7.1 行为红线的验收锚。
-// 原型此前无此页，属就绪报告 UX-ALIGN-01 新增。
-// ============================================================
-const styleSampleLibrary = [
-  {
-    id: "cold-rain",
-    name: "冷峻夜雨",
-    note: "克制的短句、潮湿的旧城意象",
-    excerpt:
-      "雨是在凌晨落下来的，比记忆里任何一场都更安静。他站在檐下，看水沿着旧招牌的裂缝往下走，没有点烟，也没有回头。",
-    profile: {
-      person: "第三人称限知",
-      tone: "冷峻、克制",
-      rhythm: "短句为主，偶有停顿",
-      imagery: "高（雨、旧城、光影）",
-      paragraph: "偏短，一段一景",
-    },
-  },
-  {
-    id: "warm-dusk",
-    name: "黄昏暖光",
-    note: "舒缓长句、细腻的情感铺陈",
-    excerpt:
-      "黄昏的光是慢慢漫上来的，先是染红了她搁在窗台上的手背，然后才一点一点爬满整间屋子，像怕惊动了谁似的，走得那样轻。",
-    profile: {
-      person: "第三人称限知",
-      tone: "温暖、感伤",
-      rhythm: "长句舒缓，节奏绵延",
-      imagery: "中高（光线、居家细节）",
-      paragraph: "偏长，情感层层递进",
-    },
-  },
-  {
-    id: "sharp-first",
-    name: "凌厉第一人称",
-    note: "紧凑口语、强推进感",
-    excerpt:
-      "我没时间解释。门在身后合上的那一秒，我已经算好了三条路——两条是死的，剩下一条，我赌它还没被他们发现。",
-    profile: {
-      person: "第一人称",
-      tone: "凌厉、紧张",
-      rhythm: "短促、强推进",
-      imagery: "低（服务于动作）",
-      paragraph: "短，逼近节奏",
-    },
-  },
-];
-
-function styleAnchorProfileMarkup(profile) {
-  const rows = [
-    ["人称", profile.person],
-    ["语气", profile.tone],
-    ["句式节奏", profile.rhythm],
-    ["意象密度", profile.imagery],
-    ["段落长度倾向", profile.paragraph],
-  ];
-  return `<div class="style-profile-grid">${rows
-    .map(
-      ([label, value]) =>
-        `<div class="style-profile-row"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`,
-    )
-    .join("")}</div>`;
 }
 
 // ============================================================
@@ -3947,90 +4318,6 @@ function bindReadthroughInteractions() {
   });
 }
 
-function renderStyleAnchor() {
-  const state = queryState();
-  const anchored = state === "anchored";
-  const activeSample =
-    styleSampleLibrary.find((sample) => sample.id === styleAnchorSelected) ||
-    null;
-  const canExtract = styleAnchorTab === "paste"
-    ? styleAnchorPasteText.trim().length >= 20
-    : Boolean(activeSample);
-  document.title = "锚定文风 · Muse";
-  app.innerHTML = `<div class="style-anchor-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>文风锚点</span></div><div class="save-state"><i></i> ${anchored ? "文风已锚定" : "尚未锚定"}</div></header>
-    <main class="style-anchor-main">
-      <section class="style-anchor-intro">
-        <div class="style-anchor-overline">Style anchor / 文风锚点</div>
-        <h1>先告诉我，你想要的味道</h1>
-        <p>选一段你爱读的文字，或粘贴一段你心里的范文。系统会抽取它的文风特征，作为这本书正文的锚——之后每一章都会贴着它写，去掉那股 AI 腔。</p>
-      </section>
-      ${anchored ? `<section class="style-anchor-result" aria-live="polite">
-        <div class="style-anchor-result-head"><span>已锚定文风</span><strong>${activeSample ? escapeHtml(activeSample.name) : "自定义样本"}</strong></div>
-        ${styleAnchorProfileMarkup(styleAnchorResult || (activeSample ? activeSample.profile : styleSampleLibrary[0].profile))}
-        <div class="style-anchor-actions"><button class="secondary-button" data-style-reset>重新选择</button><a class="primary-button" href="#/projects/demo/chapters/1">带着这个文风开始写 <span>→</span></a></div>
-      </section>` : `<section class="style-anchor-picker">
-        <div class="tabs" role="tablist" aria-label="文风锚定方式">
-          <button class="tab" role="tab" aria-selected="${styleAnchorTab === "library"}" data-style-tab="library">从样本库选</button>
-          <button class="tab" role="tab" aria-selected="${styleAnchorTab === "paste"}" data-style-tab="paste">粘贴我的范文</button>
-        </div>
-        ${styleAnchorTab === "library" ? `<ul class="style-sample-list">${styleSampleLibrary
-          .map(
-            (sample) =>
-              `<li><button type="button" class="style-sample-card ${styleAnchorSelected === sample.id ? "is-current" : ""}" data-style-sample="${sample.id}"><div class="style-sample-head"><strong>${escapeHtml(sample.name)}</strong><span>${escapeHtml(sample.note)}</span></div><p>${escapeHtml(sample.excerpt)}</p></button></li>`,
-          )
-          .join("")}</ul>` : `<div class="field style-paste-field"><div class="field-head"><label for="style-paste">粘贴一段范文</label><span class="field-note">至少 20 字</span></div><textarea class="input" id="style-paste" placeholder="贴一段你希望这本书读起来像的文字……">${escapeHtml(styleAnchorPasteText)}</textarea></div>`}
-        <div class="style-anchor-actions"><button class="primary-button" type="button" data-style-extract ${canExtract ? "" : "disabled"}>抽取文风 <span>→</span></button></div>
-      </section>`}
-      <details class="state-preview"><summary>原型状态预览</summary><div class="preview-links"><a class="preview-link" href="#/projects/demo/style-anchor">未锚定</a><a class="preview-link" href="#/projects/demo/style-anchor?state=anchored">已锚定</a></div></details>
-    </main>
-  </div>`;
-  bindStyleAnchorInteractions();
-}
-
-function bindStyleAnchorInteractions() {
-  document.querySelectorAll("[data-style-tab]").forEach((button) => {
-    button.addEventListener("click", () => {
-      styleAnchorTab = button.getAttribute("data-style-tab");
-      renderStyleAnchor();
-    });
-  });
-  document.querySelectorAll("[data-style-sample]").forEach((button) => {
-    button.addEventListener("click", () => {
-      styleAnchorSelected = button.getAttribute("data-style-sample");
-      renderStyleAnchor();
-    });
-  });
-  const paste = document.querySelector("#style-paste");
-  paste?.addEventListener("input", () => {
-    styleAnchorPasteText = paste.value;
-    const extract = document.querySelector("[data-style-extract]");
-    if (extract) extract.disabled = paste.value.trim().length < 20;
-  });
-  document
-    .querySelector("[data-style-extract]")
-    ?.addEventListener("click", () => {
-      const activeSample = styleSampleLibrary.find(
-        (sample) => sample.id === styleAnchorSelected,
-      );
-      styleAnchorResult = activeSample
-        ? activeSample.profile
-        : {
-            person: "第一人称",
-            tone: "紧凑、口语",
-            rhythm: "短句偏多",
-            imagery: "中",
-            paragraph: "偏短",
-          };
-      location.hash = "#/projects/demo/style-anchor?state=anchored";
-    });
-  document.querySelector("[data-style-reset]")?.addEventListener("click", () => {
-    styleAnchorSelected = null;
-    styleAnchorResult = null;
-    location.hash = "#/projects/demo/style-anchor";
-  });
-}
-
 function render() {
   document.body.classList.remove("dialog-open");
   const exploreMatch = hashPath().match(/^#\/projects\/([^/]+)\/explore$/);
@@ -4046,8 +4333,7 @@ function render() {
     // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
     projectsLoadState = "loading";
     renderProjects();
-  } else if (hashPath() === "#/projects/demo/style-anchor") renderStyleAnchor();
-  else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
+  } else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
   else if (hashPath() === "#/settings/model-access") {
     // 每次进入设置页都重拉最新绑定态 + 用量（绑定/解绑后返回、跨账号都能看到变化）。
     byokLoadState = "loading";
@@ -4077,15 +4363,23 @@ function render() {
       );
     }
     if (explorationEntryMode !== "free") {
-      // 待确认设定卡刷新恢复优先（AC7）：pending 态直接渲染（renderExploration 末尾重挂弹窗），
-      // 无需重拉后端（settle 结果已在 sessionStorage）。仅非 pending 时才建会话 + 回填。
+      // 待确认设定卡刷新恢复优先（AC7）：pending 态先即时渲染缓存卡（renderExploration 末尾
+      // 重挂弹窗、刷新无闪烁），再 reconcilePendingStoryProfile 以后端 GET 对账（覆盖/清陈旧）。
+      // 非 pending 时才建会话 + 回填已答。
       if (pendingStoryProfile && finalStoryProfile) {
         explorationProjectId = routeProjectId;
         guidedLoadState = "ready";
         renderExploration();
+        reconcilePendingStoryProfile(routeProjectId);
       } else {
         loadGuidedExploration(routeProjectId);
       }
+    } else if (pendingStoryProfile && finalStoryProfile) {
+      // 自由模式同样支持待确认卡刷新恢复（AC7）：settle 弹卡后刷新不回退到自由对话主界面。
+      explorationProjectId = routeProjectId;
+      freeLoadState = "ready";
+      renderExploration();
+      reconcilePendingStoryProfile(routeProjectId);
     } else {
       loadFreeExploration(routeProjectId);
     }

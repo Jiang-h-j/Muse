@@ -2218,6 +2218,97 @@ body.dialog-open {
   padding: 0 32px;
 }
 
+/* Story 7.7 设定卡内文风锚点入口（UX-DR1）——置于可滚动 .profile-dialog-body 内 */
+.style-anchor-entry {
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+
+.style-anchor-toggle {
+  align-items: center;
+  background: none;
+  border: 0;
+  color: var(--ink);
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  font-weight: 600;
+  justify-content: space-between;
+  padding: 16px 0;
+  width: 100%;
+}
+
+.style-anchor-toggle i {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.style-anchor-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 0 0 20px;
+}
+
+.style-anchor-copy {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.style-anchor-error {
+  color: var(--danger, #c0392b);
+  font-size: 12px;
+  margin: 0;
+}
+
+.style-anchor-loading {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+
+.style-anchor-profile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.style-anchor-profile-row {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 96px minmax(0, 1fr);
+}
+
+.style-anchor-profile-row dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.style-anchor-profile-row dd {
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.style-anchor-result {
+  background: var(--surface-muted, rgba(0, 0, 0, 0.03));
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+
+.style-anchor-result-head {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+
 .profile-result-item {
   align-items: center;
   border-bottom: 1px solid var(--line);
