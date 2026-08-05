@@ -1,5 +1,14 @@
 # Deferred Work
 
+## Deferred from: code review of 4-5-分页阅读-段落批注-整体点评 (2026-08-05)
+
+> 三层对抗审查（Blind/Edge/Auditor）。2 patch（翻页漏清 focus / 保存后未 focus 段落，见 story Review Findings）+ 3 dismiss（NaN 崩溃误报：状态变量 244-253 全初始化；纯函数副作用与监听泄漏：属既有渲染模式非本 diff 引入且未证实）+ 以下 4 条 defer。
+
+- **4.6 真实改进后正文变化将令已存批注坐标错位/成孤儿** [prototype/app/app.js:3191-3195 hasAnnotation 匹配 + :3206 data-paragraph-position] — Blind#1 + Edge#1 独立指出，High-for-4.6。批注存的是页内相对坐标 `{page:全局段号/5, paragraph:全局段号%5}`，两者都由可变 `chapterGeneratedText` 派生。**当前不触发**：本 story `improve` 走 900ms mock（app.js:3469-3481）只改 `chapterAgentResult` 文案、**不动正文**，`regenerate` 则清空 `chapterAnnotations`（3478）。**归 Story 4.6**：接真实生成、正文可被改写时，批注锚点会落到不同段落或彻底孤儿——须一并设计坐标重锚（按段落内容/稳定 id 而非序号）或落库持久化。旧格式 `0:全局index` 的历史批注在新分页下亦永不匹配（每页 idx 仅 0–4），4.6 若涉及旧数据须迁移。
+- **locate 定位跳转直接 `chapterReaderPage = focus.page` 未钳制** [prototype/app/app.js:3440] — Edge#2，Medium。与上条同根：仅当 `focus.page` 越界（4.6 改进后页数缩减）才失效——渲染层把 page 钳回末页但 `focus.page` 不变，`is-located` 永不命中且 `querySelector('[data-paragraph-position="2:3"]')?.focus()` 静默失败。本 story 批注 page 恒有效，不触发。**归 Story 4.6**：正文可变后，locate 赋值须同样钳制到 `pages.length-1`。
+- **`[data-annotation-paragraph]` 选择器同时命中侧栏 locate 列表按钮，双 handler 冗余渲染** [prototype/app/app.js:3391 vs 3105] — Edge#4，Medium，pre-existing（4.4 引入，本 diff 未触碰）。侧栏批注列表按钮（3105）也带 `data-annotation-paragraph`，被 3391 的「正文＋触发器」监听误命中，与 3434 的 `[data-locate-annotation]` 监听叠加：点一次「定位」先进批注模式再被 locate 覆盖，靠注册顺序（3391 先于 3434）碰巧得到正确终态，属脆弱未隔离路径。**归后续前端硬化**：给正文＋触发器换更专属的选择器（如 `[data-annotation-paragraph]:not([data-locate-annotation])` 或独立 data 属性），消除误命中。
+- **段落 `＋` 的 aria-label 用页内段号，第 2 页起与全章段号不符** [prototype/app/app.js:3205] — Blind#4，Low（无障碍）。`aria-label="给第 ${indexInPage+1} 段"` 用页内 0–4 序号，第 2 页首段朗读「第 1 段」实为全章第 6 段。**注**：整个 UI（含侧栏批注列表「第 X 页第 Y 段」3105）统一采用「页内编号」约定，修法涉及是否全局改「全章绝对段号」的取舍，非无歧义 patch。**归后续无障碍/编号约定统一批次**。
+
 ## Deferred from: code review of 7-5-引导探索接线 (2026-07-30)
 
 > 三层对抗审查（Blind/Edge/Auditor）。AC1-8 全 PASS、5 受控决策落地、无谎报、边界严守。1 decision-needed（模式错配，待定夺）+ 5 patch（在途异步清理/settle 死锁兜底，见 story Review Findings）+ 以下 2 条 defer。

@@ -3157,23 +3157,58 @@ function chapterContextMarkup(stagePlan) {
   </aside>`;
 }
 
-function generatedChapterMarkup(chapter, nextChapter) {
-  const chapterNumber = String(chapterCreationIndex + 1).padStart(2, "0");
-  // Story 4.4：渲染真实生成的正文（替换硬编码 3 页 mock）。按空行/换行拆段顺序渲染——分页翻页
-  // + 段落批注 + 整体点评是 Story 4.5 范围（Jianghj 2026-08-05 决议），本 story 只把数据源从
-  // mock 换成真实 chapterGeneratedText，保留 chapter-reader 骨架供 4.5 复用。
+// Story 4.5：真实正文长度不定（4.4 冒烟 ~3500 字），按段落数固定切页（Jianghj 2026-08-05 决议）。
+// 每页固定 CHAPTER_PAGE_SIZE 段，贴合原型每页 ~5 段观感。
+const CHAPTER_PAGE_SIZE = 5;
+
+// Story 4.5：拆段 + 按段落数分页的纯函数（无副作用）。渲染与翻页监听共用它重算，避免渲染/监听
+// 状态不同步（Dev Notes 推荐「重算最简单、不引入新状态」）。返回 `string[][]`（页→页内段）。
+// 空正文返回 `[[]]`（1 个空页），供渲染层落占位段兜底。
+function chapterPages() {
   const paragraphs = (chapterGeneratedText || "")
     .split(/\n+/)
     .map((p) => p.trim())
     .filter(Boolean);
-  const prose = paragraphs.length
-    ? paragraphs
-        .map(
-          (paragraph, index) =>
-            `<div class="chapter-paragraph" data-paragraph-position="0:${index}" tabindex="-1"><p>${escapeHtml(paragraph)}</p></div>`,
-        )
+  if (!paragraphs.length) return [[]];
+  const pages = [];
+  for (let i = 0; i < paragraphs.length; i += CHAPTER_PAGE_SIZE) {
+    pages.push(paragraphs.slice(i, i + CHAPTER_PAGE_SIZE));
+  }
+  return pages;
+}
+
+function generatedChapterMarkup(chapter, nextChapter) {
+  const chapterNumber = String(chapterCreationIndex + 1).padStart(2, "0");
+  // Story 4.5：恢复分页阅读器（4.4 曾降为单页顺序渲染，保留骨架供本 story 复用）。
+  const pages = chapterPages();
+  // 越界钳制（AC1）：改进后正文变短、页数减少时把当前页钳到有效范围，防空白页。
+  chapterReaderPage = Math.max(0, Math.min(chapterReaderPage, pages.length - 1));
+  const pageParagraphs = pages[chapterReaderPage];
+  const prose = pageParagraphs.length
+    ? pageParagraphs
+        .map((paragraph, indexInPage) => {
+          // 批注坐标是「页:页内段」（chapterReaderPage:indexInPage），供 chapterAnnotations 定位与跨页跳转。
+          const hasAnnotation = chapterAnnotations.some(
+            (annotation) =>
+              annotation.page === chapterReaderPage &&
+              annotation.paragraph === indexInPage,
+          );
+          const isSelected =
+            chapterAnnotationTarget?.page === chapterReaderPage &&
+            chapterAnnotationTarget?.paragraph === indexInPage;
+          const isLocated =
+            chapterAnnotationFocus?.page === chapterReaderPage &&
+            chapterAnnotationFocus?.paragraph === indexInPage;
+          // 定稿后不渲染 ＋ 触发器（EXPERIENCE.md:94/112）。
+          const trigger = chapterFinalized
+            ? ""
+            : `<button type="button" class="paragraph-annotation-trigger" data-annotation-page="${chapterReaderPage}" data-annotation-paragraph="${indexInPage}" aria-label="给第 ${indexInPage + 1} 段添加批注">＋</button>`;
+          return `<div class="chapter-paragraph ${hasAnnotation ? "has-annotation" : ""} ${isSelected ? "is-selected" : ""} ${isLocated ? "is-located" : ""}" data-paragraph-position="${chapterReaderPage}:${indexInPage}" tabindex="-1">${trigger}<p>${escapeHtml(paragraph)}</p></div>`;
+        })
         .join("")
     : '<div class="chapter-paragraph"><p>（本章正文为空，可点「改进本章」或重新生成。）</p></div>';
+  const pageNumber = String(chapterReaderPage + 1).padStart(2, "0");
+  const pageTotal = String(pages.length).padStart(2, "0");
   return `<article class="chapter-reader" aria-labelledby="chapter-reader-title">
     <div class="chapter-reader-meta"><span>第一阶段 / 第 ${chapterNumber} 章</span><span>${chapterFinalized ? "已定稿" : `草稿 V${chapterRevision}`}</span></div>
     <div class="chapter-title-band">
@@ -3182,8 +3217,11 @@ function generatedChapterMarkup(chapter, nextChapter) {
     </div>
     <p class="chapter-reader-lead">${escapeHtml(chapter.brief)}</p>
     <div class="chapter-reading-frame">
+      <button class="chapter-page-turn is-previous" type="button" data-chapter-page="previous" aria-label="上一页" ${chapterReaderPage === 0 ? "disabled" : ""}>←</button>
       <div class="chapter-prose" aria-live="polite">${prose}</div>
+      <button class="chapter-page-turn is-next" type="button" data-chapter-page="next" aria-label="下一页" ${chapterReaderPage === pages.length - 1 ? "disabled" : ""}>→</button>
     </div>
+    <footer class="chapter-pagination" aria-label="当前页码"><span><strong>${pageNumber}</strong> / ${pageTotal}</span></footer>
   </article>`;
 }
 
@@ -3334,6 +3372,23 @@ function bindChapterCreationInteractions() {
         chapterGenSeq,
       );
     });
+  // Story 4.5：翻页监听（4.4 接真实正文时删了分页 UI 与该死监听，本 story 恢复）。翻页只移
+  // 指针、不改数据；页数上界用 chapterPages() 重算（与渲染共用纯函数，避免状态不同步）；
+  // 翻页清当前批注目标但保留已保存批注列表与整体点评（EXPERIENCE.md:93）。
+  document.querySelectorAll("[data-chapter-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const pageCount = chapterPages().length;
+      if (button.dataset.chapterPage === "previous") {
+        chapterReaderPage = Math.max(0, chapterReaderPage - 1);
+      } else {
+        chapterReaderPage = Math.min(pageCount - 1, chapterReaderPage + 1);
+      }
+      chapterAnnotationTarget = null;
+      chapterAnnotationDraft = "";
+      chapterAnnotationFocus = null;
+      renderChapterCreation();
+    });
+  });
   document.querySelectorAll("[data-annotation-paragraph]").forEach((button) => {
     button.addEventListener("click", () => {
       chapterAnnotationTarget = {
@@ -3376,6 +3431,11 @@ function bindChapterCreationInteractions() {
       chapterAnnotationTarget = null;
       chapterAnnotationDraft = "";
       renderChapterCreation();
+      document
+        .querySelector(
+          `[data-paragraph-position="${chapterAnnotationFocus.page}:${chapterAnnotationFocus.paragraph}"]`,
+        )
+        ?.focus();
     });
   document.querySelectorAll("[data-locate-annotation]").forEach((button) => {
     button.addEventListener("click", () => {
