@@ -152,6 +152,28 @@ async def get_pending_by_project(
     return result.scalar_one_or_none()
 
 
+async def get_confirmed_by_project(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> StoryBible | None:
+    """取本作品的**已确认设定圣经**（status='confirmed'，Story 4.2 drafter 写前上下文读取源）。
+
+    where 带 user_id+project_id+status（租户守卫二义合一 + 只收 confirmed）：无 confirmed 行
+    → None——调用方（context-agent）按「设定未确认、不能创作」处理（抛 bible_not_confirmed
+    400，提示先确认设定）。Epic 4 创作的唯一设定依据是 confirmed 圣经（story_bible.py:99），
+    draft/pending 半成品不入创作上下文。
+    """
+    stmt = select(StoryBible).where(
+        StoryBible.user_id == user_id,
+        StoryBible.project_id == project_id,
+        StoryBible.status == "confirmed",
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 async def update_card_fields(
     session: AsyncSession,
     *,

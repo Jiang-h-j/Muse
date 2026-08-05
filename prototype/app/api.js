@@ -108,7 +108,7 @@ let inflightRefresh = null;
 // 统一请求入口（AC1）。
 // path: 形如 "/api/auth/me"；opts.auth=true 注入 Bearer，=false 用于 login/register/refresh。
 // opts._retried: 内部标记，401 重放时置 true 避免死循环（调用方勿传）。
-async function apiFetch(path, { method = "GET", body, auth = true, _retried = false } = {}) {
+async function apiFetch(path, { method = "GET", body, auth = true, signal, _retried = false } = {}) {
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -120,13 +120,14 @@ async function apiFetch(path, { method = "GET", body, auth = true, _retried = fa
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   });
 
   // Task 3：业务请求（auth=true）401 → 刷新重放（仅重放一次）。登录/注册/刷新自身
   // （auth=false）的 401 是凭证错误/refresh 失效，不进刷新分支（受控决策 4）。
   if (res.status === 401 && auth && !_retried && getRefreshToken()) {
     await ensureRefresh(); // 失败会抛错并已 clearTokens + 跳登录，原请求链在此终止
-    return apiFetch(path, { method, body, auth, _retried: true });
+    return apiFetch(path, { method, body, auth, signal, _retried: true });
   }
 
   // 无法救回的业务 401（review 决策 1）：①重放后仍 401（新 access 也无权/账号已失效）；
@@ -643,6 +644,50 @@ const storyApi = {
 };
 
 // ---------------------------------------------------------------------
+// 章节创作 API 薄封装（Story 4.3）：首个阶段规划的幕后触发 + 落库恢复。
+// 触发是 POST→taskId 提交（幕后 ARQ 任务，confirm 成功后调用），SSE 消费复用
+// explorationApi.taskEvents（GET /api/tasks/{taskId}/events，progress/result/error）；恢复是
+// 同步 GET（重进第一章先拉一次已落库的阶段规划，未生成则 204→null）。均走 apiFetch。
+// 后端契约（backend/src/muse/routers/chapter.py，Story 4.3/4.4）：
+//   POST /api/projects/{id}/chapters/plan-stage → 200 {taskId}（无请求体，触发幕后阶段规划）
+//   GET  /api/projects/{id}/chapters/stage-plan → 200 {stageNumber, goal, chapters:[{title,brief}]} / 204（未生成→null）
+//   POST /api/projects/{id}/chapters/{n}/generate → 200 {taskId}（body {chapterIdea?}，触发真实生成正文，连 taskEvents 消费 SSE）
+//   GET  /api/projects/{id}/chapters/{n}         → 200 {chapterNumber, chapterText, revision, status} / 204（未生成→null）
+const chapterApi = {
+  // 触发幕后生成首个阶段规划：无请求体，返 {taskId} 供连 SSE（taskEvents）。
+  planStage(projectId) {
+    return apiFetch(`/api/projects/${projectId}/chapters/plan-stage`, {
+      method: "POST",
+    });
+  },
+  // 取已落库的首个阶段规划：有则 200 阶段规划、无则 204→apiFetch 返 null。
+  // signal：进第一章的 GET 恢复阶段也可被离页/换项目 abort（Story 4.3 P2）。
+  getStagePlan(projectId, { signal } = {}) {
+    return apiFetch(`/api/projects/${projectId}/chapters/stage-plan`, {
+      signal,
+    });
+  },
+  // 触发真实生成章节正文（Story 4.4）：body {chapterIdea}（可空=跳过并生成），返 {taskId} 供
+  // 连 SSE（explorationApi.taskEvents 消费 progress/result；result 里 chapterText 为终稿正文）。
+  generateChapter(projectId, chapterNumber, { chapterIdea } = {}) {
+    return apiFetch(
+      `/api/projects/${projectId}/chapters/${chapterNumber}/generate`,
+      {
+        method: "POST",
+        body: { chapterIdea: chapterIdea || null },
+      },
+    );
+  },
+  // 取已落库的章节终稿正文（Story 4.4 重进恢复）：有则 200 {chapterNumber, chapterText,
+  // revision, status}、无则 204→apiFetch 返 null。signal：进第一章 GET 恢复可被离页/换项目 abort。
+  getChapterText(projectId, chapterNumber, { signal } = {}) {
+    return apiFetch(`/api/projects/${projectId}/chapters/${chapterNumber}`, {
+      signal,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------
 // 全局暴露（受控决策 1：全局脚本，非 module）。app.js 及 7.2–7.7 直接引用这些符号。
 // ---------------------------------------------------------------------
 if (typeof window !== "undefined") {
@@ -656,6 +701,7 @@ if (typeof window !== "undefined") {
   window.parseSSEFrame = parseSSEFrame;
   window.explorationApi = explorationApi;
   window.storyApi = storyApi;
+  window.chapterApi = chapterApi;
   window.getAccessToken = getAccessToken;
   window.getRefreshToken = getRefreshToken;
   window.setTokens = setTokens;

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from muse.core import sse
 from muse.core.errors import ErrorEnvelope
 from muse.core.settings import get_settings
+from muse.orchestration import pipeline, stage_planner
 from muse.providers.factory import get_provider_for_user
 from muse.schemas.story import StoryProfileCard
 from muse.services import story_settle_agent, usage_service
@@ -184,6 +185,163 @@ async def settle_exploration(
         raise
 
 
+# 章节生成流水线段序（= pipeline.PIPELINE_STEPS）：progress percent 按段索引推进。
+_CHAPTER_STEP_ORDER: dict[str, int] = {
+    name: i + 1 for i, name in enumerate(pipeline.PIPELINE_STEPS)
+}
+_CHAPTER_TOTAL_STEPS = len(pipeline.PIPELINE_STEPS)
+
+
+async def generate_chapter(
+    ctx: dict,
+    task_id: str,
+    user_id: str,
+    project_id: str,
+    chapter_number: int,
+    chapter_idea: str | None = None,
+) -> dict[str, object]:
+    """章节生成 ARQ 任务（Story 4.2 AC5）：驱动四段流水线、逐段推 SSE progress、末推 result。
+
+    承 settle_exploration 范式（worker.py 上文）：step 逐段推 progress → 调编排器
+    `pipeline.run_chapter_pipeline` → 末推 result（终稿正文）；异常推 error（护栏 429 / 空产
+    502 经 ErrorEnvelope 透传 code/message，其余泛化 generate_failed）。
+
+    **断点续跑（AR11）**：编排器用 chapter_generation_run 表持久化各段状态——ARQ 重试本任务时，
+    已 succeeded 段直接复用落库产物、只从失败段续跑（不重复付费 NFR5）。故任务体幂等可重入。
+
+    progress：把 SSE 推进度作为 `on_progress` 回调传给编排器——每段开跑前推一条
+    {step, stepName, percent}（复用的段不回调、不推，因为已完成）。
+
+    陷阱④：worker 独立进程/事件循环，编排器与四段 step 各自用 `async_session_maker()` 自管
+    独立 session（不复用本 worker ctx 的 session）。陷阱⑧：任何异常都推 error 事件。
+    """
+    pub: Redis = ctx["pub_redis"]
+
+    async def _on_progress(step_name: str) -> None:
+        step_no = _CHAPTER_STEP_ORDER.get(step_name, 0)
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_PROGRESS,
+            {
+                "step": step_no,
+                "stepName": step_name,
+                "percent": round(step_no / _CHAPTER_TOTAL_STEPS * 100),
+            },
+        )
+
+    try:
+        final_text = await pipeline.run_chapter_pipeline(
+            user_id=uuid.UUID(user_id),
+            project_id=uuid.UUID(project_id),
+            chapter_number=chapter_number,
+            chapter_idea=chapter_idea,
+            on_progress=_on_progress,
+        )
+        payload: dict[str, object] = {
+            "taskId": task_id,
+            "status": "chapter_ready",
+            "chapterNumber": chapter_number,
+            "chapterText": final_text,
+        }
+        await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
+        return payload
+    except ErrorEnvelope as exc:
+        # 受控业务错误（护栏触顶 429 / 设定未确认 400 / 空产 502）：透传 code/message
+        # （照 settle_exploration worker.py:165-171）。
+        await sse.publish_event(
+            pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001  worker 内任何异常都要推 error 事件（陷阱⑧）
+        # 原始异常仅落日志（可能含 DB 连接串/驱动错误/内部路径）；对外 error 只用固定泛化文案，
+        # 避免内部实现细节经 SSE 外泄（承 settle_exploration worker.py:172-184）。
+        logger.exception(
+            "generate_chapter 任务失败：task_id=%s", task_id, exc_info=exc
+        )
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_ERROR,
+            {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+        )
+        raise
+
+
+# 阶段规划任务步数（读设定 + LLM 生成 + 落库完成），每步一个 progress 事件。
+_PLAN_TOTAL_STEPS = 3
+
+
+def _plan_progress(step: int) -> dict[str, object]:
+    """构造阶段规划任务 progress payload（camelCase，architecture.md:336，陷阱⑦）。"""
+    return {"step": step, "percent": round(step / _PLAN_TOTAL_STEPS * 100)}
+
+
+async def plan_first_stage(
+    ctx: dict, task_id: str, user_id: str, project_id: str
+) -> dict[str, object]:
+    """幕后生成首个阶段规划 ARQ 任务（Story 4.3 AC1/AC6）：confirm 成功后触发。
+
+    承 settle_exploration 范式（worker.py 上文）：推 progress → 调
+    `stage_planner.plan_first_stage`（读 confirmed bible → LLM 出阶段目标+章骨架 → 落库）→
+    末推 result（阶段规划 camelCase）；异常推 error（护栏 429 / 设定未确认 400 / 空产 502 经
+    ErrorEnvelope 透传 code/message，其余泛化 generate_failed）。
+
+    **幕后无阻塞**（FR17）：本任务在后台跑，confirm 端点已立即返回、用户体感直接进第一章；第一章
+    侧栏经 SSE 消费本任务的 progress/result（就绪前显示加载/占位态，就绪后渲染真实阶段计划）。
+
+    陷阱④：worker 独立进程/事件循环，service 内自管独立 session（不复用本 worker ctx 的
+    session）。陷阱⑧：任何异常都推 error 事件。
+    """
+    pub: Redis = ctx["pub_redis"]
+    try:
+        # ---- step 1：开始生成（推 progress，驱动前端加载态）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(1))
+
+        # ---- step 2：真实 LLM 生成阶段规划 + 落库（service 自管独立 session）----
+        # 设定未确认 400 / 触顶 429 / 空产 502 均由 service 抛 ErrorEnvelope，走下方 except 透传。
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(2))
+        plan = await stage_planner.plan_first_stage(
+            user_id=uuid.UUID(user_id),
+            project_id=uuid.UUID(project_id),
+        )
+
+        # ---- step 3：完成，推真实阶段规划 result（camelCase，陷阱⑦）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(3))
+        # stagePlan payload：goal + chapters[{title, brief}]。title/brief 无下划线，camelCase
+        # 天然一致；SSE payload 须调用方保证 camelCase（format_sse_event 不转换，sse.py:75-81）。
+        payload: dict[str, object] = {
+            "taskId": task_id,
+            "status": "stage_plan_ready",
+            "stagePlan": {
+                "goal": plan.goal,
+                "chapters": plan.chapters or [],
+            },
+        }
+        await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
+        return payload
+    except ErrorEnvelope as exc:
+        # 受控业务错误（护栏触顶 429 / 设定未确认 400 / 空产 502）：透传 code/message
+        # （照 generate_chapter worker.py:249-254）。
+        await sse.publish_event(
+            pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001  worker 内任何异常都要推 error 事件（陷阱⑧）
+        # 原始异常仅落日志（可能含 DB 连接串/驱动错误/内部路径）；对外 error 只用固定泛化文案，
+        # 避免内部实现细节经 SSE 外泄（承 generate_chapter worker.py:256-267）。
+        logger.exception(
+            "plan_first_stage 任务失败：task_id=%s", task_id, exc_info=exc
+        )
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_ERROR,
+            {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+        )
+        raise
+
+
 async def on_startup(ctx: dict) -> None:
     """worker 启动：建独立 async engine + session_maker + 发布用 Redis 连接（陷阱⑦）。"""
     settings = get_settings()
@@ -209,9 +367,20 @@ class WorkerSettings:
 
     redis_settings 从 settings.redis_url 派生（与应用共用 broker）；on_startup/on_shutdown 管理
     worker 独立的 DB/Redis 连接生命周期（陷阱⑦）。
+
+    **max_tries=1（Story 4.4，兑现 deferred-work.md:112/162/215「归 4.4」）**：ARQ 默认
+    max_tries=5，任务 raise 即整体重试。真实生成（generate_chapter）每段各自 check_quota +
+    MeteredProvider 每次真计费（steps.py:172/208/273），确定性失败（502 空产 / 400 未确认 / LLM
+    跑偏）被自动重试 5× 会直接翻倍 LLM 成本、且同 _job_id 稳定频道重放 progress/error 致前端终态
+    矛盾。改 max_tries=1 后：瞬时失败靠 pipeline 断点续跑（状态落 PG，用户明示重试从断点续跑，
+    不依赖 ARQ 整体重试）；确定性失败一次到位、经 SSE error 交前端处理。**统一覆盖全部任务**
+    （demo_generate/settle_exploration/generate_chapter/plan_first_stage 同一 WorkerSettings），
+    非只补 generate——settle 等任务同样是 LLM 计费任务，重试 5× 同样有害（deferred-work.md:215
+    要求「涵盖全部 ARQ 任务勿只补 settle」）。
     """
 
-    functions = [demo_generate, settle_exploration]
+    functions = [demo_generate, settle_exploration, generate_chapter, plan_first_stage]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
+    max_tries = 1
     on_startup = on_startup
     on_shutdown = on_shutdown

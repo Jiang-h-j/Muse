@@ -183,6 +183,62 @@ let stagePlanningDraft = {
   chapters: "",
 };
 let currentStagePlan = null;
+// Story 4.3：章节页真实 projectId（替换硬编码 demo）+ 阶段规划幕后加载态。
+let chapterProjectId = "";
+let stagePlanLoadState = "idle"; // idle | loading | ready | error | empty(未生成、待用户明示触发)
+let stagePlanErrorText = "";
+let stagePlanAbortController = null;
+let stagePlanSeq = 0; // 拉取/生成代次，防在途赛跑（仿 guidedLoadSeq）
+// Story 4.3（review 改时机）：阶段规划触发点从「进页面」挪到「确认设定成功那一次」（一次性事件、
+// 天然不重复）。触发后把 {projectId, taskId} 存 sessionStorage；刷新/重进第一章时凭它接回**正在
+// 跑的那个任务**的 SSE（后端 sse.py 快照补发支持晚订阅），而非再叫一次生成——从根上杜绝重复触发/
+// 重复付费（不需加锁）。进页面查库空且无在途 taskId 时，只显示「未生成」态、由用户明示点「生成」才触发。
+const stagePlanTaskKey = "muse-stage-plan-task";
+function readStagePlanTask(projectId) {
+  const stored = readStoredJson(stagePlanTaskKey);
+  if (stored && stored.projectId === projectId && stored.taskId) return stored.taskId;
+  return null;
+}
+function persistStagePlanTask(projectId, taskId) {
+  window.sessionStorage.setItem(
+    stagePlanTaskKey,
+    JSON.stringify({ projectId, taskId }),
+  );
+}
+function clearStagePlanTask() {
+  window.sessionStorage.removeItem(stagePlanTaskKey);
+}
+// Story 4.4：章节正文真实生成态（替换 1200ms mock）。仿 stage-plan 的代次 + AbortController
+// 三守卫（seq/projectId/abort）。生成流触发后把 {projectId, chapterNumber, taskId} 存
+// sessionStorage；刷新/重进凭它接回**正在跑的那个任务**的 SSE（后端快照补发支持晚订阅），而非
+// 再叫一次生成——杜绝重复触发/重复付费。chapterGeneratedText 存 SSE result/GET 恢复的终稿正文。
+let chapterGenAbortController = null;
+let chapterGenSeq = 0;
+let chapterGeneratedText = "";
+// 记录「本章正文态已恢复到哪一章」（projectId:chapterNumber）——route 分支据此判断跨章跳转是否
+// 需要重新恢复正文态（同章内部重渲染直接渲染，跨章须 recoverChapterState 拉新章正文/接在途）。
+let chapterRecoveredKey = "";
+const chapterGenTaskKey = "muse-chapter-gen-task";
+function readChapterGenTask(projectId, chapterNumber) {
+  const stored = readStoredJson(chapterGenTaskKey);
+  if (
+    stored &&
+    stored.projectId === projectId &&
+    stored.chapterNumber === chapterNumber &&
+    stored.taskId
+  )
+    return stored.taskId;
+  return null;
+}
+function persistChapterGenTask(projectId, chapterNumber, taskId) {
+  window.sessionStorage.setItem(
+    chapterGenTaskKey,
+    JSON.stringify({ projectId, chapterNumber, taskId }),
+  );
+}
+function clearChapterGenTask() {
+  window.sessionStorage.removeItem(chapterGenTaskKey);
+}
 let chapterCreationState = "input";
 let chapterIdea = "";
 let chapterReaderPage = 0;
@@ -677,6 +733,8 @@ function storyErrorText(err) {
       return "所选文风样本不存在。";
     case "generate_failed":
       return "生成失败，请稍后重试。";
+    case "bible_not_confirmed":
+      return "请先确认故事设定，再开始创作章节。";
     case "quota_exceeded":
       return "已用完当前免费额度。可到设置页绑定自己的 API Key 后继续。";
     case "project_not_found":
@@ -1521,6 +1579,342 @@ async function startSettleFlow() {
   }
 }
 
+// Story 4.3：进第一章的阶段规划入口——先 GET 已落库规划，无则触发幕后生成 + SSE 消费。
+// 幂等按 (projectId) 单守卫：同一作品重进复用已落库规划（重进不重生成，AC2）。
+async function loadChapterStagePlan(projectId) {
+  // 取消上一个在途流（切走/换项目防御），起新代次守卫。
+  if (stagePlanAbortController) stagePlanAbortController.abort();
+  stagePlanSeq += 1;
+  const seq = stagePlanSeq;
+  chapterProjectId = projectId;
+  // P2：GET 恢复阶段也建 controller 并存入全局，让离页（render !chapterMatch）/登出能 abort、
+  // 且 GET 带 signal 可中断——否则停在 GET 阶段切走时在途流不取消，回调仍继续触发多余生成 + 覆盖 DOM。
+  if (stagePlanAbortController) stagePlanAbortController.abort();
+  stagePlanAbortController = new AbortController();
+  const signal = stagePlanAbortController.signal;
+  const stale = () =>
+    signal.aborted || seq !== stagePlanSeq || projectId !== chapterProjectId;
+
+  // 先渲染加载态（chapterMatch 已把 index 设好；此时 currentStagePlan 可能是上一项目的残留）。
+  currentStagePlan = null;
+  stagePlanLoadState = "loading";
+  stagePlanErrorText = "";
+  // Story 4.4：重置章节生成态（防跨项目/跨章残留——如上一章 reading 态切到新项目第一章）。
+  // 真实态由下方 recoverChapterState 按 GET 正文 / 在途任务重建。
+  if (chapterGenAbortController) chapterGenAbortController.abort();
+  chapterGenAbortController = null;
+  chapterCreationState = "input";
+  chapterGeneratedText = "";
+  chapterIdea = "";
+  renderChapterCreation();
+
+  try {
+    // 1. 先 GET 已落库的阶段规划（刷新/断线重进恢复，AC2）。
+    const existing = await chapterApi.getStagePlan(projectId, { signal });
+    if (stale()) return;
+    if (existing && Array.isArray(existing.chapters) && existing.chapters.length) {
+      currentStagePlan = existing;
+      stagePlanLoadState = "ready";
+      stagePlanAbortController = null;
+      clearStagePlanTask(); // 已落库，在途 taskId 不再需要
+      renderChapterCreation();
+      // Story 4.4：阶段规划就绪后，恢复本章正文态（GET 已落库正文 → reading；否则接在途生成
+      // 任务 / 显示 input）。不阻塞 stage-plan 渲染——先渲染骨架，再异步定 input/generating/reading。
+      recoverChapterState(projectId, chapterCreationIndex + 1);
+      return;
+    }
+    // existing 为 null = 204 未生成（GET 契约：无落库→204→apiFetch 返 null）。
+  } catch (err) {
+    if (stale()) return; // 被 abort（AbortError）/ 已切走：静默退出，不报错、不触发
+    // P3：GET 抛 ApiError（404 租户/5xx/网络/invalid_response）≠「未生成」，不该重新触发生成
+    // （已落库时真实错误重触发会重复付费）。判死为错误态、让用户重试，而非兜底触发。
+    stagePlanAbortController = null;
+    stagePlanLoadState = "error";
+    stagePlanErrorText = storyErrorText(err);
+    renderChapterCreation();
+    return;
+  }
+  if (stale()) return;
+  // 2. 未落库（204）——review 改时机：进页面**绝不主动叫新生成**。凭确认设定时存下的在途 taskId
+  // 接回**正在跑的那个任务**的 SSE（后端快照补发支持晚订阅），从根上杜绝「进页面反复触发/重复付费」。
+  const pendingTaskId = readStagePlanTask(projectId);
+  if (pendingTaskId) {
+    await consumeStagePlanTask(projectId, seq, pendingTaskId);
+    return;
+  }
+  // 3. 既无落库、又无在途任务（确认时触发失败 / sessionStorage 丢失 / 关页重开）：显示未生成态，
+  // 由用户明示点「生成阶段计划」才触发（renderChapterCreation empty 分支 + data-retry-stage-plan）。
+  stagePlanAbortController = null;
+  stagePlanLoadState = "empty";
+  renderChapterCreation();
+}
+
+// 接回/消费一个已存在的阶段规划任务的 SSE（AC6，仿 startSettleFlow 的消费段）：GET
+// /tasks/{id}/events 消费 progress/result/error。seq/projectId/abort 三守卫 + 无终态兜底 + 终态清
+// 在途 taskId。**不发起 POST**——用于「刷新/重进凭本地 taskId 接回正在跑的那个任务」（后端快照
+// 补发支持晚订阅）。复用当前 stagePlanAbortController（调用方已建），signal 随之被离页/登出 abort。
+async function consumeStagePlanTask(projectId, seq, taskId) {
+  const signal = stagePlanAbortController && stagePlanAbortController.signal;
+  const stale = () =>
+    (signal && signal.aborted) || seq !== stagePlanSeq || projectId !== chapterProjectId;
+  let gotTerminal = false;
+  try {
+    await explorationApi.taskEvents(taskId, {
+      signal,
+      onEvent: (type, data) => {
+        if (stale()) return;
+        if (type === "result" && data && data.stagePlan) {
+          gotTerminal = true;
+          stagePlanAbortController = null;
+          clearStagePlanTask();
+          currentStagePlan = {
+            stageNumber: data.stagePlan.stageNumber || 1,
+            goal: data.stagePlan.goal || "",
+            chapters: Array.isArray(data.stagePlan.chapters)
+              ? data.stagePlan.chapters
+              : [],
+          };
+          stagePlanLoadState = "ready";
+          renderChapterCreation();
+        } else if (type === "error") {
+          gotTerminal = true;
+          stagePlanAbortController = null;
+          clearStagePlanTask();
+          stagePlanLoadState = "error";
+          stagePlanErrorText = storyErrorText({ code: data && data.code });
+          renderChapterCreation();
+        }
+        // progress：加载态已在显示，V1 不额外更新（保持文案态）。
+      },
+    });
+    // 无终态兜底（防永久 spinner，仿 startSettleFlow）：SSE 正常结束却没收到 result/error。
+    if (!stale() && !gotTerminal && stagePlanLoadState === "loading") {
+      stagePlanAbortController = null;
+      clearStagePlanTask();
+      stagePlanLoadState = "error";
+      stagePlanErrorText = storyErrorText({ code: "generate_failed" });
+      renderChapterCreation();
+    }
+  } catch (err) {
+    if (stale()) return; // 用户主动 abort / 已切走，不报错
+    stagePlanAbortController = null;
+    clearStagePlanTask();
+    stagePlanLoadState = "error";
+    stagePlanErrorText = storyErrorText(err);
+    renderChapterCreation();
+  }
+}
+
+// 主动触发幕后阶段规划生成 + SSE 消费（AC1/AC6）：POST plan-stage 拿 taskId → 存 sessionStorage
+// （刷新可接回）→ consumeStagePlanTask 消费 SSE。**仅用于用户明示触发**——确认设定成功时（一次性）、
+// 或未生成/失败态用户点「生成/重新生成」。进页面渲染绝不调用本函数（改时机后进页面只查库/接在途）。
+async function startStagePlanFlow(projectId, seq) {
+  if (stagePlanAbortController) stagePlanAbortController.abort();
+  stagePlanAbortController = new AbortController();
+  const signal = stagePlanAbortController.signal;
+  const stale = () =>
+    signal.aborted || seq !== stagePlanSeq || projectId !== chapterProjectId;
+  stagePlanLoadState = "loading";
+  stagePlanErrorText = "";
+  renderChapterCreation();
+  let taskId;
+  try {
+    ({ taskId } = await chapterApi.planStage(projectId));
+    if (stale()) return;
+    persistStagePlanTask(projectId, taskId);
+  } catch (err) {
+    if (stale()) return;
+    stagePlanAbortController = null;
+    stagePlanLoadState = "error";
+    stagePlanErrorText = storyErrorText(err);
+    renderChapterCreation();
+    return;
+  }
+  await consumeStagePlanTask(projectId, seq, taskId);
+}
+
+// Story 4.4：接回/消费一个已存在的章节生成任务的 SSE（仿 consumeStagePlanTask）：GET
+// /tasks/{id}/events 消费 progress/result/error。seq/projectId/chapterNumber/abort 守卫 + 无终态
+// 兜底 + 终态清在途 taskId。**不发起 POST**——用于「刷新/重进凭本地 taskId 接回正在跑的那个任务」。
+// 复用当前 chapterGenAbortController（调用方已建），signal 随之被离页/登出 abort。
+async function consumeChapterGenTask(projectId, chapterNumber, seq, taskId) {
+  const signal = chapterGenAbortController && chapterGenAbortController.signal;
+  const stale = () =>
+    (signal && signal.aborted) ||
+    seq !== chapterGenSeq ||
+    projectId !== chapterProjectId ||
+    chapterNumber !== chapterCreationIndex + 1;
+  let gotTerminal = false;
+  try {
+    await explorationApi.taskEvents(taskId, {
+      signal,
+      onEvent: (type, data) => {
+        if (stale()) return;
+        if (type === "result" && data && typeof data.chapterText === "string") {
+          gotTerminal = true;
+          chapterGenAbortController = null;
+          clearChapterGenTask();
+          chapterGeneratedText = data.chapterText;
+          chapterCreationState = "reading";
+          chapterReaderPage = 0;
+          renderChapterCreation();
+        } else if (type === "error") {
+          gotTerminal = true;
+          chapterGenAbortController = null;
+          clearChapterGenTask();
+          // 生成失败：退回输入态可重试，给可读提示（复用 storyErrorText，含 429/502/泛化）。
+          chapterCreationState = "input";
+          renderChapterCreation();
+          showChapterInlineError(storyErrorText({ code: data && data.code }));
+        }
+        // progress：generating 态文案已在显示，V1 不额外更新（仿 4.3 app.js:1646）。
+      },
+    });
+    // 无终态兜底（防永久「生成中」，仿 consumeStagePlanTask）：SSE 正常结束却没收到 result/error。
+    if (!stale() && !gotTerminal && chapterCreationState === "generating") {
+      chapterGenAbortController = null;
+      clearChapterGenTask();
+      chapterCreationState = "input";
+      renderChapterCreation();
+      showChapterInlineError(storyErrorText({ code: "generate_failed" }));
+    }
+  } catch (err) {
+    if (stale()) return; // 用户主动 abort / 已切走，不报错
+    chapterGenAbortController = null;
+    clearChapterGenTask();
+    chapterCreationState = "input";
+    renderChapterCreation();
+    showChapterInlineError(storyErrorText(err));
+  }
+}
+
+// Story 4.4：主动触发真实章节正文生成 + SSE 消费（仿 startStagePlanFlow）：POST generate 拿
+// taskId → 存 sessionStorage（刷新可接回）→ consumeChapterGenTask 消费 SSE。**仅用于用户明示
+// 点「生成本章/跳过并生成」**。进页面渲染绝不调用本函数（进页面只查库 / 接在途）。
+async function startChapterGenFlow(projectId, chapterNumber, idea, seq) {
+  if (chapterGenAbortController) chapterGenAbortController.abort();
+  chapterGenAbortController = new AbortController();
+  chapterRecoveredKey = `${projectId}:${chapterNumber}`;
+  const signal = chapterGenAbortController.signal;
+  const stale = () =>
+    signal.aborted ||
+    seq !== chapterGenSeq ||
+    projectId !== chapterProjectId ||
+    chapterNumber !== chapterCreationIndex + 1;
+  chapterCreationState = "generating";
+  renderChapterCreation();
+  let taskId;
+  try {
+    ({ taskId } = await chapterApi.generateChapter(projectId, chapterNumber, {
+      chapterIdea: idea,
+    }));
+    if (stale()) return;
+    persistChapterGenTask(projectId, chapterNumber, taskId);
+  } catch (err) {
+    if (stale()) return;
+    chapterGenAbortController = null;
+    chapterCreationState = "input";
+    renderChapterCreation();
+    showChapterInlineError(storyErrorText(err));
+    return;
+  }
+  await consumeChapterGenTask(projectId, chapterNumber, seq, taskId);
+}
+
+// Story 4.4：章节页内联错误提示（仿 showGuidedInlineError）。生成失败时在输入区顶部插一条错误
+// 条，无遮挡、下次渲染清除；找不到容器则 alert 兜底。
+function showChapterInlineError(text) {
+  const host =
+    document.querySelector(".chapter-entry") ||
+    document.querySelector(".chapter-main");
+  if (!host) {
+    window.alert(text);
+    return;
+  }
+  let bar = host.querySelector("[data-chapter-error]");
+  if (!bar) {
+    bar = document.createElement("p");
+    bar.className = "guided-error";
+    bar.setAttribute("data-chapter-error", "");
+    bar.setAttribute("role", "alert");
+    host.prepend(bar);
+  }
+  bar.textContent = text;
+}
+
+// Story 4.4：进第一章/刷新时恢复本章正文态（AC6，仿 loadChapterStagePlan 的「先 GET 落库、再接
+// 在途」范式）。**绝不主动 POST 生成**——只查库 / 接在途，触发只发生在用户点「生成」那一次。
+// 用 chapterGenSeq + AbortController 三守卫防跨章/切页赛跑。
+async function recoverChapterState(projectId, chapterNumber) {
+  if (chapterGenAbortController) chapterGenAbortController.abort();
+  chapterGenSeq += 1;
+  const seq = chapterGenSeq;
+  chapterRecoveredKey = `${projectId}:${chapterNumber}`;
+  // Story 4.4 review：进入新章恢复前统一重置全部章级编辑态。否则跨章/跨项目 hash 导航（不经
+  // submit/换项目/logout 三处重置）会让上一章的批注/点评/定稿/版本号残留污染新章渲染——如第 1 章
+  // 已定稿跳第 2 章，侧栏仍显示第 1 章批注、头部仍「本章已定稿」。恢复分支随后按真实态回填。
+  chapterGeneratedText = "";
+  chapterRevision = 1;
+  chapterFinalized = false;
+  chapterReaderPage = 0;
+  chapterFeedback = "";
+  chapterAgentResult = "";
+  chapterLastRevisionAction = "";
+  chapterAnnotations = [];
+  chapterAnnotationTarget = null;
+  chapterAnnotationDraft = "";
+  chapterAnnotationFocus = null;
+  chapterGenAbortController = new AbortController();
+  const signal = chapterGenAbortController.signal;
+  const stale = () =>
+    signal.aborted ||
+    seq !== chapterGenSeq ||
+    projectId !== chapterProjectId ||
+    chapterNumber !== chapterCreationIndex + 1;
+
+  try {
+    // 1. 先 GET 已落库的章节正文（刷新/断线重进恢复，AC6）。有则直接进 reading 态。
+    const existing = await chapterApi.getChapterText(projectId, chapterNumber, {
+      signal,
+    });
+    if (stale()) return;
+    if (existing && typeof existing.chapterText === "string") {
+      chapterGeneratedText = existing.chapterText;
+      chapterRevision = existing.revision || 1;
+      chapterFinalized = existing.status === "finalized";
+      chapterCreationState = "reading";
+      chapterReaderPage = 0;
+      chapterGenAbortController = null;
+      clearChapterGenTask(); // 已落库，在途 taskId 不再需要
+      renderChapterCreation();
+      return;
+    }
+    // existing 为 null = 204 未生成。
+  } catch (err) {
+    if (stale()) return; // 被 abort / 已切走：静默退出
+    // GET 抛 ApiError（404 租户/5xx/网络）≠「未生成」：保持 input 态，用户可点生成重试
+    // （不臆断为已生成、不误触发）。真实错误经内联条提示。
+    chapterGenAbortController = null;
+    chapterCreationState = "input";
+    renderChapterCreation();
+    showChapterInlineError(storyErrorText(err));
+    return;
+  }
+  if (stale()) return;
+  // 2. 未落库（204）——凭本地在途 taskId 接回**正在跑的那个生成任务**的 SSE（生成中刷新恢复）。
+  const pendingTaskId = readChapterGenTask(projectId, chapterNumber);
+  if (pendingTaskId) {
+    chapterCreationState = "generating";
+    renderChapterCreation();
+    await consumeChapterGenTask(projectId, chapterNumber, seq, pendingTaskId);
+    return;
+  }
+  // 3. 既无落库正文、又无在途任务：显示输入态，等用户填想法/点生成（不主动触发）。
+  chapterGenAbortController = null;
+  chapterCreationState = "input";
+  renderChapterCreation();
+}
+
 // 引导页内联错误提示：在引导 stage 顶部插一条错误条（无遮挡、可被下次渲染清除）。
 function showGuidedInlineError(text) {
   const stage = document.querySelector(".guided-stage");
@@ -2008,6 +2402,21 @@ async function confirmStoryProfileAndEnterChapter() {
   // 确保第一章从头开始渲染
   chapterCreationState = "input";
   chapterIdea = "";
+  // Story 4.3（review 改时机）：在「确认设定成功」这一次性事件里主动触发幕后生成阶段规划，
+  // 而非把触发挂在「进第一章页面」（后者会被刷新/重进反复触发 → 重复叫 AI/重复付费）。触发拿到
+  // taskId 存 sessionStorage，跳转后进页面凭它接回同一个在途任务的 SSE（不再新触发，FR17 幕后无阻塞）。
+  currentStagePlan = null;
+  stagePlanLoadState = "idle";
+  stagePlanErrorText = "";
+  chapterProjectId = "";
+  clearStagePlanTask();
+  try {
+    const { taskId } = await chapterApi.planStage(projectId);
+    if (taskId) persistStagePlanTask(projectId, taskId);
+  } catch {
+    // 触发失败不阻塞跳转（幕后无阻塞，FR17）：进页面查库空且无在途 taskId → 未生成态，
+    // 用户可点「生成阶段计划」明示重试。confirm 已成功、phase 已进 chapter，不因此回退。
+  }
   closeStoryProfileDialog();
   location.hash = `#/projects/${projectId}/chapters/1`;
 }
@@ -2188,53 +2597,8 @@ function confirmedStoryProfileReference() {
   </details>`;
 }
 
-function buildCurrentStagePlan() {
-  const countMatch = stagePlanningDraft.chapters.match(/\d+/);
-  const chapterCount = Math.min(7, Math.max(3, Number(countMatch?.[0]) || 5));
-  const templates = [
-    {
-      title: "打破日常",
-      brief:
-        stagePlanningDraft.opening ||
-        "一件无法忽视的意外把主角从原有生活中拖出来。",
-    },
-    {
-      title: "不存在的证明",
-      brief:
-        stagePlanningDraft.conflict ||
-        "主角第一次试图证明异常，却发现所有证据都在否定他的记忆。",
-    },
-    {
-      title: "代价显现",
-      brief:
-        stagePlanningDraft.events ||
-        "追查开始产生真实代价，主角必须在自保和继续前进之间选择。",
-    },
-    {
-      title: "立场转折",
-      brief: "新的线索改变主角对同伴和敌人的判断，迫使他重新选择立场。",
-    },
-    {
-      title: "无法回头的选择",
-      brief:
-        stagePlanningDraft.goal ||
-        "主角作出不可撤销的决定，完成本阶段最重要的状态变化。",
-    },
-    {
-      title: "余波",
-      brief: "阶段冲突暂时收束，同时留下足以推动下一阶段的新问题。",
-    },
-    {
-      title: "新的方向",
-      brief: "人物带着本阶段的后果走向下一段故事，并显露新的目标。",
-    },
-  ];
-  return {
-    goal: stagePlanningDraft.goal,
-    conflict: stagePlanningDraft.conflict,
-    chapters: templates.slice(0, chapterCount),
-  };
-}
+// Story 4.3：原 buildCurrentStagePlan 阶段计划 mock 已删除——阶段规划改为后端真实生成 +
+// 落库（chapterApi.planStage/getStagePlan + SSE），currentStagePlan 只承载真实数据。
 
 function renderExploration() {
   // 阶段规划已全程幕后化：即使 sessionStorage 残留旧的 "stage" 值也归位到 profile，
@@ -2725,7 +3089,9 @@ function bindExplorationInteractions() {
 }
 
 function chapterStagePlan() {
-  return currentStagePlan || buildCurrentStagePlan();
+  // Story 4.3：只认真实阶段规划（幕后生成 + 落库恢复）。未就绪返 null——渲染层显示
+  // 加载/占位态（buildCurrentStagePlan mock 已停用为真实数据源，AC2）。
+  return currentStagePlan;
 }
 
 function chapterContextMarkup(stagePlan) {
@@ -2764,6 +3130,21 @@ function chapterContextMarkup(stagePlan) {
       }
     </aside>`;
   }
+  // Story 4.3：非 reading 态侧栏渲染真实阶段计划（AC3）。未就绪（幕后生成中/失败）显示
+  // 加载/占位态侧栏，不渲染 mock。
+  if (!stagePlan) {
+    const hint =
+      stagePlanLoadState === "error"
+        ? "阶段计划没能生成，可在左侧重试。"
+        : stagePlanLoadState === "empty"
+          ? "还没有阶段计划，可在左侧开始生成。"
+          : "正在生成这个阶段的章节安排……";
+    return `<aside class="chapter-context" aria-label="第一阶段章节安排">
+      <div class="chapter-context-head"><span>第一阶段</span><strong>··</strong></div>
+      <p>阶段计划提供每章的方向；详细章节计划只在准备创作当前章时生成。</p>
+      <div class="chapter-context-list"><section class="is-empty"><div><p>${hint}</p></div></section></div>
+    </aside>`;
+  }
   return `<aside class="chapter-context" aria-label="第一阶段章节安排">
     <div class="chapter-context-head"><span>第一阶段</span><strong>${String(stagePlan.chapters.length).padStart(2, "0")} 章</strong></div>
     <p>阶段计划提供每章的方向；详细章节计划只在准备创作当前章时生成。</p>
@@ -2778,53 +3159,21 @@ function chapterContextMarkup(stagePlan) {
 
 function generatedChapterMarkup(chapter, nextChapter) {
   const chapterNumber = String(chapterCreationIndex + 1).padStart(2, "0");
-  const revisedOpening =
-    chapterLastRevisionAction === "regenerate"
-      ? "旧城的雨从凌晨两点十七分开始倒着落向天空。"
-      : chapterLastRevisionAction === "improve"
-        ? "雨是在凌晨两点十七分落下来的，比程野记忆中的任何一场雨都更安静。"
-        : "雨是在凌晨两点十七分落下来的。";
-  const pages = [
-    [
-      revisedOpening,
-      "起初只是细密的一层，贴着窗玻璃缓慢向下爬。程野关掉桌上的台灯，准备离开档案室时，门缝里忽然多出了一只没有署名的信封。纸面已经湿透，边缘却没有留下任何被人捏过的痕迹。",
-      "信封里只有一页纸。第一行写着他的名字，第二行写着一个早已被所有人否认的名字——程岚，他失踪了十二年的姐姐。",
-      "程野把那张纸翻到背面。那里印着一枚已经停用多年的邮戳，日期却是三天以后。他以为自己看错了，伸手擦过墨迹，指腹沾上一点尚未干透的蓝色。",
-      "纸页最下方原本空白的位置渐渐浮出一行小字，像有人正隔着雨夜写给他：不要相信明天醒来的自己。",
-    ],
-    [
-      "走廊尽头传来值班员的脚步声。程野下意识把信藏进外套，可对方经过门口时只是看了他一眼，像往常一样问：“你还在查那个不存在的人？”",
-      "这句话他听过太多次。十二年前，程岚的房间在一夜之间变成了储物间，学校的名册里没有她的名字，连父母都坚称自己只有一个孩子。只有程野记得姐姐离开前说，她发现这座城市每天都在悄悄替换一部分过去。",
-      "他没有回答值班员，径直走向地下档案库。那枚邮戳属于旧城第七码头的临时邮局，而那间邮局早在九年前的火灾中被拆除。",
-      "电梯下降时，楼层数字在负二层和负三层之间闪烁了一下。门打开后，原本封闭的走廊尽头亮着一盏陌生的绿灯。",
-      "程野站在门口没有立刻进去。绿光越过他的鞋尖，在地面映出两个人的影子，可整条走廊里分明只有他一个人。",
-    ],
-    [
-      "绿灯下面是一排他从未见过的档案柜。每只抽屉上都贴着日期，最靠近门口的那一格，写的正是三天以后。",
-      "程野拉开抽屉，里面只有一张雨水浸过的照片。照片上，他和程岚并肩站在第七码头，身后的电子钟显示着明天凌晨两点十七分。",
-      "更让他无法移开视线的是照片右下角。那里站着另一个程野，隔着十二年的雨幕望向镜头，手里握着一只没有署名的信封。",
-      "头顶的灯忽然熄灭。黑暗里，有人贴近他的耳边，用程岚的声音轻声说：“你终于还是选择打开了它。”",
-      "程野攥紧照片。远处传来整齐的钟声，一共十三下。",
-    ],
-  ];
-  const prose = pages[chapterReaderPage]
-    .map((paragraph, index) => {
-      const hasAnnotation = chapterAnnotations.some(
-        (annotation) =>
-          annotation.page === chapterReaderPage &&
-          annotation.paragraph === index,
-      );
-      const isSelected =
-        chapterAnnotationTarget?.page === chapterReaderPage &&
-        chapterAnnotationTarget?.paragraph === index;
-      const isLocated =
-        chapterAnnotationFocus?.page === chapterReaderPage &&
-        chapterAnnotationFocus?.paragraph === index;
-      return `<div class="chapter-paragraph ${hasAnnotation ? "has-annotation" : ""} ${isSelected ? "is-selected" : ""} ${isLocated ? "is-located" : ""}" data-paragraph-position="${chapterReaderPage}:${index}" tabindex="-1">${chapterFinalized ? "" : `<button type="button" class="paragraph-annotation-trigger" data-annotation-page="${chapterReaderPage}" data-annotation-paragraph="${index}" aria-label="给第 ${index + 1} 段添加批注">＋</button>`}<p>${paragraph}</p></div>`;
-    })
-    .join("");
-  const pageNumber = String(chapterReaderPage + 1).padStart(2, "0");
-  const pageTotal = String(pages.length).padStart(2, "0");
+  // Story 4.4：渲染真实生成的正文（替换硬编码 3 页 mock）。按空行/换行拆段顺序渲染——分页翻页
+  // + 段落批注 + 整体点评是 Story 4.5 范围（Jianghj 2026-08-05 决议），本 story 只把数据源从
+  // mock 换成真实 chapterGeneratedText，保留 chapter-reader 骨架供 4.5 复用。
+  const paragraphs = (chapterGeneratedText || "")
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const prose = paragraphs.length
+    ? paragraphs
+        .map(
+          (paragraph, index) =>
+            `<div class="chapter-paragraph" data-paragraph-position="0:${index}" tabindex="-1"><p>${escapeHtml(paragraph)}</p></div>`,
+        )
+        .join("")
+    : '<div class="chapter-paragraph"><p>（本章正文为空，可点「改进本章」或重新生成。）</p></div>';
   return `<article class="chapter-reader" aria-labelledby="chapter-reader-title">
     <div class="chapter-reader-meta"><span>第一阶段 / 第 ${chapterNumber} 章</span><span>${chapterFinalized ? "已定稿" : `草稿 V${chapterRevision}`}</span></div>
     <div class="chapter-title-band">
@@ -2833,20 +3182,81 @@ function generatedChapterMarkup(chapter, nextChapter) {
     </div>
     <p class="chapter-reader-lead">${escapeHtml(chapter.brief)}</p>
     <div class="chapter-reading-frame">
-      <button class="chapter-page-turn is-previous" type="button" data-chapter-page="previous" aria-label="上一页" ${chapterReaderPage === 0 ? "disabled" : ""}>←</button>
       <div class="chapter-prose" aria-live="polite">${prose}</div>
-      <button class="chapter-page-turn is-next" type="button" data-chapter-page="next" aria-label="下一页" ${chapterReaderPage === pages.length - 1 ? "disabled" : ""}>→</button>
     </div>
-    <footer class="chapter-pagination" aria-label="当前页码"><span><strong>${pageNumber}</strong> / ${pageTotal}</span></footer>
   </article>`;
 }
 
 function renderChapterCreation() {
   const stagePlan = chapterStagePlan();
-  const chapter = stagePlan.chapters[chapterCreationIndex];
   const chapterNumber = String(chapterCreationIndex + 1).padStart(2, "0");
-  document.title = `${chapter.title} · 第 ${chapterCreationIndex + 1} 章 · Muse`;
+  // 真实 projectId（AC5）：章节页锚点用它替换硬编码 demo。回退到 explorationProjectId
+  // （从探索无缝进入时已设），仍为空则退回作品库。
+  const backProjectId = chapterProjectId || explorationProjectId;
+  const backHref = backProjectId
+    ? `#/projects/${backProjectId}/explore`
+    : "#/projects";
+
   let mainContent;
+  // Story 4.3：阶段规划幕后生成——就绪前主区显示加载/占位或错误态（AC1/AC6），不再用 mock。
+  if (!stagePlan) {
+    if (stagePlanLoadState === "error") {
+      document.title = `第 ${chapterCreationIndex + 1} 章 · Muse`;
+      mainContent = `<section class="chapter-generating" aria-live="polite">
+        <div class="chapter-overline">Chapter creation / ${chapterNumber}</div>
+        <span class="generation-index">${chapterNumber}</span>
+        <h1>阶段计划没能生成</h1>
+        <p>${escapeHtml(stagePlanErrorText || "生成失败，请稍后重试。")}</p>
+        <div class="chapter-heading"><button class="primary-button" type="button" data-retry-stage-plan>重新生成 <span>→</span></button></div>
+      </section>`;
+    } else if (stagePlanLoadState === "empty") {
+      // 未生成态（review 改时机）：确认时触发失败 / 关页重开丢了在途 taskId → 进页面查库空且无在途
+      // 任务。不自动叫生成（杜绝进页面反复触发），由用户明示点「生成阶段计划」才触发。
+      document.title = `第 ${chapterCreationIndex + 1} 章 · Muse`;
+      mainContent = `<section class="chapter-generating" aria-live="polite">
+        <div class="chapter-overline">Chapter creation / ${chapterNumber}</div>
+        <span class="generation-index">${chapterNumber}</span>
+        <h1>还没有阶段计划</h1>
+        <p>确认设定后我们会在后台规划这个阶段的章节安排；如果还没生成，可以现在开始。</p>
+        <div class="chapter-heading"><button class="primary-button" type="button" data-retry-stage-plan>生成阶段计划 <span>→</span></button></div>
+      </section>`;
+    } else {
+      document.title = `第 ${chapterCreationIndex + 1} 章 · Muse`;
+      mainContent = `<section class="chapter-generating" aria-live="polite">
+        <div class="chapter-overline">Chapter creation / ${chapterNumber}</div>
+        <span class="generation-index">${chapterNumber}</span>
+        <h1>正在准备你的第一章</h1>
+        <p>Agent 正在依据你的故事设定规划这个阶段的章节安排，稍等片刻就能开始创作。</p>
+        <div class="generation-steps"><span class="is-active">规划阶段目标</span><span>安排章节骨架</span><span>进入第一章</span></div>
+      </section>`;
+    }
+    app.innerHTML = `<div class="chapter-page">
+      <header class="explore-header"><a class="explore-back" href="${backHref}">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节创作</span></div><div class="save-state"><i></i> 阶段计划生成中</div></header>
+      <main class="chapter-workbench"><div class="chapter-main">${mainContent}</div>${chapterContextMarkup(null)}</main>
+    </div>`;
+    bindChapterCreationInteractions();
+    return;
+  }
+
+  // 章数由 LLM 按剧情定（AC2 不写死），路由章号只钳下界（app.js render 分支 Math.max(0,…)）；
+  // 越界章号（如深链/下一章跳到超出真实章数）取不到骨架，退化为错误态而非 chapter.title 崩白页。
+  const chapter = stagePlan.chapters[chapterCreationIndex];
+  if (!chapter) {
+    document.title = `第 ${chapterCreationIndex + 1} 章 · Muse`;
+    app.innerHTML = `<div class="chapter-page">
+      <header class="explore-header"><a class="explore-back" href="${backHref}">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节创作</span></div><div class="save-state"><i></i> 阶段计划</div></header>
+      <main class="chapter-workbench"><div class="chapter-main"><section class="chapter-generating" aria-live="polite">
+        <div class="chapter-overline">Chapter creation / ${chapterNumber}</div>
+        <span class="generation-index">${chapterNumber}</span>
+        <h1>这一章还没有规划</h1>
+        <p>当前阶段计划只安排到第 ${stagePlan.chapters.length} 章，第 ${chapterCreationIndex + 1} 章暂不在其中。</p>
+        <div class="chapter-heading"><a class="primary-button" href="${backProjectId ? `#/projects/${backProjectId}/chapters/1` : "#/projects"}">回到第一章 <span>→</span></a></div>
+      </section></div>${chapterContextMarkup(stagePlan)}</main>
+    </div>`;
+    bindChapterCreationInteractions();
+    return;
+  }
+  document.title = `${chapter.title} · 第 ${chapterCreationIndex + 1} 章 · Muse`;
   if (chapterCreationState === "input") {
     mainContent = `<section class="chapter-entry" aria-labelledby="chapter-title">
       <div class="chapter-overline">Chapter creation / ${chapterNumber}</div>
@@ -2873,13 +3283,24 @@ function renderChapterCreation() {
     );
   }
   app.innerHTML = `<div class="chapter-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/explore">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节创作</span></div><div class="save-state"><i></i> ${chapterFinalized ? "本章已定稿" : chapterCreationState === "reading" ? "草稿已保存" : "已保存"}</div></header>
+    <header class="explore-header"><a class="explore-back" href="${backHref}">← 故事设定</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节创作</span></div><div class="save-state"><i></i> ${chapterFinalized ? "本章已定稿" : chapterCreationState === "reading" ? "草稿已保存" : "已保存"}</div></header>
     <main class="chapter-workbench"><div class="chapter-main">${mainContent}</div>${chapterContextMarkup(stagePlan)}</main>
   </div>`;
   bindChapterCreationInteractions();
 }
 
 function bindChapterCreationInteractions() {
+  // Story 4.3（review 改时机）：未生成/失败态的「生成/重新生成」——用户明示触发，直接走
+  // startStagePlanFlow（POST 拿 taskId + 存储 + 消费 SSE）。进页面渲染绝不自动触发；只有此处
+  // 用户点击、和「确认设定成功」那一次会触发。先取消在途 + 递增代次守卫。
+  document
+    .querySelector("[data-retry-stage-plan]")
+    ?.addEventListener("click", () => {
+      if (!chapterProjectId) return;
+      if (stagePlanAbortController) stagePlanAbortController.abort();
+      stagePlanSeq += 1;
+      startStagePlanFlow(chapterProjectId, stagePlanSeq);
+    });
   const idea = document.querySelector("#chapter-idea");
   idea?.addEventListener("input", () => {
     chapterIdea = idea.value;
@@ -2891,9 +3312,11 @@ function bindChapterCreationInteractions() {
     .querySelector("#chapter-idea-form")
     ?.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (!chapterProjectId) return;
       chapterIdea = event.currentTarget.querySelector("textarea").value.trim();
-      chapterCreationState = "generating";
+      // Story 4.4：重置本章创作态（批注/点评/版本），启真实生成流（替换 1200ms mock）。
       chapterRevision = 1;
+      chapterGeneratedText = "";
       chapterAgentResult = "";
       chapterLastRevisionAction = "";
       chapterAnnotations = [];
@@ -2901,22 +3324,16 @@ function bindChapterCreationInteractions() {
       chapterAnnotationDraft = "";
       chapterAnnotationFocus = null;
       chapterFinalized = false;
-      renderChapterCreation();
-      window.setTimeout(() => {
-        chapterCreationState = "reading";
-        chapterReaderPage = 0;
-        renderChapterCreation();
-      }, 1200);
+      // 递增代次 + 取消在途，防重复提交/切页赛跑（三守卫，仿 4.3）。
+      if (chapterGenAbortController) chapterGenAbortController.abort();
+      chapterGenSeq += 1;
+      startChapterGenFlow(
+        chapterProjectId,
+        chapterCreationIndex + 1,
+        chapterIdea,
+        chapterGenSeq,
+      );
     });
-  document.querySelectorAll("[data-chapter-page]").forEach((button) => {
-    button.addEventListener("click", () => {
-      chapterReaderPage += button.dataset.chapterPage === "next" ? 1 : -1;
-      chapterAnnotationTarget = null;
-      chapterAnnotationDraft = "";
-      chapterAnnotationFocus = null;
-      renderChapterCreation();
-    });
-  });
   document.querySelectorAll("[data-annotation-paragraph]").forEach((button) => {
     button.addEventListener("click", () => {
       chapterAnnotationTarget = {
@@ -3061,13 +3478,17 @@ function archiveSummaryFor(index) {
 }
 
 function archiveStagesForPreview(stagePlan) {
+  // Story 4.3（review）：chapterStagePlan() 删 mock 后可能返 null（归档路由不加载 currentStagePlan，
+  // 刷新直达/登出后进归档时为 null）。归档页本体属 4.5-4.7（第二阶段仍是占位 mock），本 story 只做
+  // null 兜底防白屏，不扩范围接真实归档数据。
+  const firstStageChapters = (stagePlan && stagePlan.chapters) || [];
   return [
     {
       title: "第一阶段",
-      chapters: stagePlan.chapters,
+      chapters: firstStageChapters,
       completedCount: Math.min(
         chapterCreationIndex + 1,
-        stagePlan.chapters.length,
+        firstStageChapters.length,
       ),
       numberOffset: 0,
       preview: false,
@@ -3093,7 +3514,7 @@ function archiveStagesForPreview(stagePlan) {
         },
       ],
       completedCount: 2,
-      numberOffset: stagePlan.chapters.length,
+      numberOffset: firstStageChapters.length,
       preview: true,
     },
   ];
@@ -3485,6 +3906,16 @@ function resetExplorationStateForNewProject(mode) {
     chapters: "",
   };
   currentStagePlan = null;
+  // Story 4.3：清阶段规划幕后加载态（登出/重置时 abort 在途流 + 复位守卫）。
+  if (stagePlanAbortController) {
+    stagePlanAbortController.abort();
+    stagePlanAbortController = null;
+  }
+  chapterProjectId = "";
+  stagePlanLoadState = "idle";
+  stagePlanErrorText = "";
+  stagePlanSeq += 1;
+  clearStagePlanTask();
   chapterCreationState = "input";
   chapterIdea = "";
   chapterReaderPage = 0;
@@ -3577,6 +4008,18 @@ function bindProjectInteractions() {
       guidedLoadError = null;
       settleErrorText = "";
       explorationProjectId = "";
+      // Story 4.3：清阶段规划态防跨用户残留（A 在第一章页登出→B 同标签页登录，勿见 A 的阶段
+      // 计划）；abort 在途 SSE/生成流、自增 seq 作废在途回调（与各模块 logout 复位一致）。
+      if (stagePlanAbortController) {
+        stagePlanAbortController.abort();
+        stagePlanAbortController = null;
+      }
+      currentStagePlan = null;
+      chapterProjectId = "";
+      stagePlanLoadState = "idle";
+      stagePlanErrorText = "";
+      stagePlanSeq += 1;
+      clearStagePlanTask();
       location.hash = "#/login";
     })();
   });
@@ -4329,6 +4772,17 @@ function render() {
   // 防 settle/interpret 在途时切走 → 流不 abort 连接悬挂 + 陈旧回调污染。teardown 不动 pending
   // 设定卡（会话内恢复态，导航离开应保留）。进 explore 分支由 loadGuidedExploration 自管清理。
   if (!exploreMatch) teardownExplorationInflight();
+  // Story 4.3：离开章节页时 abort 在途阶段规划流（防切走后 SSE 悬挂 + 陈旧回调污染）。
+  if (!chapterMatch && stagePlanAbortController) {
+    stagePlanAbortController.abort();
+    stagePlanAbortController = null;
+  }
+  // Story 4.4：离开章节页时 abort 在途章节生成流（同理防 SSE 悬挂 + 陈旧回调）。生成任务已入队、
+  // 后端继续跑并落库；本地只是断开 SSE 消费，重进凭在途 taskId / 落库正文恢复（不重复付费）。
+  if (!chapterMatch && chapterGenAbortController) {
+    chapterGenAbortController.abort();
+    chapterGenAbortController = null;
+  }
   if (hashPath() === "#/projects") {
     // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
     projectsLoadState = "loading";
@@ -4390,8 +4844,34 @@ function render() {
     if (archiveProject) explorationTitle = archiveProject.title;
     renderChapterArchive();
   } else if (chapterMatch) {
+    const routeProjectId = chapterMatch[1];
     chapterCreationIndex = Math.max(0, Number(chapterMatch[2]) - 1);
-    renderChapterCreation();
+    // Story 4.3：消费路由真实 projectId（AC5）。同一作品且阶段规划已就绪 → 直接渲染
+    // （避免切页/内部重渲染时重复拉取）；否则走加载入口（review 改时机后：只 GET 落库恢复 / 凭本地
+    // taskId 接回在途任务，绝不主动叫新生成——触发只发生在确认设定成功那一次或用户明示点生成）。
+    if (
+      currentStagePlan &&
+      chapterProjectId === routeProjectId &&
+      stagePlanLoadState === "ready"
+    ) {
+      // 阶段规划已就绪且同作品：同章内部重渲染直接渲染；跨章跳转（章号变了）须恢复新章正文态
+      // （GET 落库正文 → reading / 接在途 / input），否则会用旧章正文渲染新章（Story 4.4）。
+      // review 修复：同章 key 命中但正处 generating 且在途生成流已被离页 abort（controller=null）
+      // 时，也须重新 recover——否则站内切走再回同章会永久卡「生成中」（无活跃 SSE 消费者、又因
+      // key 命中不重连在途 taskId）。此时 recover 会凭 sessionStorage 的 taskId 接回或按落库/204 收敛。
+      const sameChapterKey =
+        chapterRecoveredKey === `${routeProjectId}:${chapterCreationIndex + 1}`;
+      const stalledGenerating =
+        chapterCreationState === "generating" && chapterGenAbortController === null;
+      if (sameChapterKey && !stalledGenerating) {
+        renderChapterCreation();
+      } else {
+        renderChapterCreation();
+        recoverChapterState(routeProjectId, chapterCreationIndex + 1);
+      }
+    } else {
+      loadChapterStagePlan(routeProjectId);
+    }
   } else renderAuth();
 }
 

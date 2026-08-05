@@ -9,7 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from muse.core.db import engine
 from muse.core.errors import register_exception_handlers
 from muse.core.settings import get_settings
-from muse.routers import auth, byok, exploration, health, projects, story, tasks, usage
+from muse.routers import (
+    auth,
+    byok,
+    chapter,
+    exploration,
+    health,
+    projects,
+    story,
+    tasks,
+    usage,
+)
 
 
 @asynccontextmanager
@@ -42,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(byok.router)
     app.include_router(usage.router)
     app.include_router(tasks.router)
+    app.include_router(chapter.router)
     return app
 
 
