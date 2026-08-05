@@ -19,6 +19,7 @@ from fastapi import APIRouter, Response
 from muse.core.deps import CurrentUser, SessionDep
 from muse.schemas.chapter import (
     ChapterGenerateRequest,
+    ChapterReviseRequest,
     ChapterTextResponse,
     StagePlanResponse,
 )
@@ -101,6 +102,46 @@ async def generate_chapter(
         project_id=project_id,
         chapter_number=chapter_number,
         chapter_idea=payload.chapter_idea,
+    )
+    return TaskSubmitResponse(task_id=task_id)
+
+
+@router.post(
+    "/{project_id}/chapters/{chapter_number}/revise",
+    response_model=TaskSubmitResponse,
+)
+async def revise_chapter(
+    project_id: uuid.UUID,
+    chapter_number: int,
+    payload: ChapterReviseRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> TaskSubmitResponse:
+    """触发「改进本章 / 重新生成整章」（Story 4.6）：提交语义，返 200 + taskId。
+
+    body：action="improve"（改进本章，须有整体点评或段落批注，尽量保留现有内容）/"regenerate"
+    （重新生成整章，允许空反馈、替换整章）。feedback = 整体点评；annotations = 段落批注列表
+    （改进消费、重生忽略）。前端在 reading 态点「改进本章 →」/「重新生成」调用本端点拿 taskId，
+    再连 GET /api/tasks/{taskId}/events 消费 SSE progress/result（result 带新 chapterText +
+    revision）。改进/重生**强制重跑** 4.2 四段流水线（作废旧 run、不复用旧终稿），版本号递增、
+    覆盖同行、不留历史（Jianghj 2026-08-05 决议）。
+
+    租户 404 / 未确认设定 400 / 改进无反馈 400 improve_feedback_required / 本章未生成 400
+    chapter_not_generated 由 service 抛 ErrorEnvelope 交全局 handler；非法入参由 FastAPI 自动 422。
+    """
+    annotations = (
+        [a.model_dump() for a in payload.annotations]
+        if payload.annotations
+        else []
+    )
+    task_id = await chapter_service.trigger_chapter_revision(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+        action=payload.action,
+        feedback=payload.feedback,
+        annotations=annotations,
     )
     return TaskSubmitResponse(task_id=task_id)
 

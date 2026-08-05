@@ -25,6 +25,7 @@ from muse.core.settings import get_settings
 from muse.models.chapter import Chapter
 from muse.models.stage_plan import StagePlan
 from muse.repositories import (
+    chapter_generation_repo,
     chapter_repo,
     project_repo,
     stage_plan_repo,
@@ -65,6 +66,34 @@ def _chapter_out_of_range() -> ErrorEnvelope:
     return ErrorEnvelope(
         code="chapter_out_of_range",
         message="该章节不在当前阶段规划范围内。",
+        http_status=400,
+    )
+
+
+def _improve_feedback_required() -> ErrorEnvelope:
+    """改进本章无任何反馈（→ 400，Story 4.6 AC1 后端守卫）。
+
+    「改进本章」要求具体反馈（FR20「要求具体反馈并尽量保留现有内容」）：无整体点评且无段落批注
+    时无从改起。前端已用 canImprove 禁用按钮（app.js:3112），此校验拦住绕过 UI 的直接调用。
+    重生（regenerate）允许空反馈，不走此校验。
+    """
+    return ErrorEnvelope(
+        code="improve_feedback_required",
+        message="请先填写整体点评或段落批注，再改进本章。",
+        http_status=400,
+    )
+
+
+def _chapter_not_generated() -> ErrorEnvelope:
+    """改进/重生前本章尚无已生成正文（→ 400，Story 4.6 前置）。
+
+    改进/重生的前提是本章已生成过正文（reading 态才有修订按钮）。无 chapter 行说明还没生成——
+    正常 UI 走不到（input 态无修订按钮）。此校验拦住绕过 UI 对未生成章调修订（真跑流水线真计费、
+    且无「上一版正文」可保留）。
+    """
+    return ErrorEnvelope(
+        code="chapter_not_generated",
+        message="本章尚未生成，无法改进或重新生成。",
         http_status=400,
     )
 
@@ -201,6 +230,116 @@ async def trigger_chapter_generation(
     return task_id
 
 
+async def trigger_chapter_revision(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    chapter_number: int,
+    action: str,
+    feedback: str | None = None,
+    annotations: list[dict] | None = None,
+) -> str:
+    """触发「改进本章 / 重新生成整章」ARQ 后台任务（Story 4.6）。返回 taskId 供前端连 SSE。
+
+    **完整仿 trigger_chapter_generation**（本文件上文），额外做三件事：
+    1. 改进守卫（AC1）：action="improve" 且 feedback 空白且 annotations 空 → 400
+       improve_feedback_required（重生 action="regenerate" 不校验，允许空反馈）。
+    2. 前置：本章须已有正文（get_chapter None → 400 chapter_not_generated）；读出旧 revision
+       供递增（target_revision = 旧 + 1）、读出旧正文 previous_text 供改进注入。
+    3. **强制重跑（AC3 核心）**：reset_run 作废旧 chapter_generation_run（清 steps + status→
+       running），使 worker 里 run_chapter_pipeline 重跑全四段而非复用旧 succeeded 终稿。
+
+    触发范式同 trigger_chapter_generation：register_task_owner 必先于 enqueue_job（陷阱②）。
+    并发去重/限流沿用 deferred-work.md:391 defer（本 story 不做，前端按钮 disabled 防单页双击）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _project_not_found()
+
+    # confirmed 前置校验（防御）：正常流程确认设定后才进创作，必有 confirmed 行。
+    bible = await story_bible_repo.get_confirmed_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        raise _bible_not_confirmed()
+
+    # 章号范围校验（防御 API 直打，同 trigger_chapter_generation）。
+    if chapter_number < 1:
+        raise _chapter_out_of_range()
+    stage_plan = await stage_plan_repo.get_stage_plan(
+        session, user_id=user_id, project_id=project_id
+    )
+    chapters = (stage_plan.chapters if stage_plan else None) or []
+    if chapter_number > len(chapters):
+        raise _chapter_out_of_range()
+
+    # 改进守卫（AC1）：改进须有反馈（整体点评或段落批注其一）；重生允许空反馈。
+    normalized_annotations = annotations or []
+    has_feedback = bool((feedback or "").strip())
+    has_annotations = bool(normalized_annotations)
+    if action == "improve" and not has_feedback and not has_annotations:
+        raise _improve_feedback_required()
+
+    # 前置：本章须已生成正文（reading 态才有修订按钮）。读旧 revision 递增 + 旧正文供改进注入。
+    existing = await chapter_repo.get_chapter(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+    )
+    if existing is None:
+        raise _chapter_not_generated()
+    target_revision = existing.revision + 1
+    previous_text = existing.text
+
+    # 强制重跑（AC3 核心）：作废旧 run（清 steps + status→running），使 pipeline 重跑全四段。
+    # **不覆盖 chapter_idea**（code review 修）：改进/重生的反馈都经 revision_input 单独注入
+    # （worker→pipeline→context-agent 的 revision_block，且 revision_input 随 ARQ job 参数持久化、
+    # 重入一致）。若把 feedback 写进 run.chapter_idea，pipeline 的 effective_idea 会让 context-agent
+    # 的 idea_block 与 revision_block **双重渲染同段 feedback**、语义标签冲突。保留原 chapter_idea
+    # （首次生成的本章想法）作背景即可。无 run 行（正文存在但 run 缺失，如迁移残留）→ 不 reset
+    # （pipeline 会新建 run 重跑），不阻断。
+    run = await chapter_generation_repo.get_run(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+    )
+    if run is not None:
+        await chapter_generation_repo.reset_run(session, run=run)
+    await session.commit()
+
+    settings = get_settings()
+    task_id = uuid.uuid4().hex
+    uid = str(user_id)
+    pid = str(project_id)
+
+    pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    try:
+        # 先登记属主（SSE 鉴权依据），再入队——顺序保证 SSE 端点总能读到属主（陷阱②）。
+        await sse.register_task_owner(pool, task_id, uid)
+        # revise_chapter 任务参数：action/feedback/annotations（JSON-safe list[dict]）+
+        # previous_text（改进注入用）+ target_revision（落库版本号）。_job_id=task_id 不去重
+        # （同 generate_chapter，并发缺口沿用 deferred-work.md:391 defer）。
+        await pool.enqueue_job(
+            "revise_chapter",
+            task_id,
+            uid,
+            pid,
+            chapter_number,
+            action,
+            feedback,
+            normalized_annotations,
+            previous_text,
+            target_revision,
+            _job_id=task_id,
+        )
+    finally:
+        await pool.aclose()
+    return task_id
+
+
 async def get_chapter_text(
     session: AsyncSession,
     *,
@@ -208,7 +347,7 @@ async def get_chapter_text(
     project_id: uuid.UUID,
     chapter_number: int,
 ) -> Chapter | None:
-    """读已落库的章节终稿正文（AC6 重进恢复）：租户守卫 → chapter_repo.get_chapter。
+    """读已落库的章节终稿正文（AC6 重进恢复）：租户守卫 → chapter_repo.get_chapter.
 
     用请求注入 session（只读，无 provider）。返 None = 尚未生成（生成任务未完成 / 未触发）——
     router 转 204，前端连 SSE 等就绪或显示 input 态。越权/不存在 project → 404 二义合一（NFR3）。

@@ -8,6 +8,8 @@ service/编排器。所有查询显式绑定 user_id 租户守卫（NFR3）—�
 - create_run：新建运行记录（首次开跑）。竞态兜底（并发首建撞唯一约束）由 service 处理。
 - update_step：写某段的状态 + 产物到 steps JSONB（跑完一段即落库供续跑）。
 - mark_run_status：更新 run 级状态（running→succeeded/failed）。
+- reset_run：清空 steps + 状态回 running（Story 4.6 改进/重生强制重跑：作废旧 succeeded 产物，
+  使 pipeline 重跑全四段而非复用旧终稿）。
 """
 
 import uuid
@@ -103,6 +105,31 @@ async def mark_run_status(
     **不 commit**（事务边界归编排器）。flush 后 refresh 回填 updated_at。
     """
     run.status = status
+    await session.flush()
+    await session.refresh(run)
+    return run
+
+
+async def reset_run(
+    session: AsyncSession,
+    *,
+    run: ChapterGenerationRun,
+) -> ChapterGenerationRun:
+    """作废旧运行记录、回到「未开跑」态（Story 4.6 改进/重生强制重跑）。
+
+    清 steps=None（丢弃旧四段产物，含旧 succeeded 的 polisher 终稿）+ status="running"（回到
+    开跑态）。使编排器 `run_chapter_pipeline` 重入时不命中「已 succeeded 直接返旧终稿」早返回
+    分支（pipeline.py:200-216），而是真实重跑全四段——这是改进/重生「用新反馈重写正文」的前提，
+    区别于 4.4 首次生成/ARQ 重试的幂等复用（那两者要复用不重复付费 NFR5）。
+
+    **不动 chapter_idea**：改进/重生的反馈经 revision_input 注入（context-agent 的
+    revision_block），不复用 chapter_idea 通道——否则 idea_block 与 revision_block 会双重渲染
+    同段 feedback（code review 修）。原 chapter_idea（首次生成的本章想法）保留作背景。
+    **不 commit**（事务边界归 service）。
+    """
+    run.steps = None
+    flag_modified(run, "steps")
+    run.status = "running"
     await session.flush()
     await session.refresh(run)
     return run

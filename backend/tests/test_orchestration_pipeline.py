@@ -265,3 +265,51 @@ async def test_on_progress_failure_does_not_interrupt_pipeline() -> None:
     # progress 抛错被吞，四段仍跑完、返回终稿。
     assert final == "终稿"
     mocks["polisher"].assert_awaited_once()
+
+
+# ========== Story 4.6：修订模式（revision_input + target_revision）==========
+
+
+@pytest.mark.asyncio
+async def test_revision_input_passthrough_to_context_agent() -> None:
+    """改进/重生：revision_input 透传给 context-agent（供拼「改进/重生」写作任务书）。"""
+    run = _FakeRun()
+    stack, mocks = _patch_pipeline(run=run)
+    rev = {
+        "action": "improve",
+        "feedback": "开头太慢",
+        "annotations": [{"paragraph": "那天", "comment": "删"}],
+        "previous_text": "旧正文",
+    }
+    with stack:
+        final = await pipeline.run_chapter_pipeline(
+            user_id=_UID,
+            project_id=_PID,
+            chapter_number=1,
+            revision_input=rev,
+            target_revision=3,
+        )
+    assert final == "终稿"
+    # context-agent 收到 revision_input（原样透传）。
+    assert mocks["context"].call_args.kwargs["revision_input"] == rev
+    # 四段全跑（run 未 succeeded，重跑）。
+    for name in ("context", "drafter", "reviewer", "polisher"):
+        mocks[name].assert_awaited_once()
+    # 终稿落库带 target_revision（旧+1=3）。
+    assert mocks["upsert_chapter"].call_args.kwargs["revision"] == 3
+
+
+@pytest.mark.asyncio
+async def test_first_generation_defaults_revision_1_and_none_input() -> None:
+    """首次生成（未传 revision_input/target_revision）：向后兼容——revision=1、input=None。"""
+    run = _FakeRun()
+    stack, mocks = _patch_pipeline(run=run)
+    with stack:
+        await pipeline.run_chapter_pipeline(
+            user_id=_UID, project_id=_PID, chapter_number=1, chapter_idea="想法"
+        )
+    # context-agent 收到 revision_input=None（4.4 行为不回退）。
+    assert mocks["context"].call_args.kwargs["revision_input"] is None
+    # 终稿落库默认 revision=1。
+    assert mocks["upsert_chapter"].call_args.kwargs["revision"] == 1
+

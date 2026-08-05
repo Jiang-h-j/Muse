@@ -678,6 +678,23 @@ const chapterApi = {
       },
     );
   },
+  // 触发改进本章 / 重新生成整章（Story 4.6）：body {action, feedback?, annotations?}，返
+  // {taskId} 供连 SSE（taskEvents 消费 progress/result；result 里 chapterText 为新终稿正文、
+  // revision 为新版本号）。action="improve"（改进，须有点评或批注）/"regenerate"（重生，可空）。
+  // annotations = [{paragraph, comment}]（改进消费、重生忽略；随请求体一次性传、后端不落库）。
+  reviseChapter(projectId, chapterNumber, { action, feedback, annotations } = {}) {
+    return apiFetch(
+      `/api/projects/${projectId}/chapters/${chapterNumber}/revise`,
+      {
+        method: "POST",
+        body: {
+          action,
+          feedback: feedback || null,
+          annotations: annotations || [],
+        },
+      },
+    );
+  },
   // 取已落库的章节终稿正文（Story 4.4 重进恢复）：有则 200 {chapterNumber, chapterText,
   // revision, status}、无则 204→apiFetch 返 null。signal：进第一章 GET 恢复可被离页/换项目 abort。
   getChapterText(projectId, chapterNumber, { signal } = {}) {

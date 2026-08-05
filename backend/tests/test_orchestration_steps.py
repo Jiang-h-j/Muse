@@ -180,6 +180,64 @@ async def test_context_agent_no_style_profile_uses_default() -> None:
     assert "未锚定文风" in brief
 
 
+# ========== Story 4.6：修订反馈注入 ==========
+
+
+@pytest.mark.asyncio
+async def test_context_agent_improve_injects_previous_and_feedback() -> None:
+    """改进：写作任务书含旧正文（保留基础）+ 整体点评 + 逐条段落批注 + 保留指令。"""
+    rev = {
+        "action": "improve",
+        "feedback": "开头节奏太慢",
+        "annotations": [{"paragraph": "那天下着雨", "comment": "这段删掉"}],
+        "previous_text": "第一版正文内容。",
+    }
+    with _patch_step(bible=_confirmed_bible()):
+        brief = await steps.run_context_agent(
+            user_id=_UID,
+            project_id=_PID,
+            chapter_number=1,
+            revision_input=rev,
+        )
+    assert "改进本章" in brief
+    assert "第一版正文内容。" in brief  # 旧正文作保留基础
+    assert "开头节奏太慢" in brief  # 整体点评
+    assert "这段删掉" in brief  # 段落批注
+    assert "尽量保留" in brief  # 保留指令
+
+
+@pytest.mark.asyncio
+async def test_context_agent_regenerate_injects_direction_not_previous() -> None:
+    """重生：含重写方向 + 大改指令，不注入旧正文作保留基础（允许替换整章）。"""
+    rev = {
+        "action": "regenerate",
+        "feedback": "换个冷开场",
+        "annotations": [],
+        "previous_text": "旧正文不该出现",
+    }
+    with _patch_step(bible=_confirmed_bible()):
+        brief = await steps.run_context_agent(
+            user_id=_UID,
+            project_id=_PID,
+            chapter_number=1,
+            revision_input=rev,
+        )
+    assert "重新生成整章" in brief
+    assert "换个冷开场" in brief  # 重写方向
+    assert "旧正文不该出现" not in brief  # 重生不保留旧正文
+
+
+@pytest.mark.asyncio
+async def test_context_agent_no_revision_input_unchanged() -> None:
+    """首次生成（revision_input=None）：不含任何修订段（4.4 行为不回退）。"""
+    with _patch_step(bible=_confirmed_bible()):
+        brief = await steps.run_context_agent(
+            user_id=_UID, project_id=_PID, chapter_number=1, chapter_idea="想法"
+        )
+    assert "改进本章" not in brief
+    assert "重新生成整章" not in brief
+
+
 @pytest.mark.asyncio
 async def test_context_agent_not_confirmed_raises_400() -> None:
     with _patch_step(bible=None):  # 无 confirmed 行

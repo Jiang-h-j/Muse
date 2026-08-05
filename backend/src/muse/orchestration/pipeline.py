@@ -160,6 +160,8 @@ async def run_chapter_pipeline(
     chapter_number: int,
     chapter_idea: str | None = None,
     on_progress: Callable[[str], Awaitable[None]] | None = None,
+    revision_input: dict | None = None,
+    target_revision: int = 1,
 ) -> str:
     """驱动四段流水线生成一章正文，返回终稿。断点续跑：重入复用已完成段。
 
@@ -168,6 +170,13 @@ async def run_chapter_pipeline(
 
     幂等：同 (user_id, project_id, chapter_number) 重入复用同一 run 行。若 run 已整体
     succeeded，直接返回 polisher 段产物、不重跑。
+
+    **Story 4.6 修订模式**：`revision_input`（含 action/feedback/annotations/previous_text）非
+    None 时为「改进/重生」——调用方（chapter_service）已先 reset_run（清 steps + status→running），
+    故此处 run 不会命中「已 succeeded 早返回」分支，正常重跑全四段；`revision_input` 透传给
+    context-agent 拼进写作任务书（改进注入旧正文+点评+批注作保留基础、重生注入方向）。
+    `target_revision` 为落库版本号（改进/重生 = 旧 revision+1；4.4 首次生成 = 1）。
+    `revision_input=None` 时行为与 4.4 完全一致（向后兼容）。
     """
     # get-or-create run 行（首次开跑建行；已存在复用）。竞态兜底：并发首建撞唯一约束
     # → rollback 重查（照 story_settle_agent._persist_card_with_race_guard 先例）。
@@ -237,6 +246,7 @@ async def run_chapter_pipeline(
             project_id=project_id,
             chapter_number=chapter_number,
             chapter_idea=effective_idea,
+            revision_input=revision_input,
         ),
         on_progress=on_progress,
     )
@@ -288,6 +298,8 @@ async def run_chapter_pipeline(
     # 恢复/前序注入）。upsert 幂等——ARQ 重试/重入复用 succeeded run 再次落库时覆盖同行、不产生
     # 正文副本（chapter 表 (user_id, project_id, chapter_number) 复合唯一）。分层见
     # chapter_generation.py:1-9（编排状态表 vs 业务表）。
+    # **Story 4.6**：target_revision 落业务表版本列——改进/重生 = 旧 revision+1、4.4 首次 = 1；
+    # status 恒 "draft"（改进/重生后仍未定稿，定稿是 4.7 才置 finalized）。
     async with async_session_maker() as session:
         run = await run_repo.get_run(
             session,
@@ -303,6 +315,7 @@ async def run_chapter_pipeline(
             project_id=project_id,
             chapter_number=chapter_number,
             text=final,
+            revision=target_revision,
         )
         await session.commit()
     return final

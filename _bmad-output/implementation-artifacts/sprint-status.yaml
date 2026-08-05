@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-05 (Story 4.5 代码审查通过：三层对抗式 2 patch 全修（翻页漏清 focus + 保存后 focus 段落）+ 4 defer 入台账（坐标错位归 4.6）+ 3 dismiss，node -c 通过，4-5 review → done)
+last_updated: 2026-08-05 (Story 4.6 代码审查通过：三层对抗式 1 patch + 2 decision-needed（裁决A彻底修：刷新接回revise SSE+用对消费者/重生feedback双注入）全修 + 新回归测试，2 defer 入台账（enqueue失败卡running/并发revise竞争），后端551 passed零回归，4-6 review → done)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -94,7 +94,7 @@ development_status:
   4-3-首章无缝进入-幕后阶段规划: done
   4-4-本章想法输入-真实生成章节正文: done
   4-5-分页阅读-段落批注-整体点评: done
-  4-6-改进本章-重新生成整章: backlog
+  4-6-改进本章-重新生成整章: done
   4-7-定稿本章-阶段循环-阶段交界方向输入: backlog
   epic-4-retrospective: optional
 

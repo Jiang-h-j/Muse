@@ -219,6 +219,9 @@ let chapterGeneratedText = "";
 // 需要重新恢复正文态（同章内部重渲染直接渲染，跨章须 recoverChapterState 拉新章正文/接在途）。
 let chapterRecoveredKey = "";
 const chapterGenTaskKey = "muse-chapter-gen-task";
+// Story 4.6 review：存储在途任务时带 kind（"gen" 首次生成 / "revise" 改进重生）+ action
+// （revise 的 improve/regenerate，供刷新恢复时用对消费者、显示正确忙碌文案）。返回整个记录对象
+// （非仅 taskId），调用方按 kind 分派——修订在途刷新须接回 revise SSE、不被 GET 到的旧正文短路。
 function readChapterGenTask(projectId, chapterNumber) {
   const stored = readStoredJson(chapterGenTaskKey);
   if (
@@ -227,13 +230,19 @@ function readChapterGenTask(projectId, chapterNumber) {
     stored.chapterNumber === chapterNumber &&
     stored.taskId
   )
-    return stored.taskId;
+    return stored;
   return null;
 }
-function persistChapterGenTask(projectId, chapterNumber, taskId) {
+function persistChapterGenTask(
+  projectId,
+  chapterNumber,
+  taskId,
+  kind = "gen",
+  action = null,
+) {
   window.sessionStorage.setItem(
     chapterGenTaskKey,
-    JSON.stringify({ projectId, chapterNumber, taskId }),
+    JSON.stringify({ projectId, chapterNumber, taskId, kind, action }),
   );
 }
 function clearChapterGenTask() {
@@ -1821,6 +1830,120 @@ async function startChapterGenFlow(projectId, chapterNumber, idea, seq) {
   await consumeChapterGenTask(projectId, chapterNumber, seq, taskId);
 }
 
+// Story 4.6：消费一个已存在的修订任务的 SSE（仿 consumeChapterGenTask，差异见下）。GET
+// /tasks/{id}/events 消费 progress/result/error。seq/projectId/chapterNumber/abort 四守卫 +
+// 无终态兜底 + 终态清在途 taskId。**不发起 POST**——用于「刷新/重进凭本地 taskId 接回在途修订」。
+// 与生成流的关键差异：① result 取 data.revision 更新版本号（不本地 +1，AC4）；② 改进/重生都清
+// 批注 chapterAnnotations=[]（决策 1，改进后旧坐标失真）+ 清整体点评；③ 失败退回 **reading 态**
+// 保留旧正文可重看/重试（区别于 4.4 生成失败退 input 态，AC8）。
+async function consumeChapterReviseTask(projectId, chapterNumber, seq, taskId, action) {
+  const signal = chapterGenAbortController && chapterGenAbortController.signal;
+  const stale = () =>
+    (signal && signal.aborted) ||
+    seq !== chapterGenSeq ||
+    projectId !== chapterProjectId ||
+    chapterNumber !== chapterCreationIndex + 1;
+  let gotTerminal = false;
+  try {
+    await explorationApi.taskEvents(taskId, {
+      signal,
+      onEvent: (type, data) => {
+        if (stale()) return;
+        if (type === "result" && data && typeof data.chapterText === "string") {
+          gotTerminal = true;
+          chapterGenAbortController = null;
+          clearChapterGenTask();
+          chapterGeneratedText = data.chapterText;
+          // 版本号取后端权威值（旧+1），不本地递增——防前后端因失败/重试脱节（AC4）。
+          if (typeof data.revision === "number") chapterRevision = data.revision;
+          chapterReaderPage = 0; // 回第一页（修改从头呈现）
+          chapterAnnotations = []; // 改进+重生都清（决策 1）：旧批注坐标对不上新正文
+          chapterFeedback = "";
+          chapterAnnotationTarget = null;
+          chapterAnnotationDraft = "";
+          chapterAnnotationFocus = null;
+          chapterAgentBusy = false;
+          chapterLastRevisionAction = action;
+          chapterAgentResult =
+            action === "regenerate"
+              ? `已生成第 ${chapterRevision} 版草稿。你可以重新阅读后继续反馈。`
+              : `已按你的反馈改进为第 ${chapterRevision} 版草稿。修改从第一页开始呈现。`;
+          chapterCreationState = "reading"; // 维持 reading（修订在 reading 态发起）
+          renderChapterCreation();
+        } else if (type === "error") {
+          gotTerminal = true;
+          chapterGenAbortController = null;
+          clearChapterGenTask();
+          // 修订失败：退回 reading 态保留旧正文（可重看/重试），给可读提示（AC8）。
+          chapterAgentBusy = false;
+          chapterCreationState = "reading";
+          renderChapterCreation();
+          showChapterInlineError(storyErrorText({ code: data && data.code }));
+        }
+        // progress：忙碌态文案已在显示，V1 不额外更新（仿 4.4）。
+      },
+    });
+    // 无终态兜底（防永久忙碌）：SSE 正常结束却没收到 result/error。
+    if (!stale() && !gotTerminal && chapterAgentBusy) {
+      chapterGenAbortController = null;
+      clearChapterGenTask();
+      chapterAgentBusy = false;
+      chapterCreationState = "reading";
+      renderChapterCreation();
+      showChapterInlineError(storyErrorText({ code: "generate_failed" }));
+    }
+  } catch (err) {
+    if (stale()) return; // 用户主动 abort / 已切走，不报错
+    chapterGenAbortController = null;
+    clearChapterGenTask();
+    chapterAgentBusy = false;
+    chapterCreationState = "reading";
+    renderChapterCreation();
+    showChapterInlineError(storyErrorText(err));
+  }
+}
+
+// Story 4.6：主动触发改进/重生 + SSE 消费（仿 startChapterGenFlow）：POST revise 拿 taskId →
+// 存 sessionStorage（刷新可接回）→ consumeChapterReviseTask 消费 SSE。**仅用于用户明示点
+// 「改进本章 →」/「重新生成」**。调用前已置 chapterAgentBusy + 递增 seq + abort 在途。
+async function startChapterReviseFlow(
+  projectId,
+  chapterNumber,
+  action,
+  feedback,
+  annotations,
+  seq,
+) {
+  chapterGenAbortController = new AbortController();
+  chapterRecoveredKey = `${projectId}:${chapterNumber}`;
+  const signal = chapterGenAbortController.signal;
+  const stale = () =>
+    signal.aborted ||
+    seq !== chapterGenSeq ||
+    projectId !== chapterProjectId ||
+    chapterNumber !== chapterCreationIndex + 1;
+  let taskId;
+  try {
+    ({ taskId } = await chapterApi.reviseChapter(projectId, chapterNumber, {
+      action,
+      feedback,
+      annotations,
+    }));
+    if (stale()) return;
+    persistChapterGenTask(projectId, chapterNumber, taskId, "revise", action);
+  } catch (err) {
+    if (stale()) return;
+    chapterGenAbortController = null;
+    // 触发失败（如改进无反馈 400 被守卫拦）：退回 reading 态保留旧正文 + 错误提示。
+    chapterAgentBusy = false;
+    chapterCreationState = "reading";
+    renderChapterCreation();
+    showChapterInlineError(storyErrorText(err));
+    return;
+  }
+  await consumeChapterReviseTask(projectId, chapterNumber, seq, taskId, action);
+}
+
 // Story 4.4：章节页内联错误提示（仿 showGuidedInlineError）。生成失败时在输入区顶部插一条错误
 // 条，无遮挡、下次渲染清除；找不到容器则 alert 兜底。
 function showChapterInlineError(text) {
@@ -1873,12 +1996,53 @@ async function recoverChapterState(projectId, chapterNumber) {
     chapterNumber !== chapterCreationIndex + 1;
 
   try {
-    // 1. 先 GET 已落库的章节正文（刷新/断线重进恢复，AC6）。有则直接进 reading 态。
+    // 1. 先 GET 已落库的章节正文（刷新/断线重进恢复，AC6）。
     const existing = await chapterApi.getChapterText(projectId, chapterNumber, {
       signal,
     });
     if (stale()) return;
-    if (existing && typeof existing.chapterText === "string") {
+    // Story 4.6 review：读在途任务记录，区分 gen（首次生成）/ revise（改进重生）。
+    const pending = readChapterGenTask(projectId, chapterNumber);
+    const hasExisting = existing && typeof existing.chapterText === "string";
+
+    // 1a. 在途是 revise（改进/重生）：即便 GET 到旧正文也**不短路**——修订正文要等流水线末尾才
+    // upsert，此刻库里必是旧文，若短路则清掉在途 taskId、看不到「修订中」、诱发重复点重复付费
+    // （code review Edge#2/#3）。故：先用旧正文铺底进 reading + 忙碌态，再接回 revise SSE。
+    if (pending && pending.kind === "revise") {
+      if (hasExisting) {
+        chapterGeneratedText = existing.chapterText;
+        chapterRevision = existing.revision || 1;
+        chapterFinalized = existing.status === "finalized";
+      }
+      // 定稿态不该有在途修订（修订按钮已隐藏）——防御：定稿则清任务、进 reading 只读，不接回。
+      if (chapterFinalized) {
+        chapterGenAbortController = null;
+        chapterCreationState = "reading";
+        chapterReaderPage = 0;
+        clearChapterGenTask();
+        renderChapterCreation();
+        return;
+      }
+      chapterCreationState = "reading";
+      chapterReaderPage = 0;
+      chapterAgentBusy = true;
+      chapterAgentResult =
+        pending.action === "regenerate"
+          ? "正在重新规划并生成这一章……"
+          : "正在根据你的点评改进这一章……";
+      renderChapterCreation();
+      await consumeChapterReviseTask(
+        projectId,
+        chapterNumber,
+        seq,
+        pending.taskId,
+        pending.action,
+      );
+      return;
+    }
+
+    // 1b. 无在途 revise：有落库正文则直接进 reading 态（首次生成已完成 / 修订已跑完落库）。
+    if (hasExisting) {
       chapterGeneratedText = existing.chapterText;
       chapterRevision = existing.revision || 1;
       chapterFinalized = existing.status === "finalized";
@@ -1901,12 +2065,17 @@ async function recoverChapterState(projectId, chapterNumber) {
     return;
   }
   if (stale()) return;
-  // 2. 未落库（204）——凭本地在途 taskId 接回**正在跑的那个生成任务**的 SSE（生成中刷新恢复）。
-  const pendingTaskId = readChapterGenTask(projectId, chapterNumber);
-  if (pendingTaskId) {
+  // 2. 未落库（204）——凭本地在途 gen taskId 接回**正在跑的那个生成任务**的 SSE（生成中刷新恢复）。
+  const pendingGen = readChapterGenTask(projectId, chapterNumber);
+  if (pendingGen) {
     chapterCreationState = "generating";
     renderChapterCreation();
-    await consumeChapterGenTask(projectId, chapterNumber, seq, pendingTaskId);
+    await consumeChapterGenTask(
+      projectId,
+      chapterNumber,
+      seq,
+      pendingGen.taskId,
+    );
     return;
   }
   // 3. 既无落库正文、又无在途任务：显示输入态，等用户填想法/点生成（不主动触发）。
@@ -3457,14 +3626,27 @@ function bindChapterCreationInteractions() {
   document.querySelectorAll("[data-chapter-revision]").forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.chapterRevision;
+      // 改进守卫（AC1）：无点评且无批注时改进不可用（与 canImprove 一致，app.js:3112）。
       if (
         action === "improve" &&
         !chapterFeedback.trim() &&
         !chapterAnnotations.length
       )
         return;
-      const submittedFeedback = chapterFeedback.trim();
-      const submittedAnnotationCount = chapterAnnotations.length;
+      if (chapterAgentBusy) return; // 忙碌中防重复提交（AC8，按钮已 disabled 兜底）
+      if (!chapterProjectId) return;
+      // Story 4.6：组装反馈随请求体一次性传（决策 3：不落库）。批注 {page,paragraph,text} →
+      // {paragraph: 段落原文, comment: 批注文本}——原文反查 chapterPages()[page][paragraph]
+      // 给 LLM 锚点（反查不到退化为空串，后端仍收 comment）。重生忽略批注、后端不消费。
+      const pages = chapterPages();
+      const annotations =
+        action === "improve"
+          ? chapterAnnotations.map((a) => ({
+              paragraph: (pages[a.page] && pages[a.page][a.paragraph]) || "",
+              comment: a.text || "",
+            }))
+          : [];
+      const feedback = chapterFeedback.trim();
       chapterAnnotationFocus = null;
       chapterAgentBusy = true;
       chapterAgentResult =
@@ -3472,19 +3654,17 @@ function bindChapterCreationInteractions() {
           ? "正在重新规划并生成这一章……"
           : "正在根据你的点评改进这一章……";
       renderChapterCreation();
-      window.setTimeout(() => {
-        chapterRevision += 1;
-        chapterReaderPage = 0;
-        chapterAgentBusy = false;
-        chapterLastRevisionAction = action;
-        chapterAgentResult =
-          action === "regenerate"
-            ? `已生成第 ${chapterRevision} 版草稿${submittedFeedback ? "，并参考了你补充的方向" : ""}。你可以重新阅读后继续反馈。`
-            : `已根据${submittedAnnotationCount ? ` ${submittedAnnotationCount} 条段落批注${submittedFeedback ? "和整体点评" : ""}` : `“${submittedFeedback}”`}改进第 ${chapterRevision} 版草稿。修改从第一页开始呈现。`;
-        if (action === "regenerate") chapterAnnotations = [];
-        chapterFeedback = "";
-        renderChapterCreation();
-      }, 900);
+      // 递增代次 + 取消在途，防重复提交/切页赛跑（三守卫，仿 4.4 生成流）。
+      if (chapterGenAbortController) chapterGenAbortController.abort();
+      chapterGenSeq += 1;
+      startChapterReviseFlow(
+        chapterProjectId,
+        chapterCreationIndex + 1,
+        action,
+        feedback,
+        annotations,
+        chapterGenSeq,
+      );
     });
   });
   document

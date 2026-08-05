@@ -127,12 +127,77 @@ def _format_recent_chapters_block(chapters: list) -> str:
     )
 
 
+def _format_revision_block(revision_input: dict | None) -> str:
+    """把 Story 4.6 修订上下文渲染成写作任务书里的「修订」段（改进/重生注入，首次生成返空串）。
+
+    - 首次生成（revision_input=None）：返回 ""（不追加任何修订段，与 4.4 一致）。
+    - 改进（action=improve）：注入上一版正文（保留基础）+ 整体点评 + 逐条段落批注 + 保留指令。
+      drafter 据此在旧正文上按反馈精修、尽量保留现有内容与结构（FR20「尽量保留现有内容」）。
+    - 重生（action=regenerate）：注入可空重写方向 + 大改指令，**不注入旧正文作保留基础**
+      （允许替换整章，FR20「替换整章」）。
+    """
+    if not revision_input:
+        return ""
+    action = revision_input.get("action")
+    feedback = (revision_input.get("feedback") or "").strip()
+    annotations = revision_input.get("annotations") or []
+    previous_text = (revision_input.get("previous_text") or "").strip()
+
+    if action == "regenerate":
+        direction = (
+            f"【重写方向（读者补充，务必参考）】\n{feedback}"
+            if feedback
+            else "【重写方向】\n（读者未补充方向，按故事设定与前文重新构思本章、写出全新一版。）"
+        )
+        return (
+            "【本次任务：重新生成整章】\n"
+            "读者对上一版不满意、要求重写整章。请重新规划本章内容、写出全新的一版，"
+            "可大幅调整情节、结构与写法，不必保留上一版的具体写法。\n\n"
+            f"{direction}"
+        )
+
+    # 改进（默认）：保留旧正文为基础，逐条回应点评与批注。
+    parts: list[str] = ["【本次任务：改进本章】"]
+    parts.append(
+        "读者对上一版正文提出了具体意见。请在**上一版正文的基础上按意见改进、"
+        "尽量保留读者认可的现有内容与结构**，只针对下面的点评与批注做修改，不要推翻重写。"
+    )
+    if previous_text:
+        parts.append(f"【上一版正文（在此基础上改进）】\n{previous_text}")
+    if feedback:
+        parts.append(f"【读者的整体点评（针对全章）】\n{feedback}")
+    if annotations:
+        anno_lines: list[str] = []
+        for i, anno in enumerate(annotations, start=1):
+            comment = (anno.get("comment") or "").strip()
+            if not comment:
+                continue
+            paragraph = (anno.get("paragraph") or "").strip()
+            if paragraph:
+                # 段落原文可能很长，截断给锚点即可（避免任务书过长挤爆上下文）。
+                snippet = paragraph[:120]
+                anno_lines.append(
+                    f"{i}. 针对段落「{snippet}…」：{comment}"
+                    if len(paragraph) > 120
+                    else f"{i}. 针对段落「{paragraph}」：{comment}"
+                )
+            else:
+                anno_lines.append(f"{i}. {comment}")
+        if anno_lines:
+            parts.append(
+                "【读者的段落批注（逐条针对具体段落，务必逐条回应）】\n"
+                + "\n".join(anno_lines)
+            )
+    return "\n\n".join(parts)
+
+
 async def run_context_agent(
     *,
     user_id: uuid.UUID,
     project_id: uuid.UUID,
     chapter_number: int,
     chapter_idea: str | None = None,
+    revision_input: dict | None = None,
 ) -> str:
     """context-agent（AR16）：读 confirmed 设定 → 组装写作任务书（system + user 合并为一段文本）。
 
@@ -143,6 +208,12 @@ async def run_context_agent(
     + 最近前序章节正文（Story 4.4 接入，取最近 _RECENT_CHAPTERS_FOR_CONTEXT 章）。前序章节含
     draft（4.7 定稿未实现前唯一保证多章连续性的做法，Jianghj 2026-08-05 决议）。RAG 三级召回 +
     归档 chapter_cards 是 Epic 5 增强（epics.md:859③）。
+
+    **Story 4.6 修订注入**：revision_input（dict，含 action/feedback/annotations/previous_text）
+    非 None 时追加修订段——改进（action=improve）注入「上一版正文（保留基础）+ 整体点评 + 段落
+    批注 + 保留指令」，让 drafter 在旧正文上按反馈精修、尽量保留现有内容；重生（regenerate）注入
+    「可空重写方向 + 大改指令」，不注入旧正文作保留基础（允许替换整章）。revision_input=None 时
+    行为与 4.4 完全一致（首次生成，向后兼容）。
     """
     async with async_session_maker() as session:
         # 租户守卫（二义合一 404，story_settle_agent.py:350-352 范式）。
@@ -182,6 +253,9 @@ async def run_context_agent(
         if chapter_idea and chapter_idea.strip()
         else "【本章想法】\n（读者未补充，按设定与前文自然推进本章剧情。）"
     )
+    # Story 4.6 修订段（改进/重生注入，首次生成为空串不占位）。放在写作要求前，作为本次最强指令。
+    revision_block = _format_revision_block(revision_input)
+    revision_section = f"\n{revision_block}\n" if revision_block else ""
 
     brief = f"""你是一位专业的网文作者，正在为一部连载作品写第 {chapter_number} 章的正文。
 
@@ -193,7 +267,7 @@ async def run_context_agent(
 {recent_block}
 
 {idea_block}
-
+{revision_section}
 {lexicon_block}
 
 【写作要求】

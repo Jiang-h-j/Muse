@@ -268,6 +268,90 @@ async def generate_chapter(
         raise
 
 
+# 章节修订任务（Story 4.6）：段序 + 步数与 generate_chapter 共用（同四段流水线）。
+
+
+async def revise_chapter(
+    ctx: dict,
+    task_id: str,
+    user_id: str,
+    project_id: str,
+    chapter_number: int,
+    action: str,
+    feedback: str | None,
+    annotations: list[dict],
+    previous_text: str,
+    target_revision: int,
+) -> dict[str, object]:
+    """章节修订 ARQ 任务（Story 4.6）：改进本章 / 重新生成整章，走 4.2 四段流水线强制重跑。
+
+    **仿 generate_chapter**（本文件上文），差异：
+    - 组装 revision_input（action/feedback/annotations/previous_text）+ target_revision 传给
+      pipeline.run_chapter_pipeline——service 已 reset_run（清旧 succeeded 产物），故此处重跑全
+      四段（context 段据 revision_input 拼「改进/重生」写作任务书）。
+    - result payload 比 generate 多 `revision`（前端据此更新版本号，不本地 +1）。
+
+    断点续跑（AR11）：pipeline 用 chapter_generation_run 持久化各段——修订任务体内若 ARQ 重试
+    （max_tries=1 不重试，但 pipeline 层仍幂等），从失败段续跑。异常推 error（护栏/空产经
+    ErrorEnvelope 透传 code/message，其余泛化 generate_failed）。
+    """
+    pub: Redis = ctx["pub_redis"]
+
+    async def _on_progress(step_name: str) -> None:
+        step_no = _CHAPTER_STEP_ORDER.get(step_name, 0)
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_PROGRESS,
+            {
+                "step": step_no,
+                "stepName": step_name,
+                "percent": round(step_no / _CHAPTER_TOTAL_STEPS * 100),
+            },
+        )
+
+    revision_input = {
+        "action": action,
+        "feedback": feedback,
+        "annotations": annotations,
+        "previous_text": previous_text,
+    }
+    try:
+        final_text = await pipeline.run_chapter_pipeline(
+            user_id=uuid.UUID(user_id),
+            project_id=uuid.UUID(project_id),
+            chapter_number=chapter_number,
+            on_progress=_on_progress,
+            revision_input=revision_input,
+            target_revision=target_revision,
+        )
+        payload: dict[str, object] = {
+            "taskId": task_id,
+            "status": "chapter_ready",
+            "chapterNumber": chapter_number,
+            "chapterText": final_text,
+            "revision": target_revision,
+        }
+        await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
+        return payload
+    except ErrorEnvelope as exc:
+        await sse.publish_event(
+            pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001  worker 内任何异常都要推 error 事件（陷阱⑧）
+        logger.exception(
+            "revise_chapter 任务失败：task_id=%s", task_id, exc_info=exc
+        )
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_ERROR,
+            {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+        )
+        raise
+
+
 # 阶段规划任务步数（读设定 + LLM 生成 + 落库完成），每步一个 progress 事件。
 _PLAN_TOTAL_STEPS = 3
 
@@ -379,7 +463,13 @@ class WorkerSettings:
     要求「涵盖全部 ARQ 任务勿只补 settle」）。
     """
 
-    functions = [demo_generate, settle_exploration, generate_chapter, plan_first_stage]
+    functions = [
+        demo_generate,
+        settle_exploration,
+        generate_chapter,
+        revise_chapter,
+        plan_first_stage,
+    ]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = 1
     on_startup = on_startup
