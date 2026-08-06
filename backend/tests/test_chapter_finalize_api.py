@@ -1,4 +1,4 @@
-"""Story 4.7 验证：定稿本章端点 POST .../finalize（AC1/AC2/AC9）。
+"""Story 4.7 验证：定稿本章端点 POST .../finalize（AC1/AC2/AC9 + Story 5.2 写后投影）。
 
 - 离线（不需容器）：定稿端点鉴权缺失 401（CurrentUser 前置）。
 - HTTP（@requires_db，同步 REST 不需 Redis）：
@@ -9,12 +9,26 @@
   - 租户隔离 404（他人 project）
   - 章号 <1 → 400 chapter_out_of_range（防御 API 直打）
 
+**Story 5.2 扩展**：
+- 定稿触发 data-agent 投影——chapter_card / story_state / story_thread 三表落库
+- 幂等：已 finalized + chapter_card 已存在 → 不重复投影
+- 投影失败不卡 status——mock pipeline 抛异常 → status 仍 finalized、chapter_card 缺失
+- 断点续跑：已 finalized + chapter_card 缺失 → 再调 finalize 触发投影补齐
+
+**LLM mock 策略**（关键）：5.2 finalize 会跑 data-agent LLM 调用（DeepSeek 真实 API 慢
++ 需真实 key）。本测试 **autouse fixture** mock `chapter_service.pipeline.run_chapter_pipeline`
+不打真实 LLM，改为在 `chapter_generation_run.steps` 直接种 data_agent 段产物——
+`chapter_projection_service.chapter_commit` 从 run 表读产物做**真实投影**（非 mock），
+保证端到端验证「定稿 → 三表落库」的完整链路。
+
 造 confirmed bible / chapter 用同步 Session 直接造种子（仿 test_chapter_revise_api.py）。
 """
 
 import uuid
 from collections.abc import Callable
+from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
@@ -22,10 +36,108 @@ from sqlalchemy.orm import Session
 from muse.main import app
 from muse.models.account import User
 from muse.models.chapter import Chapter
+from muse.models.chapter_card import ChapterCard
+from muse.models.chapter_generation import ChapterGenerationRun
 from muse.models.story_bible import StoryBible
+from muse.models.story_state import StoryState
+from muse.models.story_thread import StoryThread
 from tests.conftest import requires_db
 
 _client = TestClient(app, raise_server_exceptions=False)
+
+
+def _default_extracted(chapter_number: int = 1) -> dict:
+    """默认 data-agent 产出（一章定稿的标准提取 schema，供 run 表种产物用）。"""
+    return {
+        "what_happened": f"第 {chapter_number} 章发生了什么（mock data-agent）",
+        "character_changes": "人物变化（mock）",
+        "new_facts_clues": "新增事实（mock）",
+        "unresolved_hooks": "未解决悬念（mock）",
+        "end_state": "章末状态（mock）",
+        "protagonist_state": "主角状态（mock）",
+        "world_rules_state": "世界规则（mock）",
+        "current_stage": "当前阶段（mock）",
+        "new_threads": [
+            {
+                "content": f"第 {chapter_number} 章埋伏笔",
+                "introduced_chapter_number": chapter_number,
+            }
+        ],
+        "resolved_threads": [],
+        "touched_threads": [],
+    }
+
+
+@pytest.fixture(autouse=True)
+def _mock_pipeline_run_chapter_pipeline(db_engine: Engine, request):
+    """autouse：mock chapter_service.pipeline.run_chapter_pipeline 不打真实 LLM。
+
+    改为在 chapter_generation_run.steps 种 data_agent 段产物（含四段 succeeded 占位），
+    chapter_projection_service 从 run 表读产物做真实投影——端到端验证「定稿 → 三表落库」。
+
+    **E6 patch 例外**：标记 `@pytest.mark.real_pipeline` 的测试跳过 mock，真实跑通
+    pipeline（只 mock provider 不打真实 LLM）——用于验证「finalize 后 chapter.status/
+    revision 不被 pipeline 末段 upsert_chapter 覆盖」（E1+E2 致命 bug 回归防线）。
+    """
+    # 标记 real_pipeline 的测试跳过 mock，让真实 pipeline 跑起来。
+    if request.node.get_closest_marker("real_pipeline"):
+        yield
+        return
+
+    async def _fake_run_chapter_pipeline(
+        *,
+        user_id: uuid.UUID,
+        project_id: uuid.UUID,
+        chapter_number: int,
+        chapter_idea=None,
+        on_progress=None,
+        revision_input=None,
+        target_revision: int = 1,
+        run_data_agent_step: bool = False,
+    ) -> str:
+        """mock：种 run 表 steps（含 data_agent 段产物），返回 mock 正文。"""
+        final_text = f"第 {chapter_number} 章定稿正文（mock pipeline）"
+        with Session(db_engine) as s:
+            run = (
+                s.execute(
+                    select(ChapterGenerationRun).where(
+                        ChapterGenerationRun.user_id == user_id,
+                        ChapterGenerationRun.project_id == project_id,
+                        ChapterGenerationRun.chapter_number == chapter_number,
+                    )
+                )
+            ).scalar_one_or_none()
+            if run is None:
+                run = ChapterGenerationRun(
+                    user_id=user_id,
+                    project_id=project_id,
+                    chapter_number=chapter_number,
+                    chapter_idea=chapter_idea,
+                    status="succeeded",
+                    steps={},
+                )
+                s.add(run)
+            # 四段 succeeded 占位（finalize 路径只跑 data_agent，四段产物复用 mock 值）。
+            run.steps = {
+                "context": {"status": "succeeded", "output": "mock 任务书"},
+                "drafter": {"status": "succeeded", "output": "mock 初稿"},
+                "reviewer": {"status": "succeeded", "output": "mock 审查意见"},
+                "polisher": {"status": "succeeded", "output": final_text},
+            }
+            if run_data_agent_step:
+                run.steps["data_agent"] = {
+                    "status": "succeeded",
+                    "output": _default_extracted(chapter_number),
+                }
+            run.status = "succeeded"
+            s.commit()
+        return final_text
+
+    with patch(
+        "muse.services.chapter_service.pipeline.run_chapter_pipeline",
+        side_effect=_fake_run_chapter_pipeline,
+    ):
+        yield
 
 
 def _create_project(user: User, headers: dict[str, str]) -> str:
@@ -305,3 +417,286 @@ def test_revise_after_finalize_rejected_400(
         assert row is not None
         assert row.status == "finalized"
         assert row.revision == 2
+
+
+# ========== Story 5.2 写后投影：定稿触发 data-agent → 三表落库 ==========
+
+
+def _read_chapter_card(
+    engine: Engine, user_id: uuid.UUID, project_id: str, chapter_number: int
+) -> ChapterCard | None:
+    with Session(engine) as session:
+        return session.execute(
+            select(ChapterCard).where(
+                ChapterCard.user_id == user_id,
+                ChapterCard.project_id == uuid.UUID(project_id),
+                ChapterCard.chapter_number == chapter_number,
+            )
+        ).scalar_one_or_none()
+
+
+def _read_story_state(
+    engine: Engine, user_id: uuid.UUID, project_id: str
+) -> StoryState | None:
+    with Session(engine) as session:
+        return session.execute(
+            select(StoryState).where(
+                StoryState.user_id == user_id,
+                StoryState.project_id == uuid.UUID(project_id),
+            )
+        ).scalar_one_or_none()
+
+
+def _read_open_threads(
+    engine: Engine, user_id: uuid.UUID, project_id: str
+) -> list[StoryThread]:
+    with Session(engine) as session:
+        return list(
+            session.execute(
+                select(StoryThread).where(
+                    StoryThread.user_id == user_id,
+                    StoryThread.project_id == uuid.UUID(project_id),
+                    StoryThread.status == "open",
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@requires_db
+def test_finalize_triggers_projection_three_tables(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.2 AC1/AC2/AC3：定稿触发 data-agent 投影 → chapter_card + story_state +
+    story_thread 三表全部落库（单事务原子性）。"""
+    with _client:
+        user = make_user("fin-proj@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(db_engine, user.id, project_id, 1, "第一章定稿正文")
+
+        resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "finalized"
+
+    # chapter_card 五要素落库（mock data-agent 产出）。
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is not None
+    assert card.what_happened == "第 1 章发生了什么（mock data-agent）"
+    assert card.unresolved_hooks == "未解决悬念（mock）"
+
+    # story_state 三列快照落库。
+    state = _read_story_state(db_engine, user.id, project_id)
+    assert state is not None
+    assert state.protagonist_state == "主角状态（mock）"
+    assert state.current_stage == "当前阶段（mock）"
+
+    # story_thread.new_threads 落库（1 条 open thread）。
+    threads = _read_open_threads(db_engine, user.id, project_id)
+    assert len(threads) == 1
+    assert threads[0].content == "第 1 章埋伏笔"
+    assert threads[0].status == "open"
+    assert threads[0].introduced_chapter_number == 1
+    assert threads[0].last_touched_chapter_number == 1
+
+
+@requires_db
+def test_finalize_idempotent_skips_projection_when_card_exists(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.2 幂等：已 finalized + chapter_card 已存在 → 不重复投影（防御 API 直打
+    重复定稿 / data-agent 断点续跑不重复付费 NFR5）。"""
+    with _client:
+        user = make_user("fin-idem@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(
+            db_engine, user.id, project_id, 1, "已定稿正文", status="finalized"
+        )
+        # 手工种 chapter_card（模拟「上次已投影完成」）。
+        with Session(db_engine) as session:
+            session.add(
+                ChapterCard(
+                    user_id=user.id,
+                    project_id=uuid.UUID(project_id),
+                    chapter_number=1,
+                    what_happened="已有卡片（上次投影）",
+                    character_changes="",
+                    new_facts_clues="",
+                    unresolved_hooks="",
+                    end_state="",
+                )
+            )
+            session.commit()
+
+        resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "finalized"
+
+    # chapter_card 仍是手工种的值（未被 mock data-agent 覆盖——幂等跳过投影）。
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is not None
+    assert card.what_happened == "已有卡片（上次投影）"
+
+
+@requires_db
+def test_finalize_projection_failure_keeps_status_finalized(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.2 AC5 + 受控决策 2：投影失败不卡 status——status 仍 finalized、
+    chapter_card 缺失（下次断点续跑补齐）。"""
+    with _client:
+        user = make_user("fin-fail@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(db_engine, user.id, project_id, 1, "第一章定稿正文")
+
+        # mock chapter_commit 抛异常（模拟投影 LLM 抖动 / DB 写异常）。
+        with patch(
+            "muse.services.chapter_projection_service.chapter_card_repo.upsert_chapter_card",
+            side_effect=RuntimeError("DB 连接抖动"),
+        ):
+            resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+            assert resp.status_code == 200  # 定稿成功（投影失败不向上抛）
+            assert resp.json()["status"] == "finalized"
+
+    # status 仍 finalized（保留），chapter_card 缺失（投影失败）。
+    row = _read_chapter(db_engine, user.id, project_id, 1)
+    assert row is not None
+    assert row.status == "finalized"
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is None
+
+    # B4 patch：三表全空（story_state / story_thread 也未落库——单事务原子性防线）。
+    state = _read_story_state(db_engine, user.id, project_id)
+    assert state is None
+    threads = _read_open_threads(db_engine, user.id, project_id)
+    assert threads == []
+
+
+@requires_db
+def test_finalize_resume_projection_when_card_missing(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.2 断点续跑：已 finalized + chapter_card 缺失（上次投影失败）→ 再调
+    finalize 触发投影补齐（data-agent 复用 run 表 polisher 段产物，不重新调 drafter）。"""
+    with _client:
+        user = make_user("fin-resume@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(
+            db_engine, user.id, project_id, 1, "已定稿正文", status="finalized"
+        )
+        # chapter_card 缺失（模拟「上次投影失败」状态）。
+
+        resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "finalized"
+
+    # 投影补齐：chapter_card / story_state / story_thread 三表全部落库。
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is not None
+    assert card.what_happened == "第 1 章发生了什么（mock data-agent）"
+
+    state = _read_story_state(db_engine, user.id, project_id)
+    assert state is not None
+
+    threads = _read_open_threads(db_engine, user.id, project_id)
+    assert len(threads) == 1
+
+
+# ========== Story 5.2 review E6 patch：真实跑通 pipeline 验证 status/revision 不被改 ==========
+
+
+@requires_db
+@pytest.mark.real_pipeline
+def test_finalize_real_pipeline_preserves_status_and_revision(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.2 review E6 patch：真实跑通 pipeline（不 mock run_chapter_pipeline、只
+    mock provider），验证「finalize 后 chapter.status/revision 不被 pipeline 末段
+    upsert_chapter 覆盖」（E1+E2 致命 bug 的回归防线）。
+
+    场景：revision=3 的 draft 章调 finalize → chapter_service 把 status 置 finalized +
+    保留 revision=3 → 真实跑 pipeline（四段 cached 复用 mock 产物 + data_agent 段跑
+    mock provider）→ 断言 DB 中 chapter.status 仍 finalized、revision 仍 3（未被
+    pipeline 末段 upsert_chapter 覆盖回 draft/1）。
+    """
+    with _client:
+        user = make_user("fin-real@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        # 种 revision=3 的 draft 章（模拟「改进过 2 次」）。
+        _seed_chapter(
+            db_engine,
+            user.id,
+            project_id,
+            1,
+            "第一章定稿正文（第 3 版）",
+            revision=3,
+            status="draft",
+        )
+
+        # 不 mock run_chapter_pipeline（让它真实跑）；只 mock provider 不打真实 LLM。
+        # 造一个 mock provider：run_data_agent 返回合法 JSON。
+        from unittest.mock import AsyncMock, MagicMock
+
+        from muse.orchestration import steps
+        from muse.providers.base import ChatResult
+
+        def _fake_chat_result(content: str) -> ChatResult:
+            return ChatResult(
+                content=content,
+                prompt_tokens=100,
+                completion_tokens=50,
+                total_tokens=150,
+                model="deepseek-v4-flash",
+            )
+
+        mock_provider = MagicMock()
+        mock_provider.chat = AsyncMock(
+            return_value=_fake_chat_result(
+                '{"what_happened": "真实 pipeline 提取", "character_changes": "人物变化", '
+                '"new_facts_clues": "新增事实", "unresolved_hooks": "未解决悬念", '
+                '"end_state": "章末状态", "protagonist_state": "主角状态", '
+                '"world_rules_state": "世界规则", "current_stage": "当前阶段", '
+                '"new_threads": [], "resolved_threads": [], "touched_threads": []}'
+            )
+        )
+
+        # patch get_provider_for_user 返回 mock provider（不打真实 DeepSeek）。
+        with patch.object(
+            steps, "get_provider_for_user", AsyncMock(return_value=mock_provider)
+        ):
+            resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "finalized"
+            assert resp.json()["revision"] == 3  # API 响应保留 revision=3
+
+    # 断言 DB 中 chapter.status 仍 finalized、revision 仍 3（未被 pipeline 末段
+    # upsert_chapter 覆盖回 draft/1——E1+E2 致命 bug 的回归防线）。
+    row = _read_chapter(db_engine, user.id, project_id, 1)
+    assert row is not None
+    assert row.status == "finalized"
+    assert row.revision == 3
+
+    # chapter_card 落库（真实 pipeline 跑的 data_agent 提取）。
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is not None
+    assert card.what_happened == "真实 pipeline 提取"

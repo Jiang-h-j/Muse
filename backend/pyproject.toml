@@ -47,6 +47,10 @@ warn_redundant_casts = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Story 5.2 review E6 patch：标记「真实跑通 pipeline 不 mock」的测试（E1+E2 回归防线）。
+markers = [
+    "real_pipeline: 跳过 autouse 的 run_chapter_pipeline mock，让真实 pipeline 跑起来（只 mock provider 不打真实 LLM）",
+]
 
 [dependency-groups]
 dev = [

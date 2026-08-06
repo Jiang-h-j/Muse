@@ -11,8 +11,13 @@
 **触发范式**照 exploration_service.trigger_guided_settle：create_pool → register_task_owner
 （**必先于** enqueue_job，否则 SSE 鉴权 404）→ enqueue_job(name, task_id, uid, pid,
 _job_id=task_id) → aclose。租户守卫二义合一 404（NFR3）。事务边界在此层（repo 只 flush）。
+
+**Story 5.2 扩展**：`finalize_chapter` 内部重写为「定稿 + 写后投影」整体流程
+（`finalize_and_project_chapter`），保持函数签名/返回类型不变（router 零改）。投影
+失败不卡 status——受控决策 2（status 翻转与投影是两个独立事务）。
 """
 
+import logging
 import uuid
 
 from arq import create_pool
@@ -20,17 +25,23 @@ from arq.connections import RedisSettings
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from muse.core import sse
+from muse.core.db import async_session_maker
 from muse.core.errors import ErrorEnvelope
 from muse.core.settings import get_settings
 from muse.models.chapter import Chapter
 from muse.models.stage_plan import StagePlan
+from muse.orchestration import pipeline
 from muse.repositories import (
+    chapter_card_repo,
     chapter_generation_repo,
     chapter_repo,
     project_repo,
     stage_plan_repo,
     story_bible_repo,
 )
+from muse.services import chapter_projection_service
+
+logger = logging.getLogger("muse")
 
 
 def _project_not_found() -> ErrorEnvelope:
@@ -408,21 +419,40 @@ async def finalize_chapter(
     project_id: uuid.UUID,
     chapter_number: int,
 ) -> Chapter:
-    """定稿本章（Story 4.7 AC1/AC2/AC9）：把 chapter.status 置 finalized，返回更新后的 Chapter。
+    """定稿本章 + 写后投影（Story 4.7 AC1/AC2/AC9 + Story 5.2 AR17/AC2/AC3/AC5）。
 
-    **同步 REST，不调 LLM、不入 ARQ**——定稿只改 status（当前版本成后续章节创作的正式上下文，
-    FR21）。事务边界在此层（commit）。流程：
+    **同步 REST，不调 LLM 不入 ARQ 的部分**：把 chapter.status 置 finalized，返回更新后的
+    Chapter——保持函数签名/返回类型不变（router 零改、前端只感知「定稿可能稍慢」）。
+
+    **Story 5.2 写后投影（同步等 data-agent + 单事务投影）**：status 翻 finalized 后，
+    调 `pipeline.run_chapter_pipeline(run_data_agent_step=True)` 跑第五段 data-agent 从
+    定稿正文提取结构化 JSON，再由 `chapter_projection_service.chapter_commit` 在同一事务
+    内投影回 story_state / chapter_card / story_thread。
+
+    **受控决策 2（投影失败 ≠ 定稿失败）**：status 翻转与投影是两个独立事务——先
+    `upsert_chapter(status="finalized")` + commit（用户已收到定稿成功响应），再独立事务
+    跑 data-agent + chapter_commit；投影失败只记 `logger.exception` + run.steps.data_agent
+    标 failed，下次定稿（本章或下一章）触发 data-agent 时断点续跑复用 polisher 段产物
+    继续投影。**AC2 的「单事务」约束的是「投影内部三表原子性」，不是「status 翻转与投影
+    同一事务」**——两者必须分开，否则投影 LLM 抖动会把 status 卡回 draft（FR21 被破坏）。
+
+    **幂等**：
+    - 已 `status=="finalized"` 且 `chapter_card` 已落库 → 直接返回现行（投影已完成、不
+      重复跑）。
+    - 已 `status=="finalized"` 但 `chapter_card` 缺失 → 视为「上次投影失败」→ 继续走
+      投影流程（data-agent 断点续跑会复用 run 表 polisher 段产物，不重新调 drafter）。
+    - 仍 `status=="draft"` → 正常走「翻 status + 投影」整体流程。
+
+    **前置校验**（沿用 Story 4.7 逻辑）：
     1. 租户守卫（`get_owned_project` → None 抛 404 二义合一，NFR3）。
     2. confirmed 前置（防御，复用 `_bible_not_confirmed`）：无 confirmed bible → 400。
-    3. 章号下界校验：`chapter_number < 1` → 400（防御 API 直打）。**不做 stage_plan 长度上界
-       校验**——跨多阶段后章号会超首阶段 chapters 长度（第二阶段章号继续递增），有正文即可定稿。
-    4. 本章须已有正文（`get_chapter` None → 400 `chapter_not_generated`，复用 4.6 工厂）。
-    5. **幂等**：已 `status=="finalized"` 直接返回现行（不重复写；前端定稿后按钮已隐藏，此为
-       防御 API 直打重复定稿）。
-    6. `upsert_chapter(status="finalized")`：保留 text/revision，只改 status → commit → 返回。
+    3. 章号下界校验：`chapter_number < 1` → 400（防御 API 直打）。**不做 stage_plan 长度
+       上界校验**——跨多阶段后章号会超首阶段 chapters 长度。
+    4. 本章须已有正文（`get_chapter` None → 400 `chapter_not_generated`）。
 
-    定稿后写前上下文会把本章计入前序（list_recent_chapters 只读 finalized，FR21 兑现）；写后
-    投影 + 章节卡片归 Epic 5 Story 5.2（本 story 只置 status，不建表不投影，Jianghj 裁决①）。
+    定稿后写前上下文会把本章计入前序（list_recent_chapters 只读 finalized，FR21 兑现）；
+    章节卡片持久化后，下一章定稿时 data-agent 会从 run.steps.data_agent 断点续跑复用
+    提取产物（不重复付费 NFR5）。
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
@@ -449,21 +479,141 @@ async def finalize_chapter(
     if existing is None:
         raise _chapter_not_generated()
 
-    # 幂等：已定稿再调直接返回现行（不重复写）。
+    # 幂等：已定稿且 chapter_card 已落库 → 直接返回现行（投影已完成）。
     if existing.status == "finalized":
-        return existing
+        card = await chapter_card_repo.get_by_chapter(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=chapter_number,
+        )
+        if card is not None:
+            return existing
+        # 已定稿但 chapter_card 缺失 → 视为「上次投影失败」→ 跳过 status 翻转直接走投影。
+        logger.info(
+            "finalize 幂等重入：status 已 finalized 但 chapter_card 缺失，"
+            "跳过 status 翻转直接走投影断点续跑：project=%s chapter=%s",
+            project_id,
+            chapter_number,
+        )
+        chapter = existing
+    else:
+        # 只改 status，保留 text/revision（upsert 同键覆盖，不新增行）。
+        chapter = await chapter_repo.upsert_chapter(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=chapter_number,
+            text=existing.text,
+            revision=existing.revision,
+            status="finalized",
+        )
+        await session.commit()
 
-    # 只改 status，保留 text/revision（upsert 同键覆盖，不新增行）。
-    chapter = await chapter_repo.upsert_chapter(
-        session,
-        user_id=user_id,
-        project_id=project_id,
-        chapter_number=chapter_number,
-        text=existing.text,
-        revision=existing.revision,
-        status="finalized",
-    )
-    await session.commit()
+    # ---------- Story 5.2 写后投影（独立事务，投影失败不卡 status） ----------
+    # 新开独立事务跑 data-agent + chapter_commit——与上方 status 翻转的 session 分开：
+    # ① status 已 finalized 落库，用户已收到定稿成功响应；② 投影失败（LLM 抖动 / DB 写
+    # 异常 / JSON 解析失败）只记日志、run.steps.data_agent 标 failed，下次断点续跑复用
+    # polisher 段产物继续投影。
+    try:
+        async with async_session_maker() as projection_session:
+            # 1. 跑 data-agent（run_chapter_pipeline 第五段，断点续跑复用产物）：
+            #    run_data_agent_step=True 时才跑 data_agent 段；其他四段（context/drafter/
+            #    reviewer/polisher）已 succeeded 会直接复用产物、不重复付费。
+            await pipeline.run_chapter_pipeline(
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=chapter_number,
+                chapter_idea=None,
+                on_progress=None,  # finalize 不走 SSE（受控决策 3：同步等 data-agent）
+                run_data_agent_step=True,
+            )
+
+            # 2. 从 run 表读 data-agent 段产物（dict）。
+            run = await chapter_generation_repo.get_run(
+                projection_session,
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=chapter_number,
+            )
+            if run is None or run.steps is None:
+                raise RuntimeError(
+                    f"data-agent 段产物缺失：project={project_id} chapter={chapter_number} "
+                    "run 或 run.steps 为 None"
+                )
+            data_agent_entry = run.steps.get(pipeline.STEP_DATA_AGENT)
+            if (
+                data_agent_entry is None
+                or data_agent_entry.get("status") != "succeeded"
+            ):
+                raise RuntimeError(
+                    f"data-agent 段产物缺失：project={project_id} chapter={chapter_number} "
+                    f"steps.data_agent={data_agent_entry}"
+                )
+            extracted = data_agent_entry.get("output")
+            if not isinstance(extracted, dict):
+                raise RuntimeError(
+                    f"data-agent 段产物类型异常：project={project_id} chapter={chapter_number} "
+                    f"output_type={type(extracted).__name__}"
+                )
+
+            # 3. 单事务 chapter-commit 投影三表（任一步抛异常 → 整体 rollback）。
+            await chapter_projection_service.chapter_commit(
+                projection_session,
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=chapter_number,
+                extracted=extracted,
+            )
+            await projection_session.commit()
+
+            logger.info(
+                "finalize 投影完成：project=%s chapter=%s",
+                project_id,
+                chapter_number,
+            )
+    except (RuntimeError, ErrorEnvelope) as exc:
+        # 投影失败不向上抛（status 已 finalized 保留）——记日志留审计 + 显式 rollback +
+        # 显式标 run.steps.data_agent 为 failed（供下次重入识别），下次定稿（本章或下一章）
+        # 触发 data-agent 时断点续跑复用 polisher 段产物继续投影。
+        # 只对预期异常（RuntimeError / ErrorEnvelope）吞——其他系统错（如 KeyboardInterrupt）
+        # 向上抛不掩盖。
+        await projection_session.rollback()
+        logger.exception(
+            "finalize 投影失败（status 已 finalized 保留，下次断点续跑）："
+            "project=%s chapter=%s",
+            project_id,
+            chapter_number,
+            exc_info=exc,
+        )
+        # 显式标 run.steps.data_agent 为 failed（A8 patch：供下次重入识别，避免
+        # run.steps.data_agent 仍显示上次的 succeeded 或不存在导致断点续跑误判）。
+        try:
+            async with async_session_maker() as run_session:
+                run = await chapter_generation_repo.get_run(
+                    run_session,
+                    user_id=user_id,
+                    project_id=project_id,
+                    chapter_number=chapter_number,
+                )
+                if run is not None:
+                    await chapter_generation_repo.update_step(
+                        run_session,
+                        run=run,
+                        step_name=pipeline.STEP_DATA_AGENT,
+                        status="failed",
+                        output="",
+                    )
+                    await run_session.commit()
+        except Exception:  # noqa: BLE001  标 failed 失败不阻断主流程（已记日志）
+            logger.warning(
+                "finalize 投影失败后标 run.steps.data_agent 为 failed 失败（已忽略）："
+                "project=%s chapter=%s",
+                project_id,
+                chapter_number,
+                exc_info=True,
+            )
+
     return chapter
 
 

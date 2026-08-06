@@ -1,4 +1,4 @@
-"""五段流水线的四段 step 实现（Story 4.2，V1 四段：context→drafter→reviewer→polisher）。
+"""五段流水线的 step 实现（Story 4.2 V1 四段 + Story 5.2 第五段 data-agent）。
 
 每段是一个独立可重试的 async 函数，遵循 story_settle_agent 的成熟范式：
 - 独立 `async_session_maker()` 自管 session（陷阱⑩：调 provider 走 MeteredProvider 记账，
@@ -20,11 +20,20 @@
 - polisher：收初稿 + 审查意见 + 词表约束 → 加载正式去 AI 味词表 analyze_axis_b 自查 →
   LLM 按词表 + style_profile 去 AI 味改写 → 终稿。**思考档 pro**（改写重）。是 NFR1 红线
   的兑现段（AR15）。
+- data-agent（Story 5.2 新增，第五段写后段）：收定稿正文 + confirmed 设定 → LLM 提取
+  结构化 JSON（事件/状态变化/新增实体/伏笔回收）→ 交 chapter_projection_service 单事务
+  投影回 story_state/chapter_card/story_thread。**快档 flash**（结构化提取是轻任务，
+  architecture.md:196「deepseek-v4-flash 快，提取/轻任务」；reviewer 已实测快档会跑偏
+  是因为审查要写意见正文，提取 JSON 天然强约束不易跑偏）。**只在定稿时跑**（受控决策 1），
+  非定稿路径（generate/revise）跳过。
 
 分层（architecture.md router→service→provider）：经 LLMProvider 抽象调 LLM（禁直调 openai，
 陷阱①），Provider 层自动记账（AR14）。
 """
 
+import json
+import logging
+import re
 import uuid
 
 from muse.core.db import async_session_maker
@@ -33,8 +42,10 @@ from muse.core.settings import get_settings
 from muse.orchestration import ai_taste_lexicon
 from muse.providers.base import ChatResult, Message
 from muse.providers.factory import get_provider_for_user
-from muse.repositories import chapter_repo, project_repo, story_bible_repo
+from muse.repositories import chapter_card_repo, chapter_repo, project_repo, story_bible_repo
 from muse.services import exploration_service, usage_service
+
+logger = logging.getLogger("muse")
 
 # drafter/polisher 写整章正文，章节体量较长；快档/思考档均为推理模型（reasoning_content 先吃
 # 预算，story_settle_agent.py:55-58 踩坑），故 max_tokens 留足避免正文被挤空。
@@ -44,6 +55,9 @@ _DRAFT_MAX_TOKENS = 4000
 # 稳定的审查意见正文。max_tokens 留足审查意见空间（reasoning 先吃预算，settle:55-58 踩坑）。
 _REVIEW_MAX_TOKENS = 2048
 _POLISH_MAX_TOKENS = 4000
+# data-agent（Story 5.2）输出严格 JSON：五要素 + 三列快照 + 三类 thread 操作，结构化
+# 凝练体量小；但 reasoning 模型先吃预算（settle:55-58 踩坑），故 max_tokens 留足。
+_DATA_AGENT_MAX_TOKENS = 2048
 
 # 写前上下文注入的前序章节数（AC4）：V1 默认取最近 1 章（前一章）。取太多会挤爆 128K 上下文
 # （承 deferred-work.md:175 对话历史无上界顾虑）；单章正文约 1500-2500 字，1 章足够给 drafter
@@ -434,3 +448,254 @@ async def run_polisher(
     if not polished:
         raise _generate_failed()
     return polished
+
+
+# ---------- Story 5.2 第五段：data-agent（写后投影，AR17） ----------
+
+
+def _projection_failed() -> ErrorEnvelope:
+    """data-agent 投影失败（LLM 产空 / JSON 解析失败 → 502，与 _generate_failed 同语义
+    但专用 code 便于运维区分）。
+
+    AC5「失败回滚可重试」配合 chapter_projection_service 单事务——step 抛错即触发
+    run.steps.data_agent 标 failed + run 标 failed，下次重入断点续跑。
+    """
+    return ErrorEnvelope(
+        code="projection_failed",
+        message="章节归档失败，请稍后重试。",
+        http_status=502,
+    )
+
+
+def _format_recent_chapter_cards_block(chapter_cards: list) -> str:
+    """把最近前序章节卡五要素渲染成 data-agent 输入的「前章归档」段（A7 patch）。
+
+    chapter_cards 已按 chapter_number 降序（最近在前，chapter_card_repo.
+    list_recent_chapter_cards）——这里反转为正序（旧→新）供阅读连贯。区分两种「无卡」：
+    - chapter_cards 为空列表 = 确实是第一章（无前序卡）→ 提示「这是第一章」。
+    - chapter_cards 非空但五要素皆空/空白（异常/占位）→ 不能骗 LLM「这是第一章」，
+      而是明确提示「前序章节归档缺失」，让 data-agent 知道确有前序、按设定谨慎提取。
+    """
+    ordered = sorted(chapter_cards, key=lambda c: c.chapter_number)
+    parts: list[str] = []
+    for card in ordered:
+        what_happened = (getattr(card, "what_happened", None) or "").strip()
+        end_state = (getattr(card, "end_state", None) or "").strip()
+        unresolved_hooks = (getattr(card, "unresolved_hooks", None) or "").strip()
+        if what_happened:
+            parts.append(
+                f"【第 {card.chapter_number} 章归档】\n"
+                f"发生了什么：{what_happened}\n"
+                f"章末状态：{end_state or '（空）'}\n"
+                f"未解决悬念：{unresolved_hooks or '（空）'}"
+            )
+    if parts:
+        body = "\n\n".join(parts)
+        return f"【前章归档卡片（务必对照识别本章新增事实/状态变化/伏笔回收）】\n{body}"
+    if not chapter_cards:
+        # 无前序卡 = 确实是第一章。
+        return "【前章归档卡片】\n（这是第一章，暂无前序归档。）"
+    # 有前序卡但五要素皆空（异常）：不谎称第一章，提示缺失让 data-agent 谨慎提取。
+    return (
+        "【前章归档卡片】\n（已有前序章节但归档缺失，请依据故事设定谨慎提取、"
+        "不要当作第一章从头提取。）"
+    )
+
+
+async def run_data_agent(
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    chapter_number: int,
+    chapter_text: str,
+) -> dict:
+    """data-agent（Story 5.2，第五段写后段，AR17）：从定稿正文提取结构化 JSON。
+
+    **只在定稿时跑**（受控决策 1，FR23）——不在 generate/revise 时跑（那两路径只翻
+    status 不落归档）。**快档 flash**（结构化提取是轻任务，architecture.md:196；
+    reviewer 已实测快档会跑偏是因为「写意见正文」的自由文本任务，JSON 强约束提取
+    不易跑偏）。**不调 reviewer**——data-agent 拿的是 polisher 段已定稿正文。
+
+    **输入注入**：定稿正文 + confirmed story_bible 12 字段摘要（上下文锚点）。
+    **输出 schema**（严格 JSON，prompt 强约束 + json.loads 解析 + 必填字段守卫）：
+
+    ```json
+    {
+      "what_happened": "...",           // chapter_card 五要素 ①
+      "character_changes": "...",       // ②
+      "new_facts_clues": "...",         // ③
+      "unresolved_hooks": "...",        // ④
+      "end_state": "...",               // ⑤
+      "protagonist_state": "...",       // story_state 三列 ①
+      "world_rules_state": "...",       // ②
+      "current_stage": "...",           // ③
+      "new_threads": [                  // 新埋伏笔（→ story_thread_repo.upsert_new_thread）
+        {"content": "...", "introduced_chapter_number": 1}
+      ],
+      "resolved_threads": [             // 本章回收的伏笔（→ resolve_thread_by_content）
+        {"content": "...", "resolved_chapter_number": 1}
+      ],
+      "touched_threads": [              // 本章再提的伏笔（→ touch_thread_by_content）
+        {"content": "...", "last_touched_chapter_number": 1}
+      ]
+    }
+    ```
+
+    **空产/解析失败抛 `_projection_failed()`**（不静默兜底——AC5「失败回滚可重试」
+    须让 run.steps.data_agent 显式标 failed，下次重入断点续跑；若静默返空 dict，
+    chapter_projection_service 会写三表空快照造成数据污染）。
+    **返回 dict**（非 str）——run.steps 是 JSONB 列，可序列化 dict 直接落库；
+    本 step 是五段中唯一返回 dict 的段（其他四段返回 str），update_step 需兼容。
+    """
+    settings = get_settings()
+    async with async_session_maker() as session:
+        project = await project_repo.get_owned_project(session, project_id, user_id)
+        if project is None:
+            raise exploration_service._exploration_not_found()
+
+        # 读 confirmed 设定圣经作上下文锚点（同 context-agent 数据源）——LLM 需要
+        # 「既有设定」对照才能识别「本章新增事实/状态变化/伏笔回收」。
+        bible = await story_bible_repo.get_confirmed_by_project(
+            session, user_id=user_id, project_id=project_id
+        )
+        if bible is None:
+            # 极端防御：正常流程 confirmed 已前置（context-agent 已校验），此处 None
+            # 属「创作中被取消确认」——复用 bible_not_confirmed 语义。
+            raise _bible_not_confirmed()
+
+        # A7 patch：读最近前序 chapter_card 五要素作上下文锚点（spec Subtask 1.2 明文）——
+        # LLM 需要「前章已沉淀的事实」对照才能识别「本章新增事实/状态变化/伏笔回收」。
+        # 第一章无前序 → 空列表 → 空提示块。
+        recent_chapter_cards = await chapter_card_repo.list_recent_chapter_cards(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            before_number=chapter_number,
+            limit=_RECENT_CHAPTERS_FOR_CONTEXT,
+        )
+        recent_cards_block = _format_recent_chapter_cards_block(recent_chapter_cards)
+
+        await usage_service.check_quota(session, user_id)
+        provider = await get_provider_for_user(session, user_id, project_id=project_id)
+
+        # 设定摘要注入（12 字段有值的才列）。
+        setting_block = _format_bible_for_brief(bible)
+
+        messages: list[Message] = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一位严谨的网文事实提取员。读下面的故事设定、前章归档卡片与一章定稿正文，"
+                    "提取这一章发生的事实、人物变化、新增伏笔与回收伏笔，输出**严格 JSON**"
+                    "（不要任何额外说明、markdown 代码块或注释）。"
+                    "每个字段的取值必须是**整段散文式中文**（不是关键词列表），"
+                    "未发生的类别填空字符串 \"\"；new_threads / resolved_threads / "
+                    "touched_threads 三类列表若本章无对应操作填空列表 []。"
+                    "章号字段（introduced_chapter_number / resolved_chapter_number / "
+                    "last_touched_chapter_number）必须填本章章号。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"【故事设定（既有创作依据）】\n{setting_block}\n\n"
+                    f"{recent_cards_block}\n\n"
+                    f"【第 {chapter_number} 章定稿正文】\n{chapter_text}\n\n"
+                    "请提取并输出严格 JSON，schema 如下（所有字段必填，未发生填空串/空列表）：\n"
+                    "{\n"
+                    '  "what_happened": "本章发生了什么（散文一段）",\n'
+                    '  "character_changes": "人物变化（散文一段）",\n'
+                    '  "new_facts_clues": "新增事实与线索（散文一段）",\n'
+                    '  "unresolved_hooks": "未解决悬念（散文一段）",\n'
+                    '  "end_state": "章末状态（散文一段）",\n'
+                    '  "protagonist_state": "主角当前状态快照（心境/伤势/资源/关系）",\n'
+                    '  "world_rules_state": "世界规则当前生效快照（含本章修订追加）",\n'
+                    '  "current_stage": "当前叙事位置简述（如『程野刚进入第七码头地下档案库』）",\n'
+                    '  "new_threads": [{"content": "...", "introduced_chapter_number": '
+                    f"{chapter_number}"
+                    "}],\n"
+                    '  "resolved_threads": [{"content": "...", "resolved_chapter_number": '
+                    f"{chapter_number}"
+                    "}],\n"
+                    '  "touched_threads": [{"content": "...", "last_touched_chapter_number": '
+                    f"{chapter_number}"
+                    "}]\n"
+                    "}"
+                ),
+            },
+        ]
+        result: ChatResult = await provider.chat(
+            messages,
+            model=settings.deepseek_model_fast,
+            max_tokens=_DATA_AGENT_MAX_TOKENS,
+        )
+
+    raw = result.content.strip()
+    if not raw:
+        logger.warning(
+            "data-agent LLM 产空：project=%s chapter=%s", project_id, chapter_number
+        )
+        raise _projection_failed()
+
+    # 容错：LLM 偶发返回 ```json ... ``` 包装——用正则剥 fence（B5+E9 patch：
+    # 原「首行 ``` + 末行 ```」严格形态太狭隘，遇「fence 后有空格」「首尾换行异常」
+    # 「同尾行多 fence」会剥失败；改正则提取第一个 ``` 块内容，失败再 fallback 原串）。
+    fence_match = re.search(r"```(?:json)?\s*\n(.*?)\n```", raw, re.DOTALL)
+    if fence_match:
+        raw = fence_match.group(1).strip()
+
+    try:
+        extracted = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "data-agent JSON 解析失败：project=%s chapter=%s raw=%s",
+            project_id,
+            chapter_number,
+            raw[:500],
+            exc_info=exc,
+        )
+        raise _projection_failed() from exc
+
+    # 必填字段守卫：五要素 + 三列快照 + 三类 thread 列表，缺任一视为不完整。
+    required_keys = (
+        "what_happened",
+        "character_changes",
+        "new_facts_clues",
+        "unresolved_hooks",
+        "end_state",
+        "protagonist_state",
+        "world_rules_state",
+        "current_stage",
+        "new_threads",
+        "resolved_threads",
+        "touched_threads",
+    )
+    missing = [k for k in required_keys if k not in extracted]
+    if missing:
+        logger.warning(
+            "data-agent JSON 缺必填字段 %s：project=%s chapter=%s",
+            missing,
+            project_id,
+            chapter_number,
+        )
+        raise _projection_failed()
+
+    # 类型归一：LLM 可能把三类 thread 列表产为非 list（如 str/dict），强制归一为 list。
+    for key in ("new_threads", "resolved_threads", "touched_threads"):
+        if not isinstance(extracted[key], list):
+            extracted[key] = []
+    # 五要素/三列快照强制 str（LLM 可能产 None/list）。
+    for key in (
+        "what_happened",
+        "character_changes",
+        "new_facts_clues",
+        "unresolved_hooks",
+        "end_state",
+        "protagonist_state",
+        "world_rules_state",
+        "current_stage",
+    ):
+        if not isinstance(extracted[key], str):
+            extracted[key] = ""
+
+    return extracted

@@ -1,5 +1,13 @@
 # Deferred Work
 
+## Deferred from: code review of 5-2-写后投影-data-agent-chapter-commit单事务 (2026-08-06)
+
+> 三层对抗式审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。Edge 发现 **E1+E2 致命 bug**（finalize 投影链路把 chapter.status 从 finalized 改回 draft、revision 从 N 重置为 1——FR21 破功）已就地修复（pipeline.py:361-368 加 `if not run_data_agent_step:` 跳过 upsert_chapter）；Acceptance Auditor 确认 4/5 AC 兑现、5 受控决策全兑现、defer 台账 4 条防线全兑现。8 条 patch 待落地（E6 端到端测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / A8 投影失败标 failed / B4 三表全空断言）、4 条 decision-needed（PIPELINE_STEPS 拆分 / 参数名+判定位置 / 错误工厂+类型归一 / schema 字段名），以下 3 条 defer。
+
+- **data_agent LLM 失败会污染 run.status，下次 finalize 被迫全四段重跑（cached 命中不重复付费但日志噪音大）** [backend/src/muse/orchestration/pipeline.py:234-262] — data_agent LLM 抛错 → `_run_or_resume` 标 run.status="failed" → 下次 finalize 调 pipeline → `run.status == "succeeded"` 不命中 → 跳过整个「已 succeeded 早返回」分支（包括 data_agent_needed 判断）→ 直接走到下方从头跑 context_agent → drafter → reviewer → polisher → data_agent。**结果正确**（四段 cached 命中仍会复用产物、不重复付费 NFR5 守住，data_agent 段 cached 缺失会重新跑），但走完整 `_run_or_resume` 路径导致日志/进度噪音大；且若 run.status="failed" 期间有人调 generate_chapter，会触发「run.status != succeeded → 走完整流程」意外路径。**归后续优化**：考虑 data_agent 段失败时不清 run.status="succeeded"，让 data_agent 单独 retry；或 finalize 重入时识别 run.status="failed" 但 step 层 polisher 已 succeeded 也允许复用。
+- **chapter_card 存在但 story_state/story_thread 缺失的「半投影」状态无法恢复** [backend/src/muse/services/chapter_service.py:483-499] — 单事务理论上保证三表同生同灭；但若运维手工删了 story_state 行或数据库发生了部分失败（如跨库导出/导入异常），chapter_card 在但 story_state 缺失——finalize 幂等检查只看 chapter_card → 早返回 → story_state 永远缺失。低危（生产很难出现），但严格防御应三表都查或加 chapter_commit_log 兜底。**归后续优化**：finalize 幂等检查扩展为三表齐查（chapter_card + story_state + 至少一条 story_thread），任一缺失即走投影补齐。
+- **data_agent 的 `chapter_text` 来自 polisher 产物而非 chapter 表实际 text，若手工改 chapter.text 会脱节** [backend/src/muse/orchestration/steps.py:227-294] — 「run 表 succeeded + chapter 行 text=A（旧版）」→ 用户手工 SQL 改了 chapter.text=B → finalize → pipeline 复用 polisher output=A 喂 data_agent → 投影到三表的内容是 A 的提取，但 chapter.text 是 B——**数据不一致**。低危（正常 UI 不会让用户直接改 chapter.text），但若后续开放手工编辑入口会破坏一致性。**归后续优化**：data_agent 调用前校验 `chapter.text == polisher_output`（不一致时重新跑 drafter→polisher 或抛错提示），或开放手工编辑时同步清 run.steps.polisher.output 强制重跑。
+
 ## Deferred from: code review of 5-1-归档核心表落地chapter_card-story_thread-story_state (2026-08-06)
 
 > 三层对抗式审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。Auditor 确认 AC1-4 全兑现、5 受控决策逐项落实、零越界；2 条 patch 就地处理（E1 abandoned 过滤用例 + E3 conftest TRUNCATE 显式列名），以下 5 条 defer——**全部是 5.2 chapter-commit service 落地时才能真正兑现的写路径校验**，本 story 只建表+最小读法，无法提前负担。

@@ -31,17 +31,29 @@ from muse.repositories import chapter_repo
 
 logger = logging.getLogger("muse")
 
-# 段名常量（= run.steps 的键、= worker 推 progress 的段序）。V1 四段，V2 补 data-agent。
+# 段名常量（= run.steps 的键、= worker 推 progress 的段序）。
+# Story 4.2 V1 四段（context/drafter/reviewer/polisher）是「生成/修订」核心段；
+# Story 5.2 追加第五段 data_agent（写后投影，只在定稿时跑——受控决策 1）。
+# 两个常量分开：
+# - PIPELINE_CORE_STEPS：生成/修订路径（generate/revise）固定跑的 4 段，progress 按 4 推 100%。
+# - STEP_DATA_AGENT：定稿路径（finalize_and_project_chapter）追加的可选段。
+# worker._CHAPTER_TOTAL_STEPS 派生用 PIPELINE_CORE_STEPS（4）——generate/revise 完成时
+# 仍推 100%；finalize 路径同步等 data-agent 跑完不走 SSE，无 progress 推送。
 STEP_CONTEXT = "context"
 STEP_DRAFTER = "drafter"
 STEP_REVIEWER = "reviewer"
 STEP_POLISHER = "polisher"
-PIPELINE_STEPS: tuple[str, ...] = (
+STEP_DATA_AGENT = "data_agent"
+PIPELINE_CORE_STEPS: tuple[str, ...] = (
     STEP_CONTEXT,
     STEP_DRAFTER,
     STEP_REVIEWER,
     STEP_POLISHER,
 )
+# 兼容别名：worker._CHAPTER_STEP_ORDER/_CHAPTER_TOTAL_STEPS 派生仍用 PIPELINE_STEPS 名字
+# ——但语义已收窄为「生成/修订核心段」（4 段），data_agent 不在其内。故 generate/revise
+# 路径 progress 仍按 4 段推 100%，不被 data_agent 拖累。
+PIPELINE_STEPS: tuple[str, ...] = PIPELINE_CORE_STEPS
 
 
 def _succeeded_output(steps_state: dict | None, step_name: str) -> str | None:
@@ -162,8 +174,9 @@ async def run_chapter_pipeline(
     on_progress: Callable[[str], Awaitable[None]] | None = None,
     revision_input: dict | None = None,
     target_revision: int = 1,
+    run_data_agent_step: bool = False,
 ) -> str:
-    """驱动四段流水线生成一章正文，返回终稿。断点续跑：重入复用已完成段。
+    """驱动流水线生成一章正文，返回终稿。断点续跑：重入复用已完成段。
 
     on_progress(step_name)：每段开跑前回调（worker 用它推 SSE progress；装置脚本可传 None）。
     复用的段不回调（已完成、无需再推进度）。
@@ -177,6 +190,14 @@ async def run_chapter_pipeline(
     context-agent 拼进写作任务书（改进注入旧正文+点评+批注作保留基础、重生注入方向）。
     `target_revision` 为落库版本号（改进/重生 = 旧 revision+1；4.4 首次生成 = 1）。
     `revision_input=None` 时行为与 4.4 完全一致（向后兼容）。
+
+    **Story 5.2 第五段 data_agent**：`run_data_agent_step=True` 时在 polisher 段之后追加
+    data-agent 段（写后投影，从定稿正文提取结构化 JSON 落 run 表 steps）。**默认 False**
+    ——generate_chapter/revise_chapter 走 ARQ 的「生成/修订」路径**不跑** data-agent（受控
+    决策 1：未定稿不污染归档）；只有 chapter_service.finalize_and_project_chapter 在「用户
+    显式点定稿」时传 True 才跑。data-agent 段产物（dict）落 run.steps.data_agent 供断点续
+    跑复用；函数返回值仍是 str（章节正文），投影产物由 chapter_projection_service 从 run
+    表读出。
     """
     # get-or-create run 行（首次开跑建行；已存在复用）。竞态兜底：并发首建撞唯一约束
     # → rollback 重查（照 story_settle_agent._persist_card_with_race_guard 先例）。
@@ -206,9 +227,16 @@ async def run_chapter_pipeline(
                     chapter_number=chapter_number,
                 )
         # 已整体成功 → 直接返回终稿（polisher 段产物），不重跑。
+        # **Story 5.2 例外**：`run_data_agent_step=True` 时若 data_agent 段未 succeeded（如
+        # 第一遍 generate 只跑了四段、定稿时才来跑 data_agent），**不早返回**——继续走下方
+        # `_run_or_resume`，让 data_agent 段跑起来（其他四段因 cached 命中自动复用产物、不
+        # 重复付费 NFR5）。
         if run is not None and run.status == "succeeded":
+            data_agent_needed = run_data_agent_step and (
+                _succeeded_output(run.steps, STEP_DATA_AGENT) is None
+            )
             final = _succeeded_output(run.steps, STEP_POLISHER)
-            if final is not None:
+            if final is not None and not data_agent_needed:
                 # 早返回也确保 chapter 业务表有行（get-or-upsert 幂等）：run 表 succeeded 与 chapter
                 # 表可能脱节——chapter 表是 4.4 才建，4.2/4.3 联调/迁移期产生的 succeeded run 没有
                 # 对应 chapter 行；若此处只 return final 不补写，则 GET /chapters/{n} 恒 204、
@@ -293,6 +321,27 @@ async def run_chapter_pipeline(
         on_progress=on_progress,
     )
 
+    # Story 5.2 第五段 data_agent（写后投影，AR17）：只在「定稿」时跑（受控决策 1）。
+    # 输入：polisher 段产物 `final`（定稿正文）+ confirmed 设定；输出：结构化 JSON dict 落
+    # run.steps.data_agent 供断点续跑复用——重试不重复调 LLM（NFR5）。产物由
+    # chapter_projection_service 从 run 表读出、单事务投影回 story_state/chapter_card/
+    # story_thread（不在此 step 内投影——保持「step 只做 LLM 提取、service 只做 DB 投影」
+    # 分层）。
+    if run_data_agent_step:
+        await _run_or_resume(
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=chapter_number,
+            step_name=STEP_DATA_AGENT,
+            runner=lambda: steps.run_data_agent(
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=chapter_number,
+                chapter_text=final,
+            ),
+            on_progress=on_progress,
+        )
+
     # 四段全成 → run 标 succeeded + 终稿正文落业务表 chapter（Story 4.4）。
     # 同一 session 内两件事：mark run succeeded（编排状态源）+ upsert 正文（业务正文源，供阅读/
     # 恢复/前序注入）。upsert 幂等——ARQ 重试/重入复用 succeeded run 再次落库时覆盖同行、不产生
@@ -300,6 +349,11 @@ async def run_chapter_pipeline(
     # chapter_generation.py:1-9（编排状态表 vs 业务表）。
     # **Story 4.6**：target_revision 落业务表版本列——改进/重生 = 旧 revision+1、4.4 首次 = 1；
     # status 恒 "draft"（改进/重生后仍未定稿，定稿是 4.7 才置 finalized）。
+    # **Story 5.2**：`run_data_agent_step=True`（finalize 路径）时**跳过此 upsert**——
+    # chapter 行已在 chapter_service.finalize_chapter 中 upsert 为 status="finalized" + 保留
+    # 原 revision；此处若再 upsert 会用默认 status="draft" + revision=target_revision=1 覆盖，
+    # 把定稿状态改回 draft、版本号回退（Edge Case Hunter 发现的严重 bug）。finalize 路径只需
+    # 跑 data_agent 段 + 投影，不需再动 chapter 行。
     async with async_session_maker() as session:
         run = await run_repo.get_run(
             session,
@@ -309,13 +363,15 @@ async def run_chapter_pipeline(
         )
         if run is not None:
             await run_repo.mark_run_status(session, run=run, status="succeeded")
-        await chapter_repo.upsert_chapter(
-            session,
-            user_id=user_id,
-            project_id=project_id,
-            chapter_number=chapter_number,
-            text=final,
-            revision=target_revision,
-        )
+        if not run_data_agent_step:
+            # 非 finalize 路径（generate/revise）：正常 upsert chapter 行（status=draft）。
+            await chapter_repo.upsert_chapter(
+                session,
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=chapter_number,
+                text=final,
+                revision=target_revision,
+            )
         await session.commit()
     return final

@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-07-31 (Story 7.6 自由探索前端接线开始开发：ready-for-dev → in-progress)
+# last_updated: 2026-08-06 (Story 5.2 三层审查通过：8 patch 全落地 [E1+E2 致命 bug 修 + E6 端到端回归测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback+A8 标 failed / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / B4 三表全空] / 4 decision 全「保持现状+spec 注记」 / 3 defer 入台账 / 9 dismiss；629 passed 零回归，5-2 review → done)
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-06 (Story 4.7 三层审查通过：11 findings 全落地——决策① finalized 后 revise/regenerate 拒 400 chapter_already_finalized、② plan_next_stage _job_id={pid}:plan_next_stage ARQ 去重+race guard warning、③ stage-direction 末章守卫+bump seq、登出清多阶段态、归档 stageNumber 动态化、sessionStorage try/catch、demo 占位、去 min 钳制、storyErrorText+SSE message 优先；4 defer 入台账；后端 577 passed 零回归、ruff 全过，4-7 review → done，Epic 4 全 done)
+last_updated: 2026-08-06 (Story 5.2 三层审查通过：8 patch 全落地 [E1+E2 致命 bug 修 + E6 端到端回归测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback+A8 标 failed / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / B4 三表全空] / 4 decision 全「保持现状+spec 注记」 / 3 defer 入台账 / 9 dismiss；629 passed 零回归，5-2 review → done)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -101,9 +101,9 @@ development_status:
   # 4-2~4-7 全 done。4-1 转正后 epic-4 才 done。
 
   # ---------- Epic 5: 故事档案与归档（含 RAG）----------
-  epic-5: backlog
-  5-1-归档核心表落地chapter_card-story_thread-story_state: backlog
-  5-2-写后投影-data-agent-chapter-commit单事务: backlog
+  epic-5: in-progress
+  5-1-归档核心表落地chapter_card-story_thread-story_state: done
+  5-2-写后投影-data-agent-chapter-commit单事务: done
   5-3-归档页-故事档案统一入口设定圣经-分阶段: backlog
   5-4-归档页-首屏收起-展开交互-章节归档详情: backlog
   5-5-embedding表-EmbeddingProviderpgvector: backlog

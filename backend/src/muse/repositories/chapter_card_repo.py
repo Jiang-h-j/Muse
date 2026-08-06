@@ -101,3 +101,32 @@ async def upsert_chapter_card(
     await session.flush()
     await session.refresh(card)
     return card
+
+
+async def list_recent_chapter_cards(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    before_number: int,
+    limit: int = 1,
+) -> list[ChapterCard]:
+    """取本作品编号 < before_number 的最近若干章节卡（Story 5.2 A7 patch：data-agent
+    输入注入「最近前序 chapter_card 五要素」作上下文锚点）。
+
+    按 chapter_number 降序取前 limit 章（最近的在前）——V1 默认 limit=1（前一章）。
+    第一章无前序 → 空列表（data-agent 提示「这是第一章」）。租户守卫（user_id +
+    project_id 二义合一）。
+    """
+    stmt = (
+        select(ChapterCard)
+        .where(
+            ChapterCard.user_id == user_id,
+            ChapterCard.project_id == project_id,
+            ChapterCard.chapter_number < before_number,
+        )
+        .order_by(ChapterCard.chapter_number.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
