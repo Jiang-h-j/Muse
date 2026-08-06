@@ -1,5 +1,15 @@
 # Deferred Work
 
+## Deferred from: code review of 5-1-归档核心表落地chapter_card-story_thread-story_state (2026-08-06)
+
+> 三层对抗式审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。Auditor 确认 AC1-4 全兑现、5 受控决策逐项落实、零越界；2 条 patch 就地处理（E1 abandoned 过滤用例 + E3 conftest TRUNCATE 显式列名），以下 5 条 defer——**全部是 5.2 chapter-commit service 落地时才能真正兑现的写路径校验**，本 story 只建表+最小读法，无法提前负担。
+
+- **story_thread 测试未覆盖「同内容+同 last_touched 重跑去重」** [backend/tests/test_story_thread.py:test_multiple_open_threads_coexist] — 三条 thread content 互不相同，实际只是把「普通的可插入多行」测了一遍；spec Dev Notes 明写「无幂等键由 service 用 last_touched_chapter_number + 内容匹配自行去重」是受控决策，真正测 service 层重跑去重的用例归 5.2 落地时（届时应造「完全同字段镜像插入」断言 service 已识别重跑、不产生重复行）。
+- **`list_open_by_project` 无 `(project_id, status, last_touched_chapter_number DESC)` 复合索引** [backend/migrations/versions/f472170cd859_*.py:74-75 仅 `ix_story_thread_user_id` + `ix_story_thread_project_id` 单列索引] — 当前 repo 用三 cond + 排序走 `ix_story_thread_project_id` 取全量行再内存过滤 status + filesort；V1 内测单作品 thread < 100 无感，但 NFR4「几百章不穿帮」目标下千级 thread 是合理预估。**归 Story 5.2 落地前评估**：届时按真实 thread 量级决定是否加 `(project_id, status, last_touched_chapter_number DESC)` 复合索引（或在 5.6 RAG 召回优化时统一处理）。
+- **story_thread 无幂等键 + 依赖 LLM 内容稳定 + status 无 DB CHECK 枚举** [backend/src/muse/models/story_thread.py:33-79] — 模型 docstring 明写「无自然幂等键，5.2 由 service 用 (project_id, last_touched_chapter_number, 内容） 自行匹配去重」+「status 值域由 service 保证、不加 DB CHECK 枚举（与 chapter.status / story_bible.status / project.billing_path 全项目先例一致）」是受控风险非缺陷。**归 Story 5.2 service 写路径必须做**：status 白名单校验（open/resolved/abandoned 三值字面量）、投影重跑用 (last_touched_chapter_number + 内容哈希） 识别重跑避免重复行。
+- **`resolved_chapter_number >= introduced_chapter_number` 无大小关系约束** [backend/src/muse/models/story_thread.py:80-87] — 5.2 data-agent 若抽出「第 5 章埋的伏笔第 3 章收」（逻辑倒挂）DB 不会拦；下游统计「伏笔活了几章」会得到负数。**归 Story 5.2 service 写路径**：显式校验 `resolved_chapter_number >= introduced_chapter_number`，违反时拒绝写入并记 warning（V1 不加 DB CHECK 保持先例一致）。
+- **`last_touched_chapter_number` 单调不减无约束** [backend/src/muse/models/story_thread.py:89-98] — 模型注释自述「只能向前推不能倒退」但 DB 层无强制；5.2 重跑/ARQ 重试若把 last_touched 回写为更旧章号，RAG 召回排序优先级错降。**归 Story 5.2 service 写路径**：UPDATE 时校验 `new_last_touched >= old_last_touched`，违反时跳过更新（保留较新值）。
+
 ## Deferred from: code review of 4-7-定稿本章-阶段循环-阶段交界方向输入 (2026-08-05)
 
 > 三层对抗审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。AC1-9 全兑现零违例；3 decision-needed + 8 patch 见 story 文件 Review Findings，此处只登记确认 defer 的 4 条。

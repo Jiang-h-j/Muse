@@ -82,12 +82,17 @@ def _clean_tables() -> None:
     if not DB_READY:
         return
     with _sync_engine().begin() as conn:
-        # refresh_session/project/byok_key/usage_ledger 均有 user_id FK 指向 user，
-        # CASCADE 一并清；RESTART IDENTITY 复位序列。
+        # refresh_session/project/byok_key/usage_ledger/chapter_card/story_thread/story_state 均有
+        # user_id+project_id FK 指向 user/project（后三张是 Story 5.1 归档域新表），CASCADE 一并清。
+        # 显式列出三张归档表：防御性更稳、契约更显式（2026-08-06 5-1 code review E3 patch）——
+        # 即使后续 Epic 5 新增表 FK 指向这三张归档表（如 chapter_commit_log → chapter_card.id），
+        # TRUNCATE CASCADE 的隐式传播链路越积越长仍是显式声明更可控。
+        # RESTART IDENTITY 复位序列。
         conn.execute(
             text(
                 'TRUNCATE "user", invite_code, refresh_session, project, byok_key, '
-                "usage_ledger RESTART IDENTITY CASCADE"
+                "usage_ledger, chapter_card, story_thread, story_state "
+                "RESTART IDENTITY CASCADE"
             )
         )
     # 清限流计数键，避免登录失败计数跨用例污染（限流用例天然隔离，无需手动 reset）。
