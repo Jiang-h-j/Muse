@@ -157,7 +157,7 @@ async def test_upsert_idempotent_overwrites_same_row(db_engine: Engine) -> None:
 @requires_db
 @pytest.mark.asyncio
 async def test_list_recent_chapters_order_and_limit(db_engine: Engine) -> None:
-    """取 before_number 之前最近若干章：降序、limit=1 只取前一章。"""
+    """取最近若干**已定稿**章：降序、limit=1 取前一章（4.7 只读 finalized）。"""
     user_id, project_id = _seed_user_and_project(db_engine)
     async with async_session_maker() as session:
         for n in (1, 2, 3):
@@ -167,6 +167,7 @@ async def test_list_recent_chapters_order_and_limit(db_engine: Engine) -> None:
                 project_id=project_id,
                 chapter_number=n,
                 text=f"第 {n} 章正文。",
+                status="finalized",
             )
         await session.commit()
 
@@ -223,6 +224,7 @@ async def test_list_recent_chapters_tenant_guard(db_engine: Engine) -> None:
             project_id=project_id,
             chapter_number=1,
             text="正文。",
+            status="finalized",
         )
         await session.commit()
 
@@ -233,5 +235,70 @@ async def test_list_recent_chapters_tenant_guard(db_engine: Engine) -> None:
             project_id=project_id,
             before_number=2,
             limit=1,
+        )
+        assert recent == []
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_list_recent_chapters_only_finalized(db_engine: Engine) -> None:
+    """Story 4.7：只召回 status='finalized' 的前序章，draft 不注入（FR21 定稿成正式上下文）。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        # 第 1 章已定稿、第 2 章仍是草稿（未定稿）。
+        await repo.upsert_chapter(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=1,
+            text="第 1 章正文（已定稿）。",
+            status="finalized",
+        )
+        await repo.upsert_chapter(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=2,
+            text="第 2 章正文（草稿）。",
+            status="draft",
+        )
+        await session.commit()
+
+    # 写第 3 章时取最近 2 章：只应召回已定稿的第 1 章，草稿第 2 章被过滤。
+    async with async_session_maker() as session:
+        recent = await repo.list_recent_chapters(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            before_number=3,
+            limit=2,
+        )
+        assert [c.chapter_number for c in recent] == [1]
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_list_recent_chapters_all_draft_empty(db_engine: Engine) -> None:
+    """Story 4.7：前序章全是草稿（无定稿）→ 空列表（context-agent 仅用全量设定，不崩）。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        for n in (1, 2):
+            await repo.upsert_chapter(
+                session,
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=n,
+                text=f"第 {n} 章草稿。",
+                status="draft",
+            )
+        await session.commit()
+
+    async with async_session_maker() as session:
+        recent = await repo.list_recent_chapters(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            before_number=3,
+            limit=2,
         )
         assert recent == []

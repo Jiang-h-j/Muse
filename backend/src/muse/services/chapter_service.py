@@ -98,6 +98,35 @@ def _chapter_not_generated() -> ErrorEnvelope:
     )
 
 
+def _no_stage_plan() -> ErrorEnvelope:
+    """触发下一阶段规划前尚无任何阶段规划（→ 400，Story 4.7 AC5 前置）。
+
+    下一阶段规划的前提是已有至少一个阶段规划（首阶段 4.3 已生成、用户写完首阶段末章定稿才走到
+    阶段交界触发本端点）。无 stage_plan 行说明连首阶段都没规划——正常 UI 走不到。此校验拦住绕过
+    UI 对未规划首阶段的作品直接触发下一阶段规划。
+    """
+    return ErrorEnvelope(
+        code="no_stage_plan",
+        message="尚无阶段规划，无法规划下一阶段。",
+        http_status=400,
+    )
+
+
+def _chapter_already_finalized() -> ErrorEnvelope:
+    """定稿后禁止再改进/重生（→ 400，Story 4.7 review patch F1甲）。
+
+    4.5 前端按钮在 chapterFinalized=true 时已隐藏，但「API 直打 / 多 tab / 前端守卫失效」仍可触达
+    revise/regenerate。FR21 字面语义：定稿版本是后续章节创作的正式上下文；改进/重生会写新 text
+    且 status 退回 draft——若放行，pipeline 写完 draft 新版覆盖 finalized 行，list_recent_chapters
+    下一轮就漏取这章、写前上下文断链。后端硬约束：已 finalized → 400，前端按 code 出可读文案。
+    """
+    return ErrorEnvelope(
+        code="chapter_already_finalized",
+        message="本章已定稿，无法再改进或重新生成。",
+        http_status=400,
+    )
+
+
 async def trigger_stage_planning(
     session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> str:
@@ -144,15 +173,20 @@ async def trigger_stage_planning(
 async def get_first_stage_plan(
     session: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> StagePlan | None:
-    """读已落库的首个阶段规划（AC2 重进恢复）：租户守卫 → get_stage_plan（首阶段=1）。
+    """读已落库的**当前最新阶段**规划（AC2 重进恢复 + Story 4.7 阶段循环）：租户守卫 →
+    get_latest_stage。
 
-    用请求注入 session（只读，无 provider）。返 None = 尚未生成（幕后任务未完成 / 未触发）——
-    router 转 204，前端连 SSE 等就绪。越权/不存在 project → 404 二义合一（NFR3）。
+    **Story 4.7 起取最新阶段**（stage_number 最大的一行），而非固定首阶段——多阶段循环后前端
+    须渲染「当前所处阶段」的章骨架 + 阶段末章判断（用当前阶段章数）。首阶段场景（仅 stage_number=1）
+    返回结果与旧行为一致。用请求注入 session（只读，无 provider）。返 None = 尚未生成任何阶段
+    规划——router 转 204，前端连 SSE 等就绪。越权/不存在 project → 404 二义合一（NFR3）。
+
+    （函数名保留 first 是历史命名；语义自 4.7 起为「最新阶段」，router GET stage-plan 复用。）
     """
     project = await project_repo.get_owned_project(session, project_id, user_id)
     if project is None:
         raise _project_not_found()
-    return await stage_plan_repo.get_stage_plan(
+    return await stage_plan_repo.get_latest_stage(
         session, user_id=user_id, project_id=project_id
     )
 
@@ -290,6 +324,10 @@ async def trigger_chapter_revision(
     )
     if existing is None:
         raise _chapter_not_generated()
+    # Story 4.7 review patch F1甲：已 finalized 拒改进/重生（前端 4.5 已隐藏按钮，后端硬约束）。
+    # 若放行会让 pipeline 写 draft 覆盖 finalized，下一轮 list_recent_chapters 漏取这章，FR21 破功。
+    if existing.status == "finalized":
+        raise _chapter_already_finalized()
     target_revision = existing.revision + 1
     previous_text = existing.text
 
@@ -361,3 +399,135 @@ async def get_chapter_text(
         project_id=project_id,
         chapter_number=chapter_number,
     )
+
+
+async def finalize_chapter(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    chapter_number: int,
+) -> Chapter:
+    """定稿本章（Story 4.7 AC1/AC2/AC9）：把 chapter.status 置 finalized，返回更新后的 Chapter。
+
+    **同步 REST，不调 LLM、不入 ARQ**——定稿只改 status（当前版本成后续章节创作的正式上下文，
+    FR21）。事务边界在此层（commit）。流程：
+    1. 租户守卫（`get_owned_project` → None 抛 404 二义合一，NFR3）。
+    2. confirmed 前置（防御，复用 `_bible_not_confirmed`）：无 confirmed bible → 400。
+    3. 章号下界校验：`chapter_number < 1` → 400（防御 API 直打）。**不做 stage_plan 长度上界
+       校验**——跨多阶段后章号会超首阶段 chapters 长度（第二阶段章号继续递增），有正文即可定稿。
+    4. 本章须已有正文（`get_chapter` None → 400 `chapter_not_generated`，复用 4.6 工厂）。
+    5. **幂等**：已 `status=="finalized"` 直接返回现行（不重复写；前端定稿后按钮已隐藏，此为
+       防御 API 直打重复定稿）。
+    6. `upsert_chapter(status="finalized")`：保留 text/revision，只改 status → commit → 返回。
+
+    定稿后写前上下文会把本章计入前序（list_recent_chapters 只读 finalized，FR21 兑现）；写后
+    投影 + 章节卡片归 Epic 5 Story 5.2（本 story 只置 status，不建表不投影，Jianghj 裁决①）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _project_not_found()
+
+    # confirmed 前置校验（防御）：正常流程确认设定后才进创作，必有 confirmed 行。
+    bible = await story_bible_repo.get_confirmed_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        raise _bible_not_confirmed()
+
+    # 章号下界（防御 API 直打）。跨阶段章号连续递增，不做上界校验（避免误拦第二阶段章）。
+    if chapter_number < 1:
+        raise _chapter_out_of_range()
+
+    # 本章须已有正文（reading 态才有定稿按钮）。无 chapter 行 → 400（拦绕过 UI 对未生成章定稿）。
+    existing = await chapter_repo.get_chapter(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+    )
+    if existing is None:
+        raise _chapter_not_generated()
+
+    # 幂等：已定稿再调直接返回现行（不重复写）。
+    if existing.status == "finalized":
+        return existing
+
+    # 只改 status，保留 text/revision（upsert 同键覆盖，不新增行）。
+    chapter = await chapter_repo.upsert_chapter(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+        text=existing.text,
+        revision=existing.revision,
+        status="finalized",
+    )
+    await session.commit()
+    return chapter
+
+
+async def trigger_next_stage_planning(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    direction: str | None = None,
+) -> str:
+    """触发「幕后生成下一阶段规划」ARQ 后台任务（Story 4.7 AC5，FR22）。返回 taskId 供前端连 SSE。
+
+    **仿 trigger_stage_planning**（本文件上文），额外做一件事：
+    - 须已有至少一个 stage_plan（`get_latest_stage` None → 400 `_no_stage_plan`）：防未规划首
+      阶段就触发下一阶段。正常流程首阶段 4.3 已生成、且用户写完首阶段末章定稿才走到这里。
+
+    `direction` 是阶段交界处用户填的走向意愿（可空=直接继续，让 LLM 按设定+前文自然推进；也可
+    是收尾声明）。透传给 worker.plan_next_stage → stage_planner.plan_next_stage 注入规划 prompt。
+    触发范式同 trigger_stage_planning：register_task_owner 必先于 enqueue_job（陷阱②）。并发去重
+    沿用 deferred-work.md:391 defer（前端按钮点击即时忙碌防单页双击）。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _project_not_found()
+
+    # confirmed 前置校验（防御）：正常流程确认设定后才进创作，必有 confirmed 行。
+    bible = await story_bible_repo.get_confirmed_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    if bible is None:
+        raise _bible_not_confirmed()
+
+    # 须已有至少一个阶段规划（防未规划首阶段就触发下一阶段；正常流程首阶段 4.3 已生成）。
+    latest = await stage_plan_repo.get_latest_stage(
+        session, user_id=user_id, project_id=project_id
+    )
+    if latest is None:
+        raise _no_stage_plan()
+
+    settings = get_settings()
+    task_id = uuid.uuid4().hex
+    uid = str(user_id)
+    pid = str(project_id)
+
+    pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    try:
+        # 先登记属主（SSE 鉴权依据），再入队（陷阱②）。direction 以字符串位置参数传给 worker。
+        # **F4a _job_id 去重**：同 project 的 plan_next_stage 复用 job_id，双 tab/重复点击第二次
+        # 入队 ARQ 返 None 不重复跑——避免两 worker 都读 latest、都算 next=prev+1、都 INSERT
+        # 撞唯一键、last-write-wins 静默覆盖（4.7 review patch F4a）。每 project 一次只允许一个
+        # in-flight 下一阶段规划，符合语义（末章定稿 → 交界 → 三按钮之一应只跑一次）；下一阶段再
+        # 触发时本 job 已结束可重发。注意：虽 _job_id 复用，ARQ 每次返是否真入队；为简化 service
+        # 仍生成新 task_id（pub/sub 频道键+SSE 属主键，不可枚举 uuid4），重复触发时新 task_id 的
+        # SSE 频道不会有事件，前端走「无终态兜底」错误态——可接受（重复触发的 client 自兜底）。
+        # 真正去重靠 ARQ _job_id。
+        await sse.register_task_owner(pool, task_id, uid)
+        await pool.enqueue_job(
+            "plan_next_stage",
+            task_id,
+            uid,
+            pid,
+            direction,
+            _job_id=f"{pid}:plan_next_stage",
+        )
+    finally:
+        await pool.aclose()
+    return task_id

@@ -183,6 +183,28 @@ let stagePlanningDraft = {
   chapters: "",
 };
 let currentStagePlan = null;
+// Story 4.7：当前所处阶段的「首章全局章号偏移」（0-based）。首阶段=0；进入第 k 阶段时 = 之前
+// 各阶段章数之和。章渲染用「全局 chapterCreationIndex - stageChapterOffset」取当前阶段章列表
+// 的相对索引（currentStagePlan.chapters 每阶段各自从 0 起）。GET stage-plan 取最新阶段
+// （后端已改），chapters 即当前阶段章骨架；阶段末章判断用 相对序号+1 == chapters.length。
+// 持久化按 projectId 存 sessionStorage，刷新/重进恢复（否则跨阶段刷新会误用 offset=0 越界）。
+let stageChapterOffset = 0;
+const stageOffsetKey = "muse-stage-offset";
+function readStageOffset(projectId) {
+  const stored = readStoredJson(stageOffsetKey);
+  if (stored && stored.projectId === projectId && Number.isInteger(stored.offset))
+    return stored.offset;
+  return 0;
+}
+function persistStageOffset(projectId, offset) {
+  window.sessionStorage.setItem(
+    stageOffsetKey,
+    JSON.stringify({ projectId, offset }),
+  );
+}
+function clearStageOffset() {
+  window.sessionStorage.removeItem(stageOffsetKey);
+}
 // Story 4.3：章节页真实 projectId（替换硬编码 demo）+ 阶段规划幕后加载态。
 let chapterProjectId = "";
 let stagePlanLoadState = "idle"; // idle | loading | ready | error | empty(未生成、待用户明示触发)
@@ -278,6 +300,26 @@ let byokReplaceMode = false; // 已绑定态点「更换 Key」后进入重填�
 let byokSelectedProvider = "deepseek"; // byok tab 当前选中的 provider（写入用）
 let byokSaving = false; // 保存 PUT 在途标志：防 input 监听在途重新 enable 按钮致并发双 PUT
 let stageDirectionText = "";
+// Story 4.7：下一阶段规划触发态（阶段交界页「带方向写下去/直接继续/收尾」提交后异步生成）。
+// idle=卡片输入态；loading=规划中 spinner；error=失败退回卡片+错误文案。复用 stagePlanSeq/
+// stagePlanAbortController 做代次+abort 守卫（同一章节创作域）。task 存 sessionStorage 供刷新接回。
+let nextStageLoadState = "idle"; // idle | loading | error
+let nextStageErrorText = "";
+const nextStageTaskKey = "muse-next-stage-task";
+function readNextStageTask(projectId) {
+  const stored = readStoredJson(nextStageTaskKey);
+  if (stored && stored.projectId === projectId && stored.taskId) return stored.taskId;
+  return null;
+}
+function persistNextStageTask(projectId, taskId) {
+  window.sessionStorage.setItem(
+    nextStageTaskKey,
+    JSON.stringify({ projectId, taskId }),
+  );
+}
+function clearNextStageTask() {
+  window.sessionStorage.removeItem(nextStageTaskKey);
+}
 // 通读视图分页：章内按页翻阅（每页若干段），翻过本章末页进入下一章。
 let readthroughChapterIndex = 0;
 let readthroughPageIndex = 0;
@@ -748,6 +790,15 @@ function storyErrorText(err) {
       return "已用完当前免费额度。可到设置页绑定自己的 API Key 后继续。";
     case "project_not_found":
       return "找不到这部作品，请回到作品库重试。";
+    // Story 4.7 review patch F11：定稿 / 下一阶段规划相关错误码（后端 ErrorEnvelope 透传 code）。
+    case "no_stage_plan":
+      return "还没有阶段规划，无法进入下一阶段。请先回到章节继续创作。";
+    case "chapter_not_generated":
+      return "本章还没有正文，请先生成再定稿。";
+    case "chapter_out_of_range":
+      return "章号超出范围，请回到章节页重试。";
+    case "chapter_already_finalized":
+      return "本章已定稿，无法再改进或重新生成。";
     default:
       return "操作未能完成，请检查网络后稍后重试。";
   }
@@ -3379,7 +3430,7 @@ function generatedChapterMarkup(chapter, nextChapter) {
   const pageNumber = String(chapterReaderPage + 1).padStart(2, "0");
   const pageTotal = String(pages.length).padStart(2, "0");
   return `<article class="chapter-reader" aria-labelledby="chapter-reader-title">
-    <div class="chapter-reader-meta"><span>第一阶段 / 第 ${chapterNumber} 章</span><span>${chapterFinalized ? "已定稿" : `草稿 V${chapterRevision}`}</span></div>
+    <div class="chapter-reader-meta"><span>第 ${(currentStagePlan && currentStagePlan.stageNumber) || 1} 阶段 / 第 ${chapterNumber} 章</span><span>${chapterFinalized ? "已定稿" : `草稿 V${chapterRevision}`}</span></div>
     <div class="chapter-title-band">
       <h1 id="chapter-reader-title">${escapeHtml(chapter.title)}</h1>
       ${nextChapter ? `<aside class="chapter-next-preview" aria-label="下一章预告"><span>下一章 / ${String(chapterCreationIndex + 2).padStart(2, "0")}</span><strong>${escapeHtml(nextChapter.title)}</strong><p>${escapeHtml(nextChapter.brief)}</p></aside>` : ""}
@@ -3447,7 +3498,10 @@ function renderChapterCreation() {
 
   // 章数由 LLM 按剧情定（AC2 不写死），路由章号只钳下界（app.js render 分支 Math.max(0,…)）；
   // 越界章号（如深链/下一章跳到超出真实章数）取不到骨架，退化为错误态而非 chapter.title 崩白页。
-  const chapter = stagePlan.chapters[chapterCreationIndex];
+  // Story 4.7：chapterCreationIndex 是**全局** 0-based 章号；当前阶段章列表各自从 0 起，故用
+  // 「全局 - stageChapterOffset」取相对索引（首阶段 offset=0 时与旧行为一致）。
+  const stageChapterIndex = chapterCreationIndex - stageChapterOffset;
+  const chapter = stagePlan.chapters[stageChapterIndex];
   if (!chapter) {
     document.title = `第 ${chapterCreationIndex + 1} 章 · Muse`;
     app.innerHTML = `<div class="chapter-page">
@@ -3486,7 +3540,7 @@ function renderChapterCreation() {
   } else {
     mainContent = generatedChapterMarkup(
       chapter,
-      stagePlan.chapters[chapterCreationIndex + 1],
+      stagePlan.chapters[stageChapterIndex + 1],
     );
   }
   app.innerHTML = `<div class="chapter-page">
@@ -3669,14 +3723,48 @@ function bindChapterCreationInteractions() {
   });
   document
     .querySelector("[data-finalize-chapter]")
-    ?.addEventListener("click", () => {
-      chapterFinalized = true;
-      chapterAnnotationTarget = null;
-      chapterAnnotationDraft = "";
-      chapterAnnotationFocus = null;
-      chapterAgentResult = `第 ${String(chapterCreationIndex + 1).padStart(2, "0")} 章已采用第 ${chapterRevision} 版草稿定稿，并将作为后续章节的正式上下文。`;
-      archiveDialogOpen = false;
-      location.hash = "#/projects/demo/archive";
+    ?.addEventListener("click", async () => {
+      if (chapterAgentBusy) return; // 忙碌中防重复提交
+      if (!chapterProjectId) return;
+      const chapterNumber = chapterCreationIndex + 1;
+      // 即时置忙碌防重复点（定稿走同步 REST，无 SSE）。
+      chapterAgentBusy = true;
+      chapterAgentResult = "正在定稿这一章……";
+      renderChapterCreation();
+      try {
+        const result = await chapterApi.finalizeChapter(
+          chapterProjectId,
+          chapterNumber,
+        );
+        chapterFinalized = result && result.status === "finalized";
+        chapterRevision = (result && result.revision) || chapterRevision;
+        chapterAnnotationTarget = null;
+        chapterAnnotationDraft = "";
+        chapterAnnotationFocus = null;
+        chapterAgentBusy = false;
+        chapterAgentResult = `第 ${String(chapterNumber).padStart(2, "0")} 章已采用第 ${chapterRevision} 版草稿定稿，并将作为后续章节的正式上下文。`;
+        archiveDialogOpen = false;
+        // 阶段交界分流（AC6，决策 3）：本阶段末章定稿 → 进阶段交界方向输入页；否则走归档流。
+        const stagePlan = chapterStagePlan();
+        const stageChapterCount =
+          (stagePlan && stagePlan.chapters && stagePlan.chapters.length) || 0;
+        const isLastOfStage =
+          stageChapterCount > 0 &&
+          chapterNumber - stageChapterOffset === stageChapterCount;
+        if (isLastOfStage) {
+          stageDirectionText = "";
+          location.hash = `#/projects/${chapterProjectId}/stage-direction`;
+        } else {
+          location.hash = `#/projects/${chapterProjectId}/archive`;
+        }
+      } catch (err) {
+        // 定稿失败：保留 reading 态可重试 + 可读错误提示（AC9）。
+        chapterFinalized = false;
+        chapterAgentBusy = false;
+        chapterAgentResult = "";
+        renderChapterCreation();
+        showChapterInlineError(storyErrorText(err));
+      }
     });
 }
 
@@ -3721,16 +3809,20 @@ function archiveStagesForPreview(stagePlan) {
   // Story 4.3（review）：chapterStagePlan() 删 mock 后可能返 null（归档路由不加载 currentStagePlan，
   // 刷新直达/登出后进归档时为 null）。归档页本体属 4.5-4.7（第二阶段仍是占位 mock），本 story 只做
   // null 兜底防白屏，不扩范围接真实归档数据。
+  // F6 review patch：GET stage-plan 自 4.7 起返回 latest（当前所处阶段）——若用户在第 k 阶段末章
+  // 定稿进归档，stagePlan.chapters 是「第 k 阶段」骨架但仍按硬编码「第一阶段」展示。改为按
+  // stagePlan.stageNumber 渲染真实阶段号；stageNumber 缺省（旧 mock / 未加载）回落「第一阶段」。
   const firstStageChapters = (stagePlan && stagePlan.chapters) || [];
+  const currentStageNumber = (stagePlan && stagePlan.stageNumber) || 1;
   return [
     {
-      title: "第一阶段",
+      title: `第 ${currentStageNumber} 阶段`,
       chapters: firstStageChapters,
       completedCount: Math.min(
-        chapterCreationIndex + 1,
+        chapterCreationIndex + 1 - stageChapterOffset,
         firstStageChapters.length,
       ),
-      numberOffset: 0,
+      numberOffset: stageChapterOffset,
       preview: false,
     },
     {
@@ -3959,7 +4051,10 @@ function bindChapterArchiveInteractions() {
       chapterAnnotationDraft = "";
       chapterAnnotationFocus = null;
       chapterFinalized = false;
-      location.hash = `#/projects/demo/chapters/${chapterCreationIndex + 1}`;
+      // Story 4.7：真实 projectId 替换 demo（归档页本体仍 mock，归 Epic 5 Story 5.3；此处只
+      // 修死链，跳转 projectId 用真实值）。
+      const nextProjectId = chapterProjectId || explorationProjectId || "demo";
+      location.hash = `#/projects/${nextProjectId}/chapters/${chapterCreationIndex + 1}`;
     });
   document
     .querySelector("[data-preview-next-stage]")
@@ -4170,6 +4265,12 @@ function resetExplorationStateForNewProject(mode) {
   chapterAnnotationFocus = null;
   chapterFinalized = false;
   chapterCreationIndex = 0;
+  // Story 4.7：重置阶段偏移 + 下一阶段规划态（登出/重置，防下一作品/账号残留）。
+  stageChapterOffset = 0;
+  clearStageOffset();
+  nextStageLoadState = "idle";
+  nextStageErrorText = "";
+  clearNextStageTask();
   archiveDialogOpen = false;
   archiveSelectedChapter = 0;
   archiveSelectedStage = 0;
@@ -4260,6 +4361,14 @@ function bindProjectInteractions() {
       stagePlanErrorText = "";
       stagePlanSeq += 1;
       clearStagePlanTask();
+      // Story 4.7 review patch F5：同步清多阶段映射 + 下一阶段规划态——A 在第 k 阶段章号 N 登出 →
+      // B 同 tab 登录另一 project，sessionStorage 里 stage-offset / next-stage-task 仍是 A 的，
+      // 进 chapterMatch 用错 offset 渲染章骨架错位。与 resetExplorationStateForNewProject 同步清。
+      stageChapterOffset = 0;
+      clearStageOffset();
+      nextStageLoadState = "idle";
+      nextStageErrorText = "";
+      clearNextStageTask();
       location.hash = "#/login";
     })();
   });
@@ -4547,43 +4656,179 @@ function readthroughPages(chapter) {
 // ============================================================
 function renderStageDirection() {
   document.title = `下一段方向 · ${explorationTitle} · Muse`;
+  const projectId = chapterProjectId || explorationProjectId || "demo";
+  // 「返回创作」回到刚定稿的上一阶段末章（reading 只读）；至少回第 1 章兜底。
+  const backHref = `#/projects/${projectId}/chapters/${Math.max(1, chapterCreationIndex + 1)}`;
+  // 规划中 / 失败态（AC5/AC9）：提交方向后异步生成下一阶段，就绪进下一阶段首章。
+  if (nextStageLoadState === "loading") {
+    app.innerHTML = `<div class="stage-direction-page">
+      <header class="explore-header"><a class="explore-back" href="${backHref}">← 返回创作</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>阶段交界</span></div><div class="save-state"><i></i> 正在规划下一阶段</div></header>
+      <main class="stage-direction-main">
+        <section class="stage-direction-card" aria-live="polite">
+          <div class="stage-direction-overline">Between stages / 阶段交界</div>
+          <h1>正在规划下一阶段……</h1>
+          <p class="stage-direction-lead">我在依据你的方向和前文，规划接下来这一阶段的章节安排，稍等片刻就能继续写。</p>
+        </section>
+      </main>
+    </div>`;
+    return;
+  }
+  const errorBlock =
+    nextStageLoadState === "error"
+      ? `<p class="stage-direction-error" role="alert">${escapeHtml(nextStageErrorText || "规划失败，请稍后重试。")}</p>`
+      : "";
+  // F9：demo 演示项目 stage-direction 只能看到占位（真实触发后端 plan_next_stage 需要真实 projectId）。
+  // 三按钮 demo 下整体隐藏，文案说明「演示模式到此为止」；「返回创作」仍可用回 chapter 页。
+  const isDemoProject = projectId === "demo";
+  const actionBlock = isDemoProject
+    ? `<p class="stage-direction-error" role="note">演示模式下不生成真实下一阶段规划，请返回创作或登录起始真实作品。</p>`
+    : `<textarea class="input stage-direction-input" id="stage-direction" placeholder="比如：让主角开始怀疑同伴 / 节奏慢下来铺一段感情 / 我想开始收尾了……">${escapeHtml(stageDirectionText)}</textarea>
+        <div class="stage-direction-actions">
+          <button class="secondary-button" type="button" data-stage-continue>直接继续</button>
+          <button class="primary-button" type="button" data-stage-submit>带着这个方向写下去 <span>→</span></button>
+        </div>
+        <button class="stage-direction-finale" type="button" data-stage-finale>我想开始收尾了 →</button>`;
   app.innerHTML = `<div class="stage-direction-page">
-    <header class="explore-header"><a class="explore-back" href="#/projects/demo/chapters/1">← 返回创作</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>阶段交界</span></div><div class="save-state"><i></i> 上一阶段已写完</div></header>
+    <header class="explore-header"><a class="explore-back" href="${backHref}">← 返回创作</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>阶段交界</span></div><div class="save-state"><i></i> 上一阶段已写完</div></header>
     <main class="stage-direction-main">
       <section class="stage-direction-card">
         <div class="stage-direction-overline">Between stages / 阶段交界</div>
         <h1>这一段，想往哪走？</h1>
         <p class="stage-direction-lead">上一阶段写完了。如果心里已经有方向，写一句给我；没有也没关系，直接继续，我会顺着故事往下写。</p>
-        <textarea class="input stage-direction-input" id="stage-direction" placeholder="比如：让主角开始怀疑同伴 / 节奏慢下来铺一段感情 / 我想开始收尾了……">${escapeHtml(stageDirectionText)}</textarea>
-        <div class="stage-direction-actions">
-          <button class="secondary-button" type="button" data-stage-continue>直接继续</button>
-          <button class="primary-button" type="button" data-stage-submit>带着这个方向写下去 <span>→</span></button>
-        </div>
-        <button class="stage-direction-finale" type="button" data-stage-finale>我想开始收尾了 →</button>
+        ${errorBlock}
+        ${actionBlock}
       </section>
     </main>
   </div>`;
-  bindStageDirectionInteractions();
+  bindStageDirectionInteractions(projectId);
 }
 
-function bindStageDirectionInteractions() {
+function bindStageDirectionInteractions(projectId) {
   const input = document.querySelector("#stage-direction");
   input?.addEventListener("input", () => {
     stageDirectionText = input.value;
   });
-  const goNext = () => {
-    location.hash = "#/projects/demo/chapters/1";
-  };
-  document
-    .querySelector("[data-stage-continue]")
-    ?.addEventListener("click", goNext);
   document
     .querySelector("[data-stage-submit]")
-    ?.addEventListener("click", goNext);
+    ?.addEventListener("click", () => {
+      startNextStageFlow(projectId, stageDirectionText);
+    });
+  document
+    .querySelector("[data-stage-continue]")
+    ?.addEventListener("click", () => {
+      // 「直接继续」= 空方向触发下一阶段规划（AC7，LLM 按设定+前文自然推进，非「什么都不做」）。
+      startNextStageFlow(projectId, "");
+    });
   document.querySelector("[data-stage-finale]")?.addEventListener("click", () => {
-    stageDirectionText = "（用户已声明：进入收尾阶段）";
-    goNext();
+    // 「我想开始收尾了」= 收尾声明作方向，LLM 规划收束主线的收尾阶段（AC5）。
+    startNextStageFlow(
+      projectId,
+      "（读者已声明：进入收尾阶段，请规划一个能收束主线、走向结局的阶段）",
+    );
   });
+}
+
+// Story 4.7：触发并消费「下一阶段规划」——POST plan-next-stage 拿 taskId → 存 sessionStorage
+// （刷新接回）→ 进 loading 态 → 消费 SSE result/error（仿 startChapterGenFlow + consumeStagePlanTask）。
+// 就绪后进下一阶段首章：stageChapterOffset 推到上一阶段末章之后、chapterCreationIndex 置新阶段首章
+// 全局号、跳 chapters/N。失败退回卡片保留方向文本可重试。
+async function startNextStageFlow(projectId, direction) {
+  if (nextStageLoadState === "loading") return; // 防重复提交
+  if (!projectId || projectId === "demo") return; // 无真实 projectId 不触发
+  stagePlanSeq += 1;
+  const seq = stagePlanSeq;
+  nextStageLoadState = "loading";
+  nextStageErrorText = "";
+  renderStageDirection();
+  try {
+    const { taskId } = await chapterApi.planNextStage(projectId, { direction });
+    // F7：sessionStorage 写失败（隐私模式/quota）容忍——taskId 已在内存中走 SSE 消费；
+    // sessionStorage 只是刷新接回的兜底，丢它不应让用户以为「后端失败请重试」（会触发重复付费请求）。
+    try {
+      persistNextStageTask(projectId, taskId);
+    } catch (storageErr) {
+      // eslint-disable-next-line no-console
+      console.warn("[next-stage] sessionStorage 写失败，刷新接回失效", storageErr);
+    }
+    await consumeNextStageTask(projectId, seq, taskId);
+  } catch (err) {
+    if (seq !== stagePlanSeq) return; // 被后续提交取代
+    clearNextStageTask();
+    nextStageLoadState = "error";
+    nextStageErrorText = storyErrorText(err);
+    renderStageDirection();
+  }
+}
+
+async function consumeNextStageTask(projectId, seq, taskId) {
+  const stale = () => seq !== stagePlanSeq;
+  let gotTerminal = false;
+  try {
+    await explorationApi.taskEvents(taskId, {
+      onEvent: (type, data) => {
+        if (stale()) return;
+        if (type === "result" && data && data.stagePlan) {
+          gotTerminal = true;
+          clearNextStageTask();
+          // 上一阶段末章全局号 = chapterCreationIndex（定稿末章时的全局 0-based）；下一阶段首章
+          // 全局 index = 上一阶段末章 index + 1 = chapterCreationIndex + 1（末章 index 即
+          // stageChapterOffset + 当前阶段章数 - 1）。offset 推到新阶段首章。
+          const newOffset = chapterCreationIndex + 1;
+          stageChapterOffset = newOffset;
+          persistStageOffset(projectId, newOffset);
+          currentStagePlan = {
+            stageNumber: data.stagePlan.stageNumber || 1,
+            goal: data.stagePlan.goal || "",
+            chapters: Array.isArray(data.stagePlan.chapters)
+              ? data.stagePlan.chapters
+              : [],
+          };
+          stagePlanLoadState = "ready";
+          // 进下一阶段首章输入态（重置章内态，仿 data-start-next-chapter）。
+          chapterCreationIndex = newOffset;
+          chapterCreationState = "input";
+          chapterIdea = "";
+          chapterReaderPage = 0;
+          chapterRevision = 1;
+          chapterFeedback = "";
+          chapterAgentBusy = false;
+          chapterAgentResult = "";
+          chapterLastRevisionAction = "";
+          chapterAnnotations = [];
+          chapterAnnotationTarget = null;
+          chapterAnnotationDraft = "";
+          chapterAnnotationFocus = null;
+          chapterFinalized = false;
+          nextStageLoadState = "idle";
+          stageDirectionText = "";
+          location.hash = `#/projects/${projectId}/chapters/${chapterCreationIndex + 1}`;
+        } else if (type === "error") {
+          gotTerminal = true;
+          clearNextStageTask();
+          nextStageLoadState = "error";
+          // F11：优先用后端透传的 message（ErrorEnvelope.message 是面向用户的中文），
+          // code 走 storyErrorText 兜底。后端「尚无阶段规划，无法规划下一阶段。」等精心文案才不丢。
+          nextStageErrorText =
+            (data && data.message) || storyErrorText({ code: data && data.code });
+          renderStageDirection();
+        }
+        // progress：loading 态已在显示，不额外更新。
+      },
+    });
+    // 无终态兜底（防永久 spinner）。
+    if (!stale() && !gotTerminal && nextStageLoadState === "loading") {
+      clearNextStageTask();
+      nextStageLoadState = "error";
+      nextStageErrorText = storyErrorText({ code: "generate_failed" });
+      renderStageDirection();
+    }
+  } catch (err) {
+    if (stale()) return;
+    clearNextStageTask();
+    nextStageLoadState = "error";
+    nextStageErrorText = storyErrorText(err);
+    renderStageDirection();
+  }
 }
 
 // 模型接入页错误文案（仿 projectErrorText，按 err.code 出可读中文 + 中性兜底）。
@@ -5008,6 +5253,9 @@ function render() {
     /^#\/projects\/([^/]+)\/chapters\/(\d+)$/,
   );
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
+  const stageDirectionMatch = hashPath().match(
+    /^#\/projects\/([^/]+)\/stage-direction$/,
+  );
   // review R2 P2：离开探索页时清理在途 SSE + 门禁（teardownExplorationInflight 原为死代码，此处挂载）。
   // 防 settle/interpret 在途时切走 → 流不 abort 连接悬挂 + 陈旧回调污染。teardown 不动 pending
   // 设定卡（会话内恢复态，导航离开应保留）。进 explore 分支由 loadGuidedExploration 自管清理。
@@ -5033,9 +5281,60 @@ function render() {
     byokLoadState = "loading";
     renderByok();
   }
-  else if (hashPath() === "#/projects/demo/stage-direction")
-    renderStageDirection();
-  else if (exploreMatch) {
+  else if (stageDirectionMatch) {
+    // Story 4.7：阶段交界方向输入页（参数化真实 projectId）。设 chapterProjectId 供
+    // renderStageDirection / startNextStageFlow 消费；恢复 stageChapterOffset（跨阶段刷新）。
+    chapterProjectId = stageDirectionMatch[1];
+    stageChapterOffset = readStageOffset(chapterProjectId);
+    // F8 review patch：进 stageDirectionMatch 路由**始终** bump stagePlanSeq——不再只在
+    // pendingNextStage 分支 bump。否则 chapter 页在途 consumeStagePlanTask 占着旧 seq，
+    // 本分支走 idle 渲染时陈旧回调仍可能写 currentStagePlan / stageChapterOffset 脏数据。
+    stagePlanSeq += 1;
+    const enterSeq = stagePlanSeq;
+    // F2 review patch：进入时校验「chapterNumber（chapterCreationIndex+1）== 当前阶段末章全局号」，
+    // 不在末章则不允许发新阶段规划——防直接 URL 跳 stage-direction / 中途手改 URL 绕过末章守卫。
+    // 判据：已知 stageChapterOffset（首章全局 index，0-based）+ currentStagePlan.chapters.length
+    // （当前阶段章数）。末章 1-based 全局号 = offset + chapters.length。当前章号（chapterCreationIndex+1）
+    // 必须等于这个值；否则以「当前阶段已写出章数」为兜底重定向回本章（继续写作），而不是允许跳交界。
+    (async () => {
+      // 异步拉一次 stage-plan 确保 currentStagePlan 存在（直接 URL 进 stage-direction 时可能 null）。
+      if (!currentStagePlan) {
+        try {
+          const existing = await chapterApi.getStagePlan(chapterProjectId);
+          if (enterSeq !== stagePlanSeq) return;
+          if (existing && Array.isArray(existing.chapters) && existing.chapters.length) {
+            currentStagePlan = existing;
+            stagePlanLoadState = "ready";
+          }
+        } catch (err) {
+          // 拉取失败：当下面校验 currentStagePlan null 兜底重定向 chapter 1。
+        }
+      }
+      if (enterSeq !== stagePlanSeq) return;
+      const chaptersCount =
+        (currentStagePlan && currentStagePlan.chapters && currentStagePlan.chapters.length) || 0;
+      const lastChapterGlobalNumber = chaptersCount > 0 ? stageChapterOffset + chaptersCount : 0;
+      const currentChapterNumber = chapterCreationIndex + 1;
+      if (!chaptersCount || currentChapterNumber !== lastChapterGlobalNumber) {
+        // 非末章 / 无当前阶段规划 / 直接 URL 进入：退回当前阶段首章或全局第 1 章兜底。
+        // 当前阶段已写过章则回落到当前阶段末章（继续写作），否则回全局第 1 章。
+        const fallbackNumber = chaptersCount > 0 ? lastChapterGlobalNumber : 1;
+        location.hash = `#/projects/${chapterProjectId}/chapters/${Math.max(1, fallbackNumber)}`;
+        return;
+      }
+      // 校验通过 = 当前章就是当前阶段末章。继续走 pendingNextStage 接回 或 idle 渲染。
+      const pendingNextStage = readNextStageTask(chapterProjectId);
+      if (pendingNextStage) {
+        nextStageLoadState = "loading";
+        nextStageErrorText = "";
+        renderStageDirection();
+        consumeNextStageTask(chapterProjectId, enterSeq, pendingNextStage);
+      } else {
+        nextStageLoadState = "idle";
+        renderStageDirection();
+      }
+    })();
+  } else if (exploreMatch) {
     // Story 7.5：进引导探索页须建会话 + 回填已答（异步）。记录路由 projectId 供
     // 落库/settle 复用（替换 deferred-work.md:42「explore 目标页未消费路由 id」）。
     // 自由模式（7.6 未接）仍走 mock，不触发引导后端加载。
@@ -5086,6 +5385,17 @@ function render() {
   } else if (chapterMatch) {
     const routeProjectId = chapterMatch[1];
     chapterCreationIndex = Math.max(0, Number(chapterMatch[2]) - 1);
+    // Story 4.7：恢复当前阶段首章偏移（跨阶段刷新/深链）。**F10 review patch**：不做 Math.min
+    // 静默钳制——clamp 只改 module 变量不写回 sessionStorage，刷新前后行为不一致非常难调；改为
+    // 直接读 sessionStorage。若 offset > chapterCreationIndex（用户手动 URL 回跳更早章 / 脏数据），
+    // stageChapterIndex 为负数 → stagePlan.chapters[负数] 是 undefined → renderChapterCreation
+    // 走「chapter 不存在」fallback 错误态，让用户看到「章节骨架缺失」而非内容错乱。当前阶段
+    // 正常线性向前不触发；要支持「回看上一阶段旧章」属 Epic 5 通读视图范畴，不在本章页路由做。
+    stageChapterOffset = readStageOffset(routeProjectId);
+    // F2 review patch：进 chapterMatch 也 bump stagePlanSeq，让在途 consumeStagePlanTask /
+    // consumeNextStageTask 走 stale 早退、不写脏 currentStagePlan / stageChapterOffset。
+    // 与 stagePlanAbortController.abort() 一起在下方 loadChapterStagePlan 头部统一；这里先 bump seq。
+    stagePlanSeq += 1;
     // Story 4.3：消费路由真实 projectId（AC5）。同一作品且阶段规划已就绪 → 直接渲染
     // （避免切页/内部重渲染时重复拉取）；否则走加载入口（review 改时机后：只 GET 落库恢复 / 凭本地
     // taskId 接回在途任务，绝不主动叫新生成——触发只发生在确认设定成功那一次或用户明示点生成）。

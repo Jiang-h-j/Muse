@@ -7,8 +7,9 @@
 方法：
 - get_chapter：按幂等键 (user_id, project_id, chapter_number) 取章节正文（重进恢复读）。
 - upsert_chapter：get-or-create 落库终稿正文（生成完成后写；重生成覆盖同行、升版本）。
-- list_recent_chapters：取本作品编号 < before_number 的最近若干章（context-agent 写前上下文
-  注入前序章节，AC4）。按 chapter_number 降序、limit N。
+- list_recent_chapters：取本作品编号 < before_number 的最近若干**已定稿**章（context-agent
+  写前上下文注入前序章节，AC4）。按 chapter_number 降序、limit N，只取 status='finalized'
+  （Story 4.7 FR21）。
 """
 
 import uuid
@@ -94,11 +95,12 @@ async def list_recent_chapters(
     before_number: int,
     limit: int = 1,
 ) -> list[Chapter]:
-    """取本作品编号 < before_number 的最近若干章（写前上下文注入前序章节，AC4）。
+    """取本作品编号 < before_number 的最近若干已定稿章（写前上下文注入前序章节，AC4）。
 
-    按 chapter_number 降序取前 limit 章（最近的在前）——V1 默认 limit=1（前一章）。不按 status
-    过滤：4.7 定稿未实现前前序章节均为 draft，注入 draft 章节是保证多章连续性的唯一做法
-    （Jianghj 2026-08-05 决议）。租户守卫（user_id + project_id）。第一章无前序时返空列表。
+    按 chapter_number 降序取前 limit 章（最近的在前）——V1 默认 limit=1（前一章）。**只注入
+    status='finalized' 的章节**（Story 4.7 FR21：定稿后当前版本才成为后续章节创作的正式上下文；
+    未定稿 draft 不注入，Jianghj 2026-08-05 裁决②）。租户守卫（user_id + project_id）。第一章
+    无前序、或前序均未定稿时返空列表（context-agent 仅用全量设定，行为不崩）。
     """
     stmt = (
         select(Chapter)
@@ -106,6 +108,7 @@ async def list_recent_chapters(
             Chapter.user_id == user_id,
             Chapter.project_id == project_id,
             Chapter.chapter_number < before_number,
+            Chapter.status == "finalized",
         )
         .order_by(Chapter.chapter_number.desc())
         .limit(limit)

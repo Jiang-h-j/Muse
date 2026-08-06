@@ -309,3 +309,118 @@ async def test_plan_first_stage_checks_quota_before_provider() -> None:
     assert call_order.index("quota") < call_order.index("chat")
     # AC7：走 get_provider_for_user（不自建 DeepSeekProvider）。
     get_provider_mock.assert_awaited_once()
+
+
+# ========== Story 4.7：plan_next_stage（下一阶段规划） ==========
+
+
+def _fake_prev_stage(stage_number: int = 1, goal: str = "站稳外门。") -> MagicMock:
+    prev = MagicMock()
+    prev.stage_number = stage_number
+    prev.goal = goal
+    prev.chapters = [{"title": "t", "brief": "b"}]
+    return prev
+
+
+def _patch_next_planner(
+    *,
+    bible: object = None,
+    provider: object = None,
+    prev_stage: object = "__present__",
+) -> ExitStack:
+    """patch plan_next_stage 依赖：复用 _patch_planner 的公共 patch + 追加 get_latest_stage。"""
+    stack = _patch_planner(bible=bible, provider=provider)
+    prev = _fake_prev_stage() if prev_stage == "__present__" else prev_stage
+    stack.enter_context(
+        patch.object(
+            stage_planner.stage_plan_repo,
+            "get_latest_stage",
+            AsyncMock(return_value=prev),
+        )
+    )
+    return stack
+
+
+@pytest.mark.asyncio
+async def test_plan_next_stage_produces_plan_with_incremented_stage_number() -> None:
+    """下一阶段规划：upsert stage_number = 上一阶段 + 1（不写死首阶段）。"""
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=_fake_chat_result(
+            "阶段目标：进入内门争锋。\n第1章标题：内门试炼\n第1章简介：踏入内门。\n"
+        )
+    )
+    with _patch_next_planner(
+        bible=_confirmed_bible(), provider=provider, prev_stage=_fake_prev_stage(2)
+    ):
+        plan = await stage_planner.plan_next_stage(
+            user_id=_UID, project_id=_PID, direction="让主角开始怀疑同伴"
+        )
+    assert plan.goal == "进入内门争锋。"
+    assert plan.stage_number == 3  # 上一阶段 2 + 1
+
+
+@pytest.mark.asyncio
+async def test_plan_next_stage_injects_prev_goal_and_direction() -> None:
+    """上一阶段目标 + 读者方向 direction 都进入 LLM prompt。"""
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=_fake_chat_result("阶段目标：x。\n第1章标题：t\n第1章简介：b\n")
+    )
+    with _patch_next_planner(
+        bible=_confirmed_bible(),
+        provider=provider,
+        prev_stage=_fake_prev_stage(1, goal="站稳外门。"),
+    ):
+        await stage_planner.plan_next_stage(
+            user_id=_UID, project_id=_PID, direction="节奏慢下来铺一段感情"
+        )
+    args, _ = provider.chat.call_args
+    user_msg = args[0][-1]["content"]
+    assert "站稳外门。" in user_msg  # 上一阶段目标
+    assert "节奏慢下来铺一段感情" in user_msg  # 读者方向
+
+
+@pytest.mark.asyncio
+async def test_plan_next_stage_empty_direction_uses_default_hint() -> None:
+    """空 direction（直接继续）→ prompt 用默认「按设定+上一阶段自然推进」提示。"""
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=_fake_chat_result("阶段目标：x。\n第1章标题：t\n第1章简介：b\n")
+    )
+    with _patch_next_planner(bible=_confirmed_bible(), provider=provider):
+        await stage_planner.plan_next_stage(
+            user_id=_UID, project_id=_PID, direction=None
+        )
+    args, _ = provider.chat.call_args
+    user_msg = args[0][-1]["content"]
+    assert "直接继续" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_plan_next_stage_no_prev_stage_raises_502() -> None:
+    """无任何上一阶段（防御）→ 502（service 层已前置 no_stage_plan 400，此为独立 session 兜底）。"""
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=_fake_chat_result("阶段目标：x。\n第1章标题：t\n第1章简介：b\n")
+    )
+    with _patch_next_planner(
+        bible=_confirmed_bible(), provider=provider, prev_stage=None
+    ):
+        with pytest.raises(ErrorEnvelope) as ei:
+            await stage_planner.plan_next_stage(user_id=_UID, project_id=_PID)
+    assert ei.value.code == "generate_failed"
+    assert ei.value.http_status == 502
+
+
+@pytest.mark.asyncio
+async def test_plan_next_stage_empty_output_raises_502() -> None:
+    """LLM 空产（无目标）→ 502。"""
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=_fake_chat_result("第1章标题：t\n第1章简介：b\n")
+    )
+    with _patch_next_planner(bible=_confirmed_bible(), provider=provider):
+        with pytest.raises(ErrorEnvelope) as ei:
+            await stage_planner.plan_next_stage(user_id=_UID, project_id=_PID)
+    assert ei.value.code == "generate_failed"

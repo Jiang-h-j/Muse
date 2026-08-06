@@ -398,6 +398,7 @@ async def plan_first_stage(
             "taskId": task_id,
             "status": "stage_plan_ready",
             "stagePlan": {
+                "stageNumber": plan.stage_number,
                 "goal": plan.goal,
                 "chapters": plan.chapters or [],
             },
@@ -416,6 +417,61 @@ async def plan_first_stage(
         # 避免内部实现细节经 SSE 外泄（承 generate_chapter worker.py:256-267）。
         logger.exception(
             "plan_first_stage 任务失败：task_id=%s", task_id, exc_info=exc
+        )
+        await sse.publish_event(
+            pub,
+            task_id,
+            sse.EVENT_ERROR,
+            {"code": "generate_failed", "message": "生成失败，请稍后重试。"},
+        )
+        raise
+
+
+async def plan_next_stage(
+    ctx: dict, task_id: str, user_id: str, project_id: str, direction: str | None
+) -> dict[str, object]:
+    """幕后生成下一阶段规划 ARQ 任务（Story 4.7 AC5，FR22）：阶段末章定稿后经阶段交界触发。
+
+    **仿 plan_first_stage**（本文件上文），差异：调 `stage_planner.plan_next_stage`（读上一阶段
+    +设定 → LLM 出下一阶段规划），透传 `direction`（阶段交界方向）；result 的 stagePlan 带
+    `stageNumber`（新阶段号，前端据此进对应阶段首章）。异常处理同 plan_first_stage（护栏 429 /
+    设定未确认 400 / 空产 502 经 ErrorEnvelope 透传，其余泛化 generate_failed）。
+    """
+    pub: Redis = ctx["pub_redis"]
+    try:
+        # ---- step 1：开始生成（推 progress，驱动前端加载态）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(1))
+
+        # ---- step 2：真实 LLM 生成下一阶段规划 + 落库（service 自管独立 session）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(2))
+        plan = await stage_planner.plan_next_stage(
+            user_id=uuid.UUID(user_id),
+            project_id=uuid.UUID(project_id),
+            direction=direction,
+        )
+
+        # ---- step 3：完成，推真实阶段规划 result（camelCase，含新 stageNumber）----
+        await sse.publish_event(pub, task_id, sse.EVENT_PROGRESS, _plan_progress(3))
+        payload: dict[str, object] = {
+            "taskId": task_id,
+            "status": "stage_plan_ready",
+            "stagePlan": {
+                "stageNumber": plan.stage_number,
+                "goal": plan.goal,
+                "chapters": plan.chapters or [],
+            },
+        }
+        await sse.publish_event(pub, task_id, sse.EVENT_RESULT, payload)
+        return payload
+    except ErrorEnvelope as exc:
+        # 受控业务错误（护栏触顶 429 / 设定未确认 400 / 空产 502）：透传 code/message。
+        await sse.publish_event(
+            pub, task_id, sse.EVENT_ERROR, {"code": exc.code, "message": exc.message}
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001  worker 内任何异常都要推 error 事件（陷阱⑧）
+        logger.exception(
+            "plan_next_stage 任务失败：task_id=%s", task_id, exc_info=exc
         )
         await sse.publish_event(
             pub,
@@ -469,6 +525,7 @@ class WorkerSettings:
         generate_chapter,
         revise_chapter,
         plan_first_stage,
+        plan_next_stage,
     ]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = 1

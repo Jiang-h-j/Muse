@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-05 (Story 4.6 代码审查通过：三层对抗式 1 patch + 2 decision-needed（裁决A彻底修：刷新接回revise SSE+用对消费者/重生feedback双注入）全修 + 新回归测试，2 defer 入台账（enqueue失败卡running/并发revise竞争），后端551 passed零回归，4-6 review → done)
+last_updated: 2026-08-06 (Story 4.7 三层审查通过：11 findings 全落地——决策① finalized 后 revise/regenerate 拒 400 chapter_already_finalized、② plan_next_stage _job_id={pid}:plan_next_stage ARQ 去重+race guard warning、③ stage-direction 末章守卫+bump seq、登出清多阶段态、归档 stageNumber 动态化、sessionStorage try/catch、demo 占位、去 min 钳制、storyErrorText+SSE message 优先；4 defer 入台账；后端 577 passed 零回归、ruff 全过，4-7 review → done，Epic 4 全 done)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -95,8 +95,10 @@ development_status:
   4-4-本章想法输入-真实生成章节正文: done
   4-5-分页阅读-段落批注-整体点评: done
   4-6-改进本章-重新生成整章: done
-  4-7-定稿本章-阶段循环-阶段交界方向输入: backlog
+  4-7-定稿本章-阶段循环-阶段交界方向输入: done
   epic-4-retrospective: optional
+  # 注：epic-4 仍 in-progress 因为 4-1（盲测 launch blocker）还卡 review——是创始人确认门禁非代码评审路径；
+  # 4-2~4-7 全 done。4-1 转正后 epic-4 才 done。
 
   # ---------- Epic 5: 故事档案与归档（含 RAG）----------
   epic-5: backlog

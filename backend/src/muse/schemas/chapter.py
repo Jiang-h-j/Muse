@@ -76,6 +76,18 @@ class ChapterReviseRequest(CamelModel):
     annotations: list[ChapterAnnotation] | None = None
 
 
+class NextStagePlanRequest(CamelModel):
+    """POST 触发下一阶段规划的请求体（Story 4.7 AC5，FR22）：阶段交界方向可选填。
+
+    边界 camelCase（direction 无下划线，camel/snake 一致）。direction = 用户在阶段交界处填的
+    走向意愿：非空=「带着这个方向写下去」（注入下一阶段规划）；空/None=「直接继续」（LLM 按设定
+    +前文自然推进）；也可是收尾声明（「我想开始收尾了」→ LLM 规划收束主线的收尾阶段）。
+    project_id 在路径、不在 body。
+    """
+
+    direction: str | None = None
+
+
 class ChapterTextResponse(CamelModel):
     """GET 章节正文恢复响应（AC6）：终稿正文 + 版本 + 状态。
 

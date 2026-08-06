@@ -6,6 +6,7 @@ user_id 的全表入口。
 
 方法：
 - get_stage_plan：按幂等键 (user_id, project_id, stage_number) 取阶段规划（重进恢复读）。
+- get_latest_stage：取本作品当前最新阶段规划（stage_number 最大的一行，Story 4.7 阶段循环）。
 - upsert_stage_plan：get-or-create 落库阶段规划（幕后任务生成完成后写；重生成覆盖同行）。
 """
 
@@ -34,6 +35,31 @@ async def get_stage_plan(
         StagePlan.user_id == user_id,
         StagePlan.project_id == project_id,
         StagePlan.stage_number == stage_number,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_latest_stage(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> StagePlan | None:
+    """取本作品当前最新阶段规划（stage_number 最大的一行，Story 4.7 阶段循环）。
+
+    按 stage_number 降序取第一行——多阶段循环后返回「当前所处阶段」的规划（前端渲染当前阶段章
+    骨架 + 阶段末章判断、下一阶段规划读上一阶段承接）。租户守卫（user_id + project_id）。无任何
+    阶段规划返 None（连首阶段都没生成）。
+    """
+    stmt = (
+        select(StagePlan)
+        .where(
+            StagePlan.user_id == user_id,
+            StagePlan.project_id == project_id,
+        )
+        .order_by(StagePlan.stage_number.desc())
+        .limit(1)
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()

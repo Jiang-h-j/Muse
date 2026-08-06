@@ -151,3 +151,64 @@ async def test_upsert_idempotent_overwrites_same_row(db_engine: Engine) -> None:
             )
         ).scalars().all()
         assert len(rows) == 1
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_get_latest_stage_returns_highest_stage_number(db_engine: Engine) -> None:
+    """Story 4.7：多阶段后 get_latest_stage 返回 stage_number 最大的一行（当前所处阶段）。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        for n in (1, 2, 3):
+            await repo.upsert_stage_plan(
+                session,
+                user_id=user_id,
+                project_id=project_id,
+                goal=f"第 {n} 阶段目标。",
+                chapters=[{"title": f"s{n}", "brief": "b"}],
+                stage_number=n,
+            )
+        await session.commit()
+
+    async with async_session_maker() as session:
+        latest = await repo.get_latest_stage(
+            session, user_id=user_id, project_id=project_id
+        )
+        assert latest is not None
+        assert latest.stage_number == 3
+        assert latest.goal == "第 3 阶段目标。"
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_get_latest_stage_absent_returns_none(db_engine: Engine) -> None:
+    """无任何阶段规划 → None。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        latest = await repo.get_latest_stage(
+            session, user_id=user_id, project_id=project_id
+        )
+        assert latest is None
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_get_latest_stage_tenant_guard(db_engine: Engine) -> None:
+    """他人 user_id 读不到本作品最新阶段（租户守卫）。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    other_user_id, _ = _seed_user_and_project(db_engine)
+    async with async_session_maker() as session:
+        await repo.upsert_stage_plan(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            goal="目标。",
+            chapters=[{"title": "t", "brief": "b"}],
+        )
+        await session.commit()
+
+    async with async_session_maker() as session:
+        latest = await repo.get_latest_stage(
+            session, user_id=other_user_id, project_id=project_id
+        )
+        assert latest is None

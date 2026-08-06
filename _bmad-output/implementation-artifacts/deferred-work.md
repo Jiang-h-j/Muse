@@ -1,5 +1,14 @@
 # Deferred Work
 
+## Deferred from: code review of 4-7-定稿本章-阶段循环-阶段交界方向输入 (2026-08-05)
+
+> 三层对抗审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。AC1-9 全兑现零违例；3 decision-needed + 8 patch 见 story 文件 Review Findings，此处只登记确认 defer 的 4 条。
+
+- **`NextStagePlanRequest.direction` 无 max_length 上限** [backend/src/muse/schemas/chapter.py:88] — direction 原文注入下一阶段规划 prompt（stage_planner 直接拼 user message），无 `max_length`。恶意/失控客户端可灌超长字符串放大 token 成本。**归开放注册前加固批次**：与本文件已有的「触发端点零幂等」（391 行族）、「SSE 编排硬化」同批——开放注册前的安全加固统一处理，V1 单用户内测面可控。
+- **finalize 拿 existing.text/revision upsert 存在跨 tab revise 竞态 lost-update 窗口** [backend/src/muse/services/chapter_service.py:433-449] — finalize 读 `existing.text/revision` → upsert，若期间另一 tab 的 revise ARQ 任务完成写入新 text/revision，finalize 会用旧值覆盖。**单 tab 由 `chapterAgentBusy` 互斥、跨 tab  revising 与本文件 392 行「并发revise竞争」同根**——并入既有 defer：finalize upsert 加乐观锁（`WHERE revision=existing.revision`，失败返 409）+revise/generate 同批加固。
+- **worker `plan_next_stage` 独立 session 重查 prev_stage=None 时报 `_generate_failed` 而非 `_no_stage_plan`** [backend/src/muse/orchestration/stage_planner.py:342-343] — service 层 `_no_stage_plan` 已前置 400 拦截正常路径；worker 这条只在「service 校验后、worker 跑前 stage_plan 被删除」的极端窗口命中，概率极低但错误码误导（客户端以为 LLM 失败会重试）。**归 Story 4.x 后续批次**：`_no_stage_plan` 提到 stage_planner 或公共 errors 模块，worker 复用同 code。
+- **`_persist_plan_with_race_guard` 并发覆盖时无 logger.warning** [backend/src/muse/orchestration/stage_planner.py:409-430] — IntegrityError rollback 后重 upsert 会静默覆盖另一并发任务刚写完的 chapters（last-write-wins），无审计痕迹。**与 Story 4.7 Review Finding F4 同根**：等决策确定（ARQ _job_id 去重 / SELECT FOR UPDATE / 仅加 warning）后一并落地；若选 c 即在本函数补 warning 即可关闭本 defer。
+
 ## Deferred from: code review of 4-5-分页阅读-段落批注-整体点评 (2026-08-05)
 
 > 三层对抗审查（Blind/Edge/Auditor）。2 patch（翻页漏清 focus / 保存后未 focus 段落，见 story Review Findings）+ 3 dismiss（NaN 崩溃误报：状态变量 244-253 全初始化；纯函数副作用与监听泄漏：属既有渲染模式非本 diff 引入且未证实）+ 以下 4 条 defer。
@@ -371,7 +380,7 @@
 > 三层对抗审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）triage 出的 defer 项（1 decision-needed + 4 patch 见 story 文件 Review Findings，此处只登记确认为 pre-existing / 非阻断的 defer 项）。
 
 - **worker 卡死/未起 → 前端永久 spinner，无客户端超时** [prototype/app/app.js `startStagePlanFlow` 无终态兜底 + backend/src/muse/core/sse.py `event_stream` listen() 无 watchdog] — 前端「无终态兜底」只在 SSE 流**正常结束却没收到 result/error** 时触发；若 worker 进程未起/任务积压/卡死，后端 listen() 永久阻塞、SSE 连接永不结束，前端 taskEvents 不 resolve、兜底永不触发，无客户端超时定时器 → 用户无限停在「正在准备你的第一章」占位态、重试按钮仅 error 态才渲染。**非本 story 引入**：与 2.1「SSE event_stream 无服务端超时」（本文件 2-1 条目）、2.1/2.5「worker SIGTERM 不推 error 终态」同源，前端单次 SSE 消费无重连/无整体超时是全项目既有范式（2.3/2.6/7.2/7.3 多处已登记）。**归 SSE 编排硬化批次 / Story 4.4**：后端任务级看门狗（快照非终态且超时推 error）+ 前端加客户端整体超时定时器，与既有 SSE 硬化 defer 同批。Blind Hunter + Edge Case Hunter 独立指出。
-- **worker `plan_first_stage` 对受控 ErrorEnvelope 也 raise，触发 ARQ 默认重试（max_tries 未设=5）重复付费/重推事件** [backend/src/muse/tasks/worker.py `plan_first_stage` except ErrorEnvelope … raise / generic except … raise] — 任务推完终态 error 事件后仍 `raise`，前端收到 error 即关流不再监听，而 `raise` 让 ARQ 按默认 max_tries=5 重跑整个任务体；确定性失败（bible_not_confirmed 400 / 触顶 429 / 反复空产 502）每次重试都再打一次思考档 LLM 并再记一次账（record_usage 内部 commit），progress/result 推到已无人监听的频道。**非本 story 引入**：逐行照搬 settle_exploration（worker.py:172/185）/ generate_chapter（worker.py:255/268）的既有范式，WorkerSettings 自 2.1 起一直未设 max_tries，本文件 2-1/2-5/3-3 条目已多次登记同类。**归开放注册前加固批次 / Story 4.4**：统一定 settle/generate/plan 任务的 max_tries（确定性失败如 400/429/502 应 max_tries=1 不重试、仅瞬时错误重试）或终态幂等守卫（已推终态则不重试），涵盖全部 ARQ 任务勿只补本任务。Blind Hunter 指出。
+- **worker `plan_first_stage` 对受控 ErrorEnvelope 也 raise，触发 ARQ 默认重试（max_tries 未设=5）重复付费/重推事件** [backend/src/muse/tasks/worker.py `plan_first_stage` except ErrorEnvelope … raise / generic except … raise] — 任务推完终态 error 事件后仍 `raise`，前端收到 error 即关流不再监听，而 `raise` 让 ARQ 按默认 max_tries=5 重跑整个任务体；确定性失败（bible_not_confirmed 400 / 触顶 429 / 反复空产 502）每次重试都再打一次思考档 LLM 并再记一次账（record_usage 内部 commit），progress/result 推到已无人监听的频道。**非本 story 引入**：逐行照搬 settle_exploration（worker.py:172/185）/ generate_chapter（worker.py:255/268）的既有范式，WorkerSettings 自 2.1 起一直未设 max_tries，本文件 2-1/2-5/3-3 条目已多次登记同类。**归开放注册前加固批次 / Story 4.4**：统一定 settle/generate/plan 任务的 max_tries（确定性失败如 400/429/502 应 max_tries=1 不重试、仅瞬时错误重试）或终态幂等守卫（已推终态则不重试），涵盖全部 ARQ 任务勿只补本任务。Blind Hunter 指出。**[2026-08-06 注记] Story 4.4 已落 max_tries=1（worker.py:531，注释明写"兑现 deferred-work.md:112/162/215「归 4.4」"），本条核心诉求已兑现；blind 4.7 review F3 重申已确认此配置生效。后续若需进一步加固（ErrorEnvelope return-语义避免 raise）归开放注册前加固批次。**
 
 ## Story 4.3 首章无缝进入 + 幕后阶段规划 (2026-08-04)
 

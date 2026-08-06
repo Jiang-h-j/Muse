@@ -4434,6 +4434,13 @@ body.dialog-open {
   margin-bottom: 24px;
 }
 
+.stage-direction-error {
+  color: #d14343;
+  line-height: 1.7;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
 .stage-direction-input {
   min-height: 120px;
   resize: vertical;

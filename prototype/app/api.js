@@ -702,6 +702,22 @@ const chapterApi = {
       signal,
     });
   },
+  // 定稿本章（Story 4.7）：**同步 REST**（不调 LLM、无 taskId、无 SSE），无请求体。成功返
+  // {chapterNumber, chapterText, revision, status="finalized"}。幂等（已定稿再调返回同状态）。
+  finalizeChapter(projectId, chapterNumber) {
+    return apiFetch(
+      `/api/projects/${projectId}/chapters/${chapterNumber}/finalize`,
+      { method: "POST" },
+    );
+  },
+  // 触发幕后生成下一阶段规划（Story 4.7 FR22）：body {direction}（可空=直接继续 / 收尾声明），
+  // 返 {taskId} 供连 SSE（taskEvents 消费 progress/result；result 里 stagePlan 含新 stageNumber）。
+  planNextStage(projectId, { direction } = {}) {
+    return apiFetch(`/api/projects/${projectId}/chapters/plan-next-stage`, {
+      method: "POST",
+      body: { direction: direction || null },
+    });
+  },
 };
 
 // ---------------------------------------------------------------------

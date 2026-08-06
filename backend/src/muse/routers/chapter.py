@@ -21,6 +21,7 @@ from muse.schemas.chapter import (
     ChapterGenerateRequest,
     ChapterReviseRequest,
     ChapterTextResponse,
+    NextStagePlanRequest,
     StagePlanResponse,
 )
 from muse.schemas.task import TaskSubmitResponse
@@ -75,6 +76,36 @@ async def get_stage_plan(
         content=body.model_dump_json(by_alias=True),
         media_type="application/json",
     )
+
+
+@router.post(
+    "/{project_id}/chapters/plan-next-stage", response_model=TaskSubmitResponse
+)
+async def plan_next_stage(
+    project_id: uuid.UUID,
+    payload: NextStagePlanRequest,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> TaskSubmitResponse:
+    """触发幕后生成下一阶段规划（Story 4.7 AC5，FR22）：提交语义，返 200 + taskId。
+
+    body 收可选阶段交界方向（direction）：非空=带方向写下去、空/None=直接继续、收尾声明=规划
+    收尾阶段。前端在阶段末章定稿后进阶段交界页，点三按钮之一调本端点拿 taskId，再连
+    GET /api/tasks/{taskId}/events 消费 SSE progress/result（幕后无阻塞 FR17，就绪后进下一阶段
+    首章）。真实生成走 stage_planner.plan_next_stage（读上一阶段+设定 → LLM 出下一阶段规划）。
+    租户 404 / 未确认设定 400 / 无阶段规划 400 no_stage_plan 由 service 抛 ErrorEnvelope 交全局
+    handler；project_id 非法由 FastAPI 自动 422。
+
+    **路由顺序**：静态段 plan-next-stage 声明在动态 {chapter_number} 段之前——不会被 int 转换器
+    吞（同 plan-stage/stage-plan 静态段范式）。
+    """
+    task_id = await chapter_service.trigger_next_stage_planning(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        direction=payload.direction,
+    )
+    return TaskSubmitResponse(task_id=task_id)
 
 
 @router.post(
@@ -144,6 +175,40 @@ async def revise_chapter(
         annotations=annotations,
     )
     return TaskSubmitResponse(task_id=task_id)
+
+
+@router.post(
+    "/{project_id}/chapters/{chapter_number}/finalize",
+    response_model=ChapterTextResponse,
+)
+async def finalize_chapter(
+    project_id: uuid.UUID,
+    chapter_number: int,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> ChapterTextResponse:
+    """定稿本章（Story 4.7 AC1，FR21）：**同步 REST**，直接返回定稿后的章节资源体。
+
+    **无 body**（定稿只改 status、不调 LLM、不入 ARQ、无需 SSE）。前端在 reading 态点「定稿本章 →」
+    调本端点，成功后本章 status=finalized——成为后续章节创作的正式上下文（list_recent_chapters
+    只读 finalized）、前端隐藏批注/改进按钮。**幂等**：已定稿再调返回同状态、不报错。
+
+    租户 404 / 未确认设定 400 / 本章未生成 400 chapter_not_generated / 章号 <1 chapter_out_of_range
+    由 service 抛 ErrorEnvelope 交全局 handler；project_id/chapter_number 非法由 FastAPI 自动 422。
+    写后投影 + 章节卡片归 Epic 5 Story 5.2（本端点只置 status）。
+    """
+    chapter = await chapter_service.finalize_chapter(
+        session,
+        user_id=current_user.id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+    )
+    return ChapterTextResponse(
+        chapter_number=chapter.chapter_number,
+        chapter_text=chapter.text,
+        revision=chapter.revision,
+        status=chapter.status,
+    )
 
 
 @router.get("/{project_id}/chapters/{chapter_number}")
