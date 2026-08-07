@@ -38,9 +38,11 @@ from muse.models.account import User
 from muse.models.chapter import Chapter
 from muse.models.chapter_card import ChapterCard
 from muse.models.chapter_generation import ChapterGenerationRun
+from muse.models.embedding import Embedding
 from muse.models.story_bible import StoryBible
 from muse.models.story_state import StoryState
 from muse.models.story_thread import StoryThread
+from muse.services import embedding_projection_service
 from tests.conftest import requires_db
 
 _client = TestClient(app, raise_server_exceptions=False)
@@ -700,3 +702,107 @@ def test_finalize_real_pipeline_preserves_status_and_revision(
     card = _read_chapter_card(db_engine, user.id, project_id, 1)
     assert card is not None
     assert card.what_happened == "真实 pipeline 提取"
+
+
+# ========== Story 5.5：定稿后 embedding 落库 + embedding 失败不影响定稿 ==========
+
+
+class _FakeEmbeddingProvider:
+    """返每个 chunk 一个 1024 维定值向量的 fake（数量与输入对齐）。"""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1] * 1024 for _ in texts]
+
+    @property
+    def dimensions(self) -> int:
+        return 1024
+
+
+class _RaisingEmbeddingProvider:
+    """embed 抛异常，模拟阿里 API 抖动（验证 embedding 失败不阻断定稿）。"""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("模拟 embedding API 失败")
+
+    @property
+    def dimensions(self) -> int:
+        return 1024
+
+
+def _read_embedding_chunks(
+    engine: Engine, user_id: uuid.UUID, project_id: str, chapter_number: int
+) -> list[Embedding]:
+    with Session(engine) as session:
+        return list(
+            session.execute(
+                select(Embedding)
+                .where(
+                    Embedding.user_id == user_id,
+                    Embedding.project_id == uuid.UUID(project_id),
+                    Embedding.chapter_number == chapter_number,
+                )
+                .order_by(Embedding.chunk_index.asc())
+            )
+            .scalars()
+            .all()
+        )
+
+
+@requires_db
+def test_finalize_writes_embedding_chunks(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.5 AC3：定稿后 embedding 表落本章 chunk 行（mock provider 返固定向量）。"""
+    with _client:
+        user = make_user("fin-emb@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(db_engine, user.id, project_id, 1, "第一章定稿正文，用于向量化。")
+
+        with patch.object(
+            embedding_projection_service,
+            "get_embedding_provider",
+            return_value=_FakeEmbeddingProvider(),
+        ):
+            resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "finalized"
+
+    rows = _read_embedding_chunks(db_engine, user.id, project_id, 1)
+    assert len(rows) >= 1
+    assert all(len(r.embedding) == 1024 for r in rows)
+    assert rows[0].model_name == "text-embedding-v3"
+
+
+@requires_db
+def test_finalize_embedding_failure_does_not_block(
+    db_engine: Engine,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    """Story 5.5 AC3：embedding 失败不影响定稿成功 + 三表仍落库（provider 抛异常）。"""
+    with _client:
+        user = make_user("fin-emb-fail@example.com")
+        headers = auth_headers(user)
+        project_id = _create_project(user, headers)
+        _seed_confirmed_bible(db_engine, user.id, project_id)
+        _seed_chapter(db_engine, user.id, project_id, 1, "第一章定稿正文")
+
+        with patch.object(
+            embedding_projection_service,
+            "get_embedding_provider",
+            return_value=_RaisingEmbeddingProvider(),
+        ):
+            resp = _client.post(_finalize_url(project_id, 1), headers=headers)
+        # 定稿仍 200、status 仍 finalized（embedding 失败被 finalize 层吞、不阻断）。
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "finalized"
+
+    # 三表仍落库（chapter_card 在），embedding 表本章无行（失败降级）。
+    card = _read_chapter_card(db_engine, user.id, project_id, 1)
+    assert card is not None
+    rows = _read_embedding_chunks(db_engine, user.id, project_id, 1)
+    assert rows == []

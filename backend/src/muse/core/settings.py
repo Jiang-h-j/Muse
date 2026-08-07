@@ -82,6 +82,21 @@ class Settings(BaseSettings):
     deepseek_model_thinking: str = "deepseek-v4-pro"
     deepseek_model_fast: str = "deepseek-v4-flash"
 
+    # Embedding Provider（Story 5.5，AR18/焦点四）：RAG 向量化的托管接入配置。
+    # **无 fail-fast**（照 deepseek_api_key 决策，参照 free_quota_tokens）：业务配置非安全
+    # 密钥——空值只触发 AC4 降级（投影 skip embedding、RAG 退 tsvector），不导致越权，故不加
+    # model_validator 拒启动。空串默认便于本地/CI 无 key 时其余功能正常跑。
+    # embedding_api_key 是 **Muse 自有托管 key**——受控决策 1：V1 embedding 只走托管、不开放
+    # BYOK（很多用户不懂嵌入模型，embedding 是系统内部一致性能力而非用户可感知的模型选择）。
+    embedding_api_key: str = ""
+    # 阿里百炼国内 endpoint（OpenAI 兼容）。**合规约束（NFR8 数据不出境，AC5）**：embedding
+    # （阿里）须与 LLM（DeepSeek）同区、部署国内云；base_url 指向阿里国内 endpoint 满足合规。
+    # 换区域/代理可用 .env 覆盖，但不得指向境外 endpoint（违反 NFR8）。
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 向量模型名（text-embedding-v3，1024 维）。换模型/换维度须同步改建表迁移
+    # （models/embedding.EMBEDDING_DIM + 迁移 Vector 维度，陷阱⑦锁死 1024）。
+    embedding_model: str = "text-embedding-v3"
+
     @model_validator(mode="after")
     def _fail_fast_on_weak_secret(self) -> "Settings":
         """生产环境弱 JWT 密钥拒绝启动（deferred-work.md L5，AC6）。
