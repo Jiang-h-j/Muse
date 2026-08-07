@@ -77,9 +77,13 @@ def _patch_step(
     bible: object = None,
     provider: object = None,
     recent_chapters: object = None,
+    story_state: object = None,
+    open_threads: object = None,
 ) -> ExitStack:
     """patch 一段 step 的公共依赖：session_maker、project_repo、story_bible_repo、
-    chapter_repo.list_recent_chapters、usage_service.check_quota、get_provider_for_user。
+    chapter_repo.list_recent_chapters、story_state_repo.get_by_project、
+    story_thread_repo.list_open_by_project、usage_service.check_quota、
+    get_provider_for_user、recall_context_for_chapter。
     返回已进入的 ExitStack。"""
     stack = ExitStack()
     owned = MagicMock() if owned_project == "__present__" else owned_project
@@ -105,6 +109,22 @@ def _patch_step(
             steps.chapter_repo,
             "list_recent_chapters",
             AsyncMock(return_value=recent_chapters or []),
+        )
+    )
+    # Story 5.6：新增 story_state_repo.get_by_project
+    stack.enter_context(
+        patch.object(
+            steps.story_state_repo,
+            "get_by_project",
+            AsyncMock(return_value=story_state),
+        )
+    )
+    # Story 5.6：新增 story_thread_repo.list_open_by_project
+    stack.enter_context(
+        patch.object(
+            steps.story_thread_repo,
+            "list_open_by_project",
+            AsyncMock(return_value=open_threads or []),
         )
     )
     stack.enter_context(
@@ -411,3 +431,66 @@ async def test_polisher_no_style_profile_uses_default() -> None:
     args, _ = provider.chat.call_args
     user_msg = args[0][-1]["content"]
     assert "未锚定文风" in user_msg
+
+
+# ========== Story 5.6：写前上下文升级（context-agent 注入新块） ==========
+
+
+@pytest.mark.asyncio
+async def test_context_agent_injects_story_state_block() -> None:
+    """AC2：story_state 当前快照块注入写作任务书。"""
+    state = MagicMock()
+    state.protagonist_state = "程野心智动摇但行动果决。"
+    state.world_rules_state = "灵气复苏、时间裂缝法则失效。"
+    state.current_stage = "第七码头地下档案库。"
+    with _patch_step(bible=_confirmed_bible(), story_state=state):
+        brief = await steps.run_context_agent(
+            user_id=_UID, project_id=_PID, chapter_number=2, chapter_idea=None
+        )
+    assert "当前故事状态" in brief
+    assert "主角状态" in brief
+    assert "程野心智动摇" in brief
+    assert "世界规则" in brief
+    assert "灵气复苏" in brief
+    assert "叙事位置" in brief
+    assert "第七码头" in brief
+
+
+@pytest.mark.asyncio
+async def test_context_agent_story_state_none_uses_placeholder() -> None:
+    """story_state 为 None（无快照）时输出空提示，不报错。"""
+    with _patch_step(bible=_confirmed_bible(), story_state=None):
+        brief = await steps.run_context_agent(
+            user_id=_UID, project_id=_PID, chapter_number=2, chapter_idea=None
+        )
+    assert "当前故事状态" in brief
+    assert "暂无故事状态快照" in brief
+
+
+@pytest.mark.asyncio
+async def test_context_agent_injects_open_threads_block() -> None:
+    """AC2：未回收伏笔块注入写作任务书。"""
+    thread1 = MagicMock()
+    thread1.content = "邮戳日期为未来，可能是关键线索。"
+    thread1.last_touched_chapter_number = 5
+    thread2 = MagicMock()
+    thread2.content = "第七码头神秘邮局。"
+    thread2.last_touched_chapter_number = 3
+    with _patch_step(bible=_confirmed_bible(), open_threads=[thread1, thread2]):
+        brief = await steps.run_context_agent(
+            user_id=_UID, project_id=_PID, chapter_number=6, chapter_idea=None
+        )
+    assert "未回收伏笔/线索" in brief
+    assert "邮戳日期为未来" in brief
+    assert "第七码头神秘邮局" in brief
+
+
+@pytest.mark.asyncio
+async def test_context_agent_empty_threads_uses_placeholder() -> None:
+    """open_threads 为空时输出空提示，不报错。"""
+    with _patch_step(bible=_confirmed_bible(), open_threads=[]):
+        brief = await steps.run_context_agent(
+            user_id=_UID, project_id=_PID, chapter_number=2, chapter_idea=None
+        )
+    assert "未回收伏笔/线索" in brief
+    assert "当前无未回收伏笔与线索" in brief

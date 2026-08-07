@@ -53,6 +53,7 @@ async def list_open_by_project(
     *,
     user_id: uuid.UUID,
     project_id: uuid.UUID,
+    limit: int = 0,
 ) -> list[StoryThread]:
     """列出本作品全部 `status='open'` 的 thread，按 last_touched_chapter_number 降序。
 
@@ -60,6 +61,9 @@ async def list_open_by_project(
     get_pending_by_project 先例）：跨租户/已 resolved / 已 abandoned 的 thread 都
     被滤掉——返回空列表表达「无可召回伏笔」（非错误）。降序意味最近活跃的 thread
     在前，5.6 RAG 召回按需截断、5.3 归档页按活跃度排序展示。
+
+    limit=0 时返回全部 open threads（默认无上限）；limit>0 时取前 limit 条（SQL
+    层截断——Story 5.6 写前上下文注入 10 条上限）。
     """
     stmt = (
         select(StoryThread)
@@ -70,6 +74,8 @@ async def list_open_by_project(
         )
         .order_by(StoryThread.last_touched_chapter_number.desc())
     )
+    if limit > 0:
+        stmt = stmt.limit(limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 

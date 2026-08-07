@@ -42,7 +42,15 @@ from muse.core.settings import get_settings
 from muse.orchestration import ai_taste_lexicon
 from muse.providers.base import ChatResult, Message
 from muse.providers.factory import get_provider_for_user
-from muse.repositories import chapter_card_repo, chapter_repo, project_repo, story_bible_repo
+from muse.rag.retrieval import RecallResult, recall_context_for_chapter
+from muse.repositories import (
+    chapter_card_repo,
+    chapter_repo,
+    project_repo,
+    story_bible_repo,
+    story_state_repo,
+    story_thread_repo,
+)
 from muse.services import exploration_service, usage_service
 
 logger = logging.getLogger("muse")
@@ -205,6 +213,99 @@ def _format_revision_block(revision_input: dict | None) -> str:
     return "\n\n".join(parts)
 
 
+# ========== Story 5.6：写前上下文升级（3 个新块格式化函数） ==========
+
+
+def _format_story_threads_block(threads: list) -> str:
+    """把未回收 story_threads 渲染为写作任务书里的「未回收伏笔/线索」段。
+
+    按 `last_touched_chapter_number DESC` 取最近活跃的若干条（默认 10 条上限），
+    渲染为「【未回收伏笔/线索（需在本章关注或回收）】」块。
+
+    threads 为空或降级时：写入空提示（同类体例与 _format_recent_chapters_block
+    的「这是第一章」/「暂缺」空提示范式一致）。
+    """
+    if not threads:
+        return "【未回收伏笔/线索】\n（当前无未回收伏笔与线索，可自然推进。）"
+    parts: list[str] = []
+    for thread in threads:
+        content = (getattr(thread, "content", None) or "").strip()
+        if not content:
+            continue
+        # 截断 200 字防上下文暴涨（受控决策 5）
+        snippet = content[:200]
+        if len(content) > 200:
+            snippet += "…"
+        ch_num = getattr(thread, "last_touched_chapter_number", None)
+        parts.append(
+            f"（第 {ch_num} 章未回收）{snippet}"
+            if ch_num is not None
+            else f"（未回收）{snippet}"
+        )
+    if parts:
+        body = "\n".join(parts)
+        return f"【未回收伏笔/线索（需在本章关注或回收）】\n{body}"
+    return "【未回收伏笔/线索】\n（当前无未回收伏笔与线索，可自然推进。）"
+
+
+def _format_story_state_block(state) -> str:
+    """把 story_state 当前快照渲染为写作任务书里的「当前故事状态」段。
+
+    取 protagonist_state / world_rules_state / current_stage 三列快照，
+    渲染为「【当前故事状态（主角状态/世界规则/叙事位置）】」块。
+
+    state 为 None 或三列皆空时：写入空提示（同 _format_recent_chapters_block 的
+    空提示范式）。
+    """
+    if state is None:
+        return "【当前故事状态】\n（暂无故事状态快照，请依据故事设定自然推进。）"
+    protag = (getattr(state, "protagonist_state", None) or "").strip()
+    world = (getattr(state, "world_rules_state", None) or "").strip()
+    stage = (getattr(state, "current_stage", None) or "").strip()
+    if not protag and not world and not stage:
+        return "【当前故事状态】\n（暂无故事状态快照，请依据故事设定自然推进。）"
+    parts = []
+    if protag:
+        parts.append(f"主角状态：{protag}")
+    if world:
+        parts.append(f"世界规则：{world}")
+    if stage:
+        parts.append(f"叙事位置：{stage}")
+    body = "\n".join(parts)
+    return f"【当前故事状态（主角状态/世界规则/叙事位置）】\n{body}"
+
+
+def _format_recalled_block(recalled: RecallResult) -> str:
+    """把 RAG 召回结果渲染为写作任务书里的「相关历史设定」段（AC2）。
+
+    每条：`{source}[章{chapter_number}](score={score:.2f})：{content[:200]}...`
+    （截断 200 字防上下文暴涨）。
+
+    召回为空或降级时输出「（当前无相关历史设定召回）」提示。上限防超 3000 字
+    （≈ 15 条 × 200 字平均，受控决策 5）。
+    """
+    if not recalled.items:
+        return "【相关历史设定（RAG 召回，供本章参考）】\n（当前无相关历史设定召回。）"
+    lines: list[str] = []
+    total_chars = 0
+    max_chars = 3000  # 受控决策 5：上限防上下文暴涨
+    for item in recalled.items:
+        content = (getattr(item, "content", None) or "").strip()
+        if not content:
+            continue
+        truncated = content[:200]
+        ch_num = getattr(item, "chapter_number", None) or "?"
+        score = getattr(item, "score", 0.0)
+        line = f"{item.source}[章{ch_num}](score={score:.2f})：{truncated}"
+        if total_chars + len(line) > max_chars:
+            lines.append("（RAG 召回结果已超过写作任务书上限，后续条省略）")
+            break
+        lines.append(line)
+        total_chars += len(line)
+    body = "\n".join(lines)
+    return f"【相关历史设定（RAG 召回，供本章参考）】\n{body}"
+
+
 async def run_context_agent(
     *,
     user_id: uuid.UUID,
@@ -222,6 +323,10 @@ async def run_context_agent(
     + 最近前序章节正文（Story 4.4 接入，取最近 _RECENT_CHAPTERS_FOR_CONTEXT 章）。前序章节含
     draft（4.7 定稿未实现前唯一保证多章连续性的做法，Jianghj 2026-08-05 决议）。RAG 三级召回 +
     归档 chapter_cards 是 Epic 5 增强（epics.md:859③）。
+
+    **Story 5.6：写前上下文升级**——在现有「全量设定 + 最近前序章节」的基础上追加
+    3 个新块：未回收伏笔/线索（story_threads）、当前故事状态（story_state）、
+    RAG 召回的相关历史设定（recall_context_for_chapter）。不替换任何现有块——只追加。
 
     **Story 4.6 修订注入**：revision_input（dict，含 action/feedback/annotations/previous_text）
     非 None 时追加修订段——改进（action=improve）注入「上一版正文（保留基础）+ 整体点评 + 段落
@@ -253,6 +358,19 @@ async def run_context_agent(
         )
         recent_block = _format_recent_chapters_block(recent_chapters)
 
+        # Story 5.6：读 story_state 当前快照 + story_threads 未回收伏笔
+        # （同 session 内读完，块文本在下方拼装）。
+        state_row = await story_state_repo.get_by_project(
+            session, user_id=user_id, project_id=project_id
+        )
+        state_block_raw = _format_story_state_block(state_row)
+
+        open_threads = await story_thread_repo.list_open_by_project(
+            session, user_id=user_id, project_id=project_id
+        )
+        # Story 5.6：取最近活跃的若干条未回收 thread（上限 10 条防上下文暴涨）。
+        recent_threads_block_raw = _format_story_threads_block(open_threads[:10])
+
     # 组装写作任务书（session 已可关闭，纯文本拼装）。
     setting_block = _format_bible_for_brief(bible)
     style_profile = (getattr(bible, "style_profile", None) or "").strip()
@@ -271,6 +389,49 @@ async def run_context_agent(
     revision_block = _format_revision_block(revision_input)
     revision_section = f"\n{revision_block}\n" if revision_block else ""
 
+    # Story 5.6：RAG 召回——开独立 session 调 recall_context_for_chapter，
+    # 不阻断（受控决策 4）。try/except 包裹：异常时只 logger.warning，任务书无 RAG 块
+    # （等效 4.4 基线行为）。
+    recalled_block_raw: str | None = None
+    try:
+        async with async_session_maker() as rag_session:
+            recalled = await recall_context_for_chapter(
+                rag_session,
+                user_id=user_id,
+                project_id=project_id,
+                current_chapter=chapter_number,
+                limit=20,  # 受控决策 5：上限防上下文暴涨
+            )
+            recalled_block_raw = _format_recalled_block(recalled)
+    except Exception:
+        logger.warning(
+            "RAG 召回异常（跳过，不阻断写前上下文组装）：user=%s project=%s "
+            "chapter=%s",
+            user_id,
+            project_id,
+            chapter_number,
+            exc_info=True,
+        )
+        # 不抛错——RAG 是增强非必备，降级后仍有三表基础上下文（受控决策 4）。
+        recalled_block_raw = None
+
+    # 三块拼接——空/降级时写入空提示（同 _format_recent_chapters_block 的典范做法）。
+    recalled_section = (
+        f"\n{recalled_block_raw}\n"
+        if recalled_block_raw
+        else "\n【相关历史设定（RAG 召回）】\n（当前无相关历史设定召回。）\n"
+    )
+    threads_section = (
+        f"\n{recent_threads_block_raw}\n"
+        if recent_threads_block_raw
+        else "\n【未回收伏笔/线索】\n（当前无未回收伏笔与线索，可自然推进。）\n"
+    )
+    state_section = (
+        f"\n{state_block_raw}\n"
+        if state_block_raw
+        else "\n【当前故事状态】\n（暂无故事状态快照，请依据故事设定自然推进。）\n"
+    )
+
     brief = f"""你是一位专业的网文作者，正在为一部连载作品写第 {chapter_number} 章的正文。
 
 【故事设定（唯一创作依据）】
@@ -279,9 +440,11 @@ async def run_context_agent(
 {style_block}
 
 {recent_block}
-
+{state_section}
+{threads_section}
 {idea_block}
 {revision_section}
+{recalled_section}
 {lexicon_block}
 
 【写作要求】
