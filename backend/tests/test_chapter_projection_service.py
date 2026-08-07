@@ -132,6 +132,36 @@ async def test_chapter_commit_full_projection(db_engine: Engine) -> None:
 
 @requires_db
 @pytest.mark.asyncio
+async def test_chapter_commit_persists_initial_stage_number(db_engine: Engine) -> None:
+    """首次投影固定 stage_number，后续归档不必再由可变计划反推。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+
+    async with async_session_maker() as session:
+        await chapter_projection_service.chapter_commit(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=3,
+            stage_number=2,
+            extracted=_extracted_minimal(),
+        )
+        await session.commit()
+
+    async with async_session_maker() as session:
+        card = (
+            await session.execute(
+                select(ChapterCard).where(
+                    ChapterCard.user_id == user_id,
+                    ChapterCard.project_id == project_id,
+                    ChapterCard.chapter_number == 3,
+                )
+            )
+        ).scalar_one()
+    assert card.stage_number == 2
+
+
+@requires_db
+@pytest.mark.asyncio
 async def test_chapter_commit_idempotent_rerun(db_engine: Engine) -> None:
     """幂等重跑：同 extracted 重跑 → chapter_card / story_state 覆盖同行不产生副本、
     story_thread 同内容 open thread 防重不新建行（defer 台账 B2 防线）。"""

@@ -50,6 +50,7 @@ async def chapter_commit(
     project_id: uuid.UUID,
     chapter_number: int,
     extracted: dict,
+    stage_number: int = 1,
 ) -> None:
     """单事务 chapter-commit 原子投影（Story 5.2 AC2，AR17，NFR4）。
 
@@ -74,6 +75,7 @@ async def chapter_commit(
         user_id=user_id,
         project_id=project_id,
         chapter_number=chapter_number,
+        stage_number=stage_number,
         what_happened=extracted["what_happened"],
         character_changes=extracted["character_changes"],
         new_facts_clues=extracted["new_facts_clues"],

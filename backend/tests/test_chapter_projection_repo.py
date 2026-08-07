@@ -61,6 +61,7 @@ async def test_upsert_chapter_card_create_then_overwrite(db_engine: Engine) -> N
             user_id=user_id,
             project_id=project_id,
             chapter_number=1,
+            stage_number=2,
             what_happened="第一章发生了什么（第一版）",
             character_changes="人物变化（第一版）",
             new_facts_clues="新增事实（第一版）",
@@ -76,6 +77,7 @@ async def test_upsert_chapter_card_create_then_overwrite(db_engine: Engine) -> N
             user_id=user_id,
             project_id=project_id,
             chapter_number=1,
+            stage_number=3,
             what_happened="第一章发生了什么（重跑覆盖）",
             character_changes="人物变化（重跑覆盖）",
             new_facts_clues="新增事实（重跑覆盖）",
@@ -102,6 +104,40 @@ async def test_upsert_chapter_card_create_then_overwrite(db_engine: Engine) -> N
         assert len(rows) == 1
         assert rows[0].what_happened == "第一章发生了什么（重跑覆盖）"
         assert rows[0].end_state == "章末状态（重跑覆盖）"
+        assert rows[0].stage_number == 2
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_upsert_chapter_card_backfills_null_stage_once(db_engine: Engine) -> None:
+    """迁移遗留 NULL 卡在补偿投影时补阶段，之后仍受不可变归属保护。"""
+    user_id, project_id = _seed_user_and_project(db_engine)
+    with Session(db_engine) as session:
+        session.add(
+            ChapterCard(
+                user_id=user_id,
+                project_id=project_id,
+                chapter_number=3,
+                stage_number=None,
+            )
+        )
+        session.commit()
+
+    async with async_session_maker() as session:
+        card = await chapter_card_repo.upsert_chapter_card(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            chapter_number=3,
+            stage_number=2,
+            what_happened="补偿投影",
+            character_changes="",
+            new_facts_clues="",
+            unresolved_hooks="",
+            end_state="",
+        )
+        await session.commit()
+        assert card.stage_number == 2
 
 
 # ---------- story_state_repo.upsert_story_state ----------

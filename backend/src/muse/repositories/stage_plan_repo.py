@@ -7,6 +7,8 @@ user_id 的全表入口。
 方法：
 - get_stage_plan：按幂等键 (user_id, project_id, stage_number) 取阶段规划（重进恢复读）。
 - get_latest_stage：取本作品当前最新阶段规划（stage_number 最大的一行，Story 4.7 阶段循环）。
+- list_all_by_project（5.3）：列出本作品**全部**阶段规划（stage_number 升序）——供
+  归档页按阶段分组渲染章节卡片列表。
 - upsert_stage_plan：get-or-create 落库阶段规划（幕后任务生成完成后写；重生成覆盖同行）。
 """
 
@@ -63,6 +65,59 @@ async def get_latest_stage(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def list_all_by_project(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> list[StagePlan]:
+    """列出本作品**全部**阶段规划（`stage_number` 升序，Story 5.3）。
+
+    按 (user_id, project_id) 取出全部 `stage_plan` 行，升序排列（阶段 1→N 自然顺序）。
+    租户守卫（user_id + project_id 二义合一），不泄露其他作品有无阶段（NFR3）。
+    无任何阶段规划则返回空列表（非 None——`archive_service` 按「尚无阶段」处理）。
+    与 `get_latest_stage` 的区别：本方法取全部阶段、不限数、不降序。
+    """
+    stmt = (
+        select(StagePlan)
+        .where(
+            StagePlan.user_id == user_id,
+            StagePlan.project_id == project_id,
+        )
+        .order_by(StagePlan.stage_number.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def locate_stage_for_chapter(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    chapter_number: int,
+) -> StagePlan | None:
+    """按全书连续 chapter_number 定位所属阶段（Story 5.3 稳定归属投影）。
+
+    `stage_plan.chapters` 的章号在每个阶段内部从 1 重置，chapter 表/章节卡则用全书连续
+    chapter_number。按 stage_number 升序累计每段计划章数，找到覆盖目标章号的第一阶段。
+    无规划、chapter_number < 1 或超出全部规划范围均返回 None，由 service 统一转 400。
+
+    该函数仅在**首次投影**时用当前计划给章节卡定归属；已存在 chapter_card 的重跑不调用
+    它重写历史归属，避免计划重生成后出现重映射。
+    """
+    if chapter_number < 1:
+        return None
+    number_offset = 0
+    for plan in await list_all_by_project(
+        session, user_id=user_id, project_id=project_id
+    ):
+        number_offset += len(plan.chapters or [])
+        if chapter_number <= number_offset:
+            return plan
+    return None
 
 
 async def upsert_stage_plan(

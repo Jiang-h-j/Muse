@@ -78,6 +78,12 @@ class ChapterCard(Base, UUIDPKMixin, TimestampMixin):
     # 共同构成幂等键。
     chapter_number: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # 定稿时所属的阶段编号（Story 5.3 review patch）：归档卡的不可变历史归属。
+    # 不把它纳入唯一键——一作品一章一卡仍只由 chapter_number 决定；重跑投影必须保留
+    # 首次写入的归属，不能因后续重生成阶段计划而重映射历史章节。列可空仅为兼容本迁移
+    # 前既有卡片：迁移会按当时 plan 尽力回填，无法可靠回填的遗留卡由归档 API 单列展示。
+    stage_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
     # ---------- 章节归档五要素（Text NOT NULL server_default=""） ----------
     # 「必备但允许空串」先例（story_bible 主干列 / story_clue.value）：投影 LLM
     # 某要素产空也能落库。
