@@ -10,6 +10,8 @@
 - list_recent_chapters：取本作品编号 < before_number 的最近若干**已定稿**章（context-agent
   写前上下文注入前序章节，AC4）。按 chapter_number 降序、limit N，只取 status='finalized'
   （Story 4.7 FR21）。
+- list_chapters_by_project：取本作品全部章节（Story 6.1 通读视图组装已定稿章节 + hasUnfinalized
+  标记），按 chapter_number 升序。status 过滤交调用方（service），repo 不预定 finalized。
 """
 
 import uuid
@@ -112,6 +114,31 @@ async def list_recent_chapters(
         )
         .order_by(Chapter.chapter_number.desc())
         .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_chapters_by_project(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> list[Chapter]:
+    """按 (user_id, project_id) 列出全章节，按 chapter_number 升序（Story 6.1）。
+
+    通读视图消费：service 取全量后自行二分（finalized 入 chapters 数组、其他状态置
+    hasUnfinalized=True）。**status 不在 repo 层过滤**——service 需要同时拿到两种状态，
+    若 repo 只查 finalized 则需两次 SQL。租户守卫（user_id + project_id 双条件，NFR3）。
+    无章节时返空列表（新作品 / 全未生成）。
+    """
+    stmt = (
+        select(Chapter)
+        .where(
+            Chapter.user_id == user_id,
+            Chapter.project_id == project_id,
+        )
+        .order_by(Chapter.chapter_number.asc())
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())

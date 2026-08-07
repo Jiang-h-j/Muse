@@ -10,12 +10,14 @@ from muse.core.db import engine
 from muse.core.errors import register_exception_handlers
 from muse.core.settings import get_settings
 from muse.routers import (
+    archive,
     auth,
     byok,
     chapter,
     exploration,
     health,
     projects,
+    readthrough,
     story,
     tasks,
     usage,
@@ -53,6 +55,8 @@ def create_app() -> FastAPI:
     app.include_router(usage.router)
     app.include_router(tasks.router)
     app.include_router(chapter.router)
+    app.include_router(archive.router)
+    app.include_router(readthrough.router)
     return app
 
 

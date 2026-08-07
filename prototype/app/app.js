@@ -285,7 +285,11 @@ let chapterAnnotationFocus = null;
 let chapterFinalized = false;
 let chapterCreationIndex = 0;
 let archiveDialogOpen = false;
-// UX-ALIGN-01 新增四页的会话级状态（文风锚点 / BYOK 用量 / 阶段交界方向输入）
+let archiveData = null;
+let archiveLoadState = "loading"; // loading | ready | error
+let archiveErrorText = "";
+let archiveProjectId = null;
+let archiveLoadSeq = 0;
 let styleAnchorTab = "library";
 let styleAnchorSelected = null;
 let styleAnchorPasteText = "";
@@ -320,9 +324,7 @@ function persistNextStageTask(projectId, taskId) {
 function clearNextStageTask() {
   window.sessionStorage.removeItem(nextStageTaskKey);
 }
-// 通读视图分页：章内按页翻阅（每页若干段），翻过本章末页进入下一章。
-let readthroughChapterIndex = 0;
-let readthroughPageIndex = 0;
+// 通读视图分页游标声明移至「全本通读视图」区（Story 6.1 起与 readthroughLoadState 同源）。
 let archiveSelectedChapter = 0;
 let archiveSelectedStage = 0;
 let archiveCollapsedStages = new Set();
@@ -3768,189 +3770,81 @@ function bindChapterCreationInteractions() {
     });
 }
 
-function archiveSummaryFor(index) {
-  if (index === 0) {
-    return [
-      [
-        "本章发生了什么",
-        "程野收到一封来自未来的匿名信，信中再次出现被所有人遗忘的姐姐程岚。他循着已经停用的邮戳进入地下档案库，发现一条本不存在的走廊。",
-      ],
-      [
-        "人物变化",
-        "程野从被动保存记忆，转为主动验证姐姐存在过的痕迹；他第一次决定用行动对抗周围人的否认。",
-      ],
-      [
-        "新增事实与线索",
-        "未来日期的邮戳、会浮现文字的信纸、第七码头邮局，以及照片中来自未来的另一个程野。",
-      ],
-      [
-        "尚未解决的悬念",
-        "是谁寄出了信？程岚为何仍能留下痕迹？照片里的另一个程野经历了什么？",
-      ],
-      [
-        "章末状态",
-        "程野打开标有未来日期的档案抽屉，并在黑暗中再次听见程岚的声音，已经无法回到原来的日常。",
-      ],
-    ];
-  }
-  return [
-    [
-      "本章发生了什么",
-      "主角沿着上一章留下的线索继续调查，并遭遇新的异常证据。",
-    ],
-    ["人物变化", "主角对自身记忆的信任进一步动摇，但仍选择继续追查。"],
-    ["新增事实与线索", "新的证据把故事推向阶段计划中的下一次关键选择。"],
-    ["尚未解决的悬念", "异常现象背后的规则与行动者仍未完全显现。"],
-    ["章末状态", "主角付出新的代价，进入下一章无法回避的冲突。"],
-  ];
-}
-
-function archiveStagesForPreview(stagePlan) {
-  // Story 4.3（review）：chapterStagePlan() 删 mock 后可能返 null（归档路由不加载 currentStagePlan，
-  // 刷新直达/登出后进归档时为 null）。归档页本体属 4.5-4.7（第二阶段仍是占位 mock），本 story 只做
-  // null 兜底防白屏，不扩范围接真实归档数据。
-  // F6 review patch：GET stage-plan 自 4.7 起返回 latest（当前所处阶段）——若用户在第 k 阶段末章
-  // 定稿进归档，stagePlan.chapters 是「第 k 阶段」骨架但仍按硬编码「第一阶段」展示。改为按
-  // stagePlan.stageNumber 渲染真实阶段号；stageNumber 缺省（旧 mock / 未加载）回落「第一阶段」。
-  const firstStageChapters = (stagePlan && stagePlan.chapters) || [];
-  const currentStageNumber = (stagePlan && stagePlan.stageNumber) || 1;
-  return [
-    {
-      title: `第 ${currentStageNumber} 阶段`,
-      chapters: firstStageChapters,
-      completedCount: Math.min(
-        chapterCreationIndex + 1 - stageChapterOffset,
-        firstStageChapters.length,
-      ),
-      numberOffset: stageChapterOffset,
-      preview: false,
-    },
-    {
-      title: "第二阶段",
-      chapters: [
-        {
-          title: "决裂的地图",
-          brief: "主角发现城市的变化并非随机，而是有人在借此抹去特定的人。",
-        },
-        {
-          title: "雨停之前",
-          brief: "一场短暂的停雨让被隐藏的旧城轮廓重新显现。",
-        },
-        {
-          title: "被替换的清晨",
-          brief: "主角醒来后发现同伴已经站到了另一套记忆一边。",
-        },
-        {
-          title: "留下名字的人",
-          brief: "主角必须决定保住真相，还是保住仍记得自己的人。",
-        },
-      ],
-      completedCount: 2,
-      numberOffset: firstStageChapters.length,
-      preview: true,
-    },
-  ];
-}
-
 function chapterArchiveDialogMarkup(stage, stageIndex, index) {
-  const chapter = stage.chapters[index];
-  const globalNumber = stage.numberOffset + index + 1;
-  const items = archiveSummaryFor(stageIndex === 0 ? index : -1)
+  const chapter = stage.chapterCards[index];
+  if (!chapter) return "";
+  const items = [
+    ["本章发生了什么", chapter.whatHappened],
+    ["人物变化", chapter.characterChanges],
+    ["新增事实与线索", chapter.newFactsClues],
+    ["尚未解决的悬念", chapter.unresolvedHooks],
+    ["章末状态", chapter.endState],
+  ]
     .map(
       ([label, text], itemIndex) =>
-        `<section><span>${String(itemIndex + 1).padStart(2, "0")} / ${label}</span><p>${text}</p></section>`,
+        `<section><span>${String(itemIndex + 1).padStart(2, "0")} / ${label}</span><p>${escapeHtml(text || "尚未记录")}</p></section>`,
     )
     .join("");
   return `<div class="archive-dialog-backdrop" data-close-archive-dialog>
     <section class="archive-dialog" role="dialog" aria-modal="true" aria-labelledby="archive-dialog-title">
-      <header><div><span>${stage.title} / Chapter ${String(globalNumber).padStart(2, "0")}</span><h2 id="archive-dialog-title">${escapeHtml(chapter.title)}</h2><p>${escapeHtml(chapter.brief)}</p></div><button type="button" aria-label="关闭章节归档" data-close-archive-dialog>×</button></header>
+      <header><div><span>${escapeHtml(stage.title)} / Chapter ${String(chapter.chapterNumber).padStart(2, "0")}</span><h2 id="archive-dialog-title">${escapeHtml(chapter.title)}</h2><p>${escapeHtml(chapter.brief)}</p></div><button type="button" aria-label="关闭章节归档" data-close-archive-dialog>×</button></header>
       <div class="archive-dialog-body">${items}</div>
       <footer><span>这份归档将作为后续章节创作的长期上下文。</span><button type="button" data-close-archive-dialog>返回章节归档</button></footer>
     </section>
   </div>`;
 }
 
-function archiveStageGroupMarkup(stage, stageIndex) {
+function archiveStageGroupMarkup(stage, stageIndex, nextChapterNumber) {
   const isCollapsed = archiveCollapsedStages.has(stageIndex);
-  const completedCards = stage.chapters
-    .slice(0, stage.completedCount)
-    .map((chapter, index) => {
-      const globalNumber = stage.numberOffset + index + 1;
-      return `<button class="archive-chapter-card" type="button" data-open-archive-stage="${stageIndex}" data-open-archive-chapter="${index}">
-        <div><span>${String(globalNumber).padStart(2, "0")}</span><em>已定稿</em></div>
+  const completedCards = stage.chapterCards
+    .map(
+      (chapter, index) => `<button class="archive-chapter-card" type="button" data-open-archive-stage="${stageIndex}" data-open-archive-chapter="${index}">
+        <div><span>${String(chapter.chapterNumber).padStart(2, "0")}</span><em>已定稿</em></div>
         <h2>${escapeHtml(chapter.title)}</h2>
         <p>${escapeHtml(chapter.brief)}</p>
         <footer><span>查看章节归档</span><strong>→</strong></footer>
-      </button>`;
-    })
+      </button>`,
+    )
     .join("");
-  const nextIndex = stage.completedCount;
-  const globalNextNumber = stage.numberOffset + nextIndex + 1;
-  const nextCard =
-    nextIndex < stage.chapters.length
-      ? `<button class="archive-next-card" type="button" ${stage.preview ? "data-preview-next-stage" : `data-start-next-chapter="${nextIndex}"`}>
-          <div><span>${stage.preview ? "Layout preview" : "Next chapter"}</span><strong>${String(globalNextNumber).padStart(2, "0")}</strong></div>
-          <h2>${escapeHtml(stage.chapters[nextIndex].title)}</h2>
-          <p>${escapeHtml(stage.chapters[nextIndex].brief)}</p>
-          <footer><span>开始创作第 ${String(globalNextNumber).padStart(2, "0")} 章</span><strong>→</strong></footer>
+  const remaining =
+    stage.missing > 0
+      ? `<button class="archive-next-card" type="button" data-start-next-chapter="${nextChapterNumber}">
+          <div><span>续写下一章</span><strong>${String(nextChapterNumber).padStart(2, "0")}</strong></div>
+          <h2>还有 ${stage.missing} 章等待写下</h2>
+          <p>新的章节会在定稿后自动归入这里。</p>
+          <footer><span>续写下一章</span><strong>→</strong></footer>
         </button>`
-      : `<button class="archive-next-card" type="button"><div><span>Next stage</span><strong>＋</strong></div><h2>${stage.title}已经完成</h2><p>带着已经写下的故事，继续探索下一阶段。</p><footer><span>规划下一阶段</span><strong>→</strong></footer></button>`;
+      : "";
   return `<section class="archive-stage-group ${isCollapsed ? "is-collapsed" : ""}">
     <header class="archive-stage-row-head">
       <button class="archive-stage-toggle" type="button" data-toggle-archive-stage="${stageIndex}" aria-expanded="${!isCollapsed}" aria-controls="archive-stage-panel-${stageIndex}">
-        <div><span>Stage / ${String(stageIndex + 1).padStart(2, "0")}</span><h2>${stage.title}</h2></div>
-        <span class="archive-stage-state"><em>${String(stage.completedCount).padStart(2, "0")} 章已归档${stage.preview ? " · 排版预览" : ""}</em><strong aria-hidden="true">${isCollapsed ? "↓" : "↑"}</strong></span>
+        <div><span>Stage / ${String(stage.stageNumber).padStart(2, "0")}</span><h2>${escapeHtml(stage.title)}</h2></div>
+        <span class="archive-stage-state"><em>${String(stage.completedCount).padStart(2, "0")} 章已归档</em><strong aria-hidden="true">${isCollapsed ? "↓" : "↑"}</strong></span>
       </button>
     </header>
     <div class="archive-stage-collapse" id="archive-stage-panel-${stageIndex}">
       <div class="archive-stage-collapse-inner">
-        <div class="archive-stage-spread ${stage.completedCount === 1 ? "is-sparse" : ""}" aria-label="${stage.title}章节卡片">${completedCards}${nextCard}</div>
+        <div class="archive-stage-spread ${stage.completedCount === 1 ? "is-sparse" : ""}" aria-label="${escapeHtml(stage.title)}章节卡片">${completedCards || '<p class="archive-empty-stage">这一阶段还没有定稿章节。</p>'}${remaining}</div>
       </div>
     </div>
   </section>`;
 }
 
-// 归档页缺省的设定圣经占位（未确认设定时使用，风格与归档 mock 一致）
-const archiveStoryProfileFallback = [
-  {
-    label: "一句话构想",
-    value:
-      "一个在雨夜里收到未来来信的人，为了找回被所有人遗忘的姐姐，必须对抗一座不断替换过去的城市。",
-  },
-  {
-    label: "主角",
-    value:
-      "程野，档案室管理员。执拗地保存着关于姐姐程岚的记忆，是城里唯一不肯承认她“从未存在”的人。",
-  },
-  {
-    label: "核心冲突",
-    value:
-      "越接近真相，他就越难相信自己的记忆；每一次推进都会带来无法轻易撤销的代价。",
-  },
-  {
-    label: "世界与氛围",
-    value:
-      "潮湿的旧城、凌晨将熄未熄的路灯，以及会自行改写的过去。世界规则先以反常细节显现，再逐步揭露边界。",
-  },
-  {
-    label: "叙事风格",
-    value:
-      "以人物视角缓慢逼近真相，减少直接解释，让冲突通过选择、停顿与细节自然显现。",
-  },
-];
-
 function archiveStoryProfileMarkup() {
-  const profile =
-    confirmedStoryProfile && confirmedStoryProfile.length
-      ? confirmedStoryProfile
-      : archiveStoryProfileFallback;
+  const profile = archiveData && archiveData.profileFields;
+  const collapsed = archiveProfileCollapsed;
+  if (!archiveData || !archiveData.profileConfirmed || !profile || !profile.length) {
+    return `<section class="archive-story-profile archive-stage-group" aria-labelledby="archive-profile-title">
+      <header class="archive-stage-row-head"><div><span>设定圣经</span><h2 id="archive-profile-title">尚未确认故事设定</h2></div><span class="archive-stage-state"><em>0 项设定</em></span></header>
+      <div class="archive-stage-collapse"><div class="archive-stage-collapse-inner"><p class="archive-empty-stage">确认故事设定后，它会在这里成为整部作品的只读依据。</p></div></div>
+    </section>`;
+  }
   const items = profile
     .map(
       (field, index) =>
         `<section class="archive-profile-item"><span>${String(index + 1).padStart(2, "0")} / ${escapeHtml(field.label)}</span><p>${escapeHtml(field.value)}</p></section>`,
     )
     .join("");
-  const collapsed = archiveProfileCollapsed;
   return `<section class="archive-story-profile archive-stage-group ${collapsed ? "is-collapsed" : ""}" aria-labelledby="archive-profile-title">
     <header class="archive-stage-row-head">
       <button class="archive-stage-toggle" type="button" data-toggle-archive-profile aria-expanded="${!collapsed}" aria-controls="archive-profile-panel">
@@ -3966,36 +3860,89 @@ function archiveStoryProfileMarkup() {
   </section>`;
 }
 
+function loadChapterArchive(projectId) {
+  const requestSeq = ++archiveLoadSeq;
+  archiveProjectId = projectId;
+  archiveData = null;
+  archiveErrorText = "";
+  archiveLoadState = "loading";
+  archiveDialogOpen = false;
+  archiveCollapsedStages = new Set();
+  archiveStagesInitialized = false;
+  renderChapterArchive();
+  archiveApi
+    .get(projectId)
+    .then((data) => {
+      if (
+        requestSeq !== archiveLoadSeq ||
+        hashPath() !== `#/projects/${projectId}/archive`
+      )
+        return;
+      archiveData = data;
+      archiveLoadState = "ready";
+      renderChapterArchive();
+    })
+    .catch((err) => {
+      if (
+        requestSeq !== archiveLoadSeq ||
+        hashPath() !== `#/projects/${projectId}/archive`
+      )
+        return;
+      archiveData = null;
+      archiveLoadState = "error";
+      archiveErrorText =
+        err && err.code === "project_not_found"
+          ? "这本小说已不存在。"
+          : "连接恢复后可以重新加载，不会影响已经保存的内容。";
+      renderChapterArchive();
+    });
+}
+
 function renderChapterArchive() {
-  const stagePlan = chapterStagePlan();
-  const stages = archiveStagesForPreview(stagePlan);
-  // 首次进入归档页时，把所有阶段默认预置为收起；之后由用户自由展开/收起。
-  if (!archiveStagesInitialized) {
+  const stages = (archiveData && archiveData.stages) || [];
+  // AC1 首屏全收起：仅当阶段数据真正就绪（stages 非空）时才初始化收起。loadChapterArchive
+  // 会先以 loading 空态渲染一次，若此时就置 initialized=true，等 API ready 拿到 stages 时便
+  // 不再收起，导致阶段默认展开（Story 5.3 未做浏览器验证漏掉的竞态）。
+  if (!archiveStagesInitialized && stages.length > 0) {
     stages.forEach((_, index) => archiveCollapsedStages.add(index));
     archiveStagesInitialized = true;
   }
-  const stageGroups = stages
-    .map((stage, index) => archiveStageGroupMarkup(stage, index))
-    .join("");
   const completedCount = stages.reduce(
     (total, stage) => total + stage.completedCount,
     0,
   );
   document.title = `章节归档 · ${explorationTitle}`;
+  let archiveBody = "";
+  if (archiveLoadState === "loading") {
+    archiveBody = `<div class="chapter-generating"><span class="spinner" aria-hidden="true"></span><p>正在读取已经写下的故事……</p></div>`;
+  } else if (archiveLoadState === "error") {
+    archiveBody = `<div class="chapter-empty"><h2>暂时无法读取章节归档。</h2><p>${escapeHtml(archiveErrorText || "连接恢复后可以重新加载，不会影响已经保存的内容。")}</p><button type="button" data-retry-archive>重新加载</button></div>`;
+  } else {
+    const stageGroups = stages
+      .map((stage, index) =>
+        archiveStageGroupMarkup(stage, index, completedCount + 1),
+      )
+      .join("");
+    archiveBody = `${archiveStoryProfileMarkup()}<div class="archive-stage-collection">${stageGroups || '<p class="archive-empty-stage">还没有可查看的章节归档。</p>'}</div>`;
+  }
   app.innerHTML = `<div class="chapter-archive-page">
     <header class="explore-header"><a class="explore-back" href="#/projects">← 作品</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>章节归档</span></div><div class="save-state"><i></i> ${String(completedCount).padStart(2, "0")} 章已归档</div></header>
     <main class="chapter-archive-main">
       <header class="chapter-archive-heading"><div><span>Chapter archive</span><h1>已经写下的故事</h1><p>章节按阶段分行归档，每个阶段直接呈现已经写下的故事记忆。</p></div></header>
-      ${archiveStoryProfileMarkup()}
-      <div class="archive-stage-collection">${stageGroups}</div>
+      ${archiveBody}
     </main>
-    ${archiveDialogOpen ? chapterArchiveDialogMarkup(stages[archiveSelectedStage], archiveSelectedStage, archiveSelectedChapter) : ""}
+    ${archiveLoadState === "ready" && archiveDialogOpen ? chapterArchiveDialogMarkup(stages[archiveSelectedStage], archiveSelectedStage, archiveSelectedChapter) : ""}
   </div>`;
-  document.body.classList.toggle("dialog-open", archiveDialogOpen);
+  document.body.classList.toggle("dialog-open", archiveLoadState === "ready" && archiveDialogOpen);
   bindChapterArchiveInteractions();
 }
 
 function bindChapterArchiveInteractions() {
+  document
+    .querySelector("[data-retry-archive]")
+    ?.addEventListener("click", () => {
+      if (archiveProjectId) loadChapterArchive(archiveProjectId);
+    });
   document
     .querySelector("[data-toggle-archive-profile]")
     ?.addEventListener("click", () => {
@@ -4032,10 +3979,11 @@ function bindChapterArchiveInteractions() {
       }
     });
   });
-  document
-    .querySelector("[data-start-next-chapter]")
-    ?.addEventListener("click", (event) => {
-      chapterCreationIndex = Number(
+  document.querySelectorAll("[data-start-next-chapter]").forEach((card) => {
+    card.addEventListener("click", (event) => {
+      // dataset 携带真实推导的下一章全局 1-based 章号（= 已归档总章数 + 1）；路由分发
+      // （chapterMatch）会据 URL 的 N 反解 chapterCreationIndex，故此处只需把正确章号写进 URL。
+      const nextChapterNumber = Number(
         event.currentTarget.dataset.startNextChapter,
       );
       chapterCreationState = "input";
@@ -4051,17 +3999,11 @@ function bindChapterArchiveInteractions() {
       chapterAnnotationDraft = "";
       chapterAnnotationFocus = null;
       chapterFinalized = false;
-      // Story 4.7：真实 projectId 替换 demo（归档页本体仍 mock，归 Epic 5 Story 5.3；此处只
-      // 修死链，跳转 projectId 用真实值）。
-      const nextProjectId = chapterProjectId || explorationProjectId || "demo";
-      location.hash = `#/projects/${nextProjectId}/chapters/${chapterCreationIndex + 1}`;
+      // 归档页从真实 API 直达（可不经章节创作页），projectId 用加载时存下的真实
+      // archiveProjectId，勿用 chapterProjectId||explorationProjectId||"demo" 旧兜底链。
+      location.hash = `#/projects/${archiveProjectId}/chapters/${nextChapterNumber}`;
     });
-  document
-    .querySelector("[data-preview-next-stage]")
-    ?.addEventListener("click", (event) => {
-      event.currentTarget.querySelector("footer span").textContent =
-        "第二阶段为多阶段排版预览";
-    });
+  });
 }
 
 function bindAuthInteractions() {
@@ -4573,72 +4515,40 @@ function bindInlineProjectActions(row) {
 }
 
 // ============================================================
-// 全本通读视图（FR26 / 模块 5 · V1）
-// 按顺序连续呈现已定稿章节，让用户从头读一遍自己的书。原型此前无此页。
-// 章节数据为线框占位（真实数据由后端定稿章节提供）。
+// 全本通读视图（FR26 / 模块 5 · Story 6.1 V1）
+// 按顺序连续呈现已定稿章节，让用户从头读一遍自己的书。原型此前无此页，
+// Story 6.1 起接入真实后端 `GET /api/projects/:id/readthrough`（dissolved mock）。
+// 后端按 READTHROUGH_PER_PAGE=6 段/页切好 pages[i][j] 直发（AC7 陷阱⑧：
+// 前端不做二次分页），前端只渲染 `pages[pageIndex]`。
 // ============================================================
-const readthroughChapters = [
-  {
-    title: "打破日常",
-    paragraphs: [
-      "雨是在凌晨两点十七分落下来的，比程野记忆中的任何一场雨都更安静。",
-      "他关掉桌上的台灯，准备离开档案室时，门缝里忽然多出了一只没有署名的信封。纸面已经湿透，边缘却没有留下任何被人捏过的痕迹。",
-      "信封里只有一页纸。第一行写着他的名字，第二行写着一个早已被所有人否认的名字——程岚，他失踪了十二年的姐姐。",
-      "程野把那张纸翻到背面。那里印着一枚已经停用多年的邮戳，日期却是三天以后。他以为自己看错了，伸手擦过墨迹，指腹沾上一点尚未干透的蓝色。",
-      "纸页最下方原本空白的位置渐渐浮出一行小字，像有人正隔着雨夜写给他：不要相信明天醒来的自己。",
-      "他把信重新折好，动作比自己预想的要慢。窗外的雨还在下，档案室的钟指向两点十九分，仿佛刚才那两分钟从未真正走过。",
-      "他做的第一件事，是把档案室里所有的钟都记了一遍。墙上的、桌角的、还有腕表上那只——三只钟指向的分秒竟不完全一致，走得最快的那只，已经偏向了两天以后。",
-      "程野想起姐姐失踪的那夜也下着这样的雨。她站在门口回头，说这座城市会一点点把人从别人的记忆里擦掉：先是名字，然后是脸，最后连‘她曾经存在过’这件事，都不再剩下。",
-      "‘可只要还有一个人记得，’程岚当时笑了笑，‘被擦掉的那一块，就还留着一条缝。’那年他十四岁，把这句话当作姐姐惯常的胡话，随手丢在了脑后。",
-      "十二年过去，他成了整座城市里唯一还守着那条缝的人。而这封信，正是从缝里递进来的——他几乎可以确定。",
-      "他重新拧亮台灯，借着光又读了一遍那行浮字。墨迹已经开始变淡，像是写下它的人，也正被同一场遗忘缓缓收回。",
-      "离开时程野没有锁门。他忽然觉得，在这座会自行改写的城市里，锁与不锁，大概从来就没有分别。雨声盖过下楼的脚步，档案室的钟，无声地跳到了两点二十分。",
-    ],
-  },
-  {
-    title: "不存在的证明",
-    paragraphs: [
-      "走廊尽头传来值班员的脚步声。程野下意识把信藏进外套，可对方经过门口时只是看了他一眼，像往常一样问：“你还在查那个不存在的人？”",
-      "这句话他听过太多次。十二年前，程岚的房间在一夜之间变成了储物间，学校的名册里没有她的名字，连父母都坚称自己只有一个孩子。",
-      "只有程野记得姐姐离开前说，这座城市每天都在悄悄替换一部分过去。而他，是唯一一个还留着旧版本记忆的人。",
-      "他径直走向地下档案库。那枚邮戳属于旧城第七码头的临时邮局，而那间邮局早在九年前的火灾中被拆除。",
-      "电梯下降时，楼层数字在负二层和负三层之间闪烁了一下。门打开后，原本封闭的走廊尽头亮着一盏陌生的绿灯。",
-      "程野站在门口没有立刻进去。绿光越过他的鞋尖，在地面映出两个人的影子，可整条走廊里分明只有他一个人。",
-      "他弯腰去碰那第二道影子。指尖穿过去，只触到冰凉的地面，影子却没有随之晃动，像是它属于另一个正站在同样位置、却与他错开了一点时间的人。",
-      "走廊两侧的档案柜都空着，唯独尽头那只亮着绿灯的柜子上贴着一张借阅卡。卡上的借阅人一栏，写着他自己的名字，归还日期同样是三天以后。",
-      "程野翻开随身的记事本，想记下这一切。可落笔时他发现，本子里前几页的字迹正在缓慢褪色——那些是他昨天才写下的、关于姐姐的线索。",
-      "他忽然明白过来：这座城市擦除一个人，不是让别人忘记，而是让所有能证明她存在的东西一起消失。信、照片、他手写的字，都是与遗忘赛跑的证据。",
-      "绿灯闪了两下，像在回应他的领悟。程野把记事本按在胸口，逼着自己一笔一划重新描过那些正在变淡的字，仿佛只要描得够用力，姐姐就还留在这世上。",
-      "他决定顺着借阅卡的指引走下去。既然三天以后的自己借走过这里的东西，那么在那之前，他还有时间把姐姐从这场缓慢的抹除里，一寸一寸抢回来。",
-    ],
-  },
-  {
-    title: "代价显现",
-    paragraphs: [
-      "绿灯下面是一排他从未见过的档案柜。每只抽屉上都贴着日期，最靠近门口的那一格，写的正是三天以后。",
-      "程野拉开抽屉，里面只有一张雨水浸过的照片。照片上，他和程岚并肩站在第七码头，身后的电子钟显示着明天凌晨两点十七分。",
-      "更让他无法移开视线的是照片右下角。那里站着另一个程野，隔着十二年的雨幕望向镜头，手里握着一只没有署名的信封。",
-      "头顶的灯忽然熄灭。黑暗里，有人贴近他的耳边，用程岚的声音轻声说：“你终于还是选择打开了它。”",
-      "程野攥紧照片。远处传来整齐的钟声，一共十三下——这座城市从来只有十二座钟。",
-      "第十三声钟响落下时，黑暗里那道声音又贴近了些：“记得，是要付代价的。你替她记了十二年，这十二年里，你自己丢了什么，从没算过吧。”",
-      "他这才意识到，自己想不起父母的脸了。不是模糊，是彻底的空白——就像当年别人想不起程岚那样。原来守着那条缝的人，也会被缝一点点吞掉。",
-      "照片在他掌心里发烫。画面开始变动：另一个程野转过身，把那只信封递向镜头，口型分明是‘别记了’，可程野知道，自己永远做不到。",
-      "绿灯彻底熄灭。伸手不见五指的档案库里，只剩下十三声钟的余音，和他自己越来越轻、仿佛也要被抹去的呼吸。",
-      "程野摸黑把照片贴身收好，又摸出那封信，两样东西一起攥在手里。它们是他与整座城市对赌的全部筹码——只要还攥着，他就还没输。",
-      "他开始往回走，一步一数。数到第十七步时，走廊尽头透进一线灰白的光，是通往地面的楼梯口，也是三天倒计时真正开始的地方。",
-      "登上最后一级台阶，雨已经停了。天边泛起病态的青灰色，像一张被反复擦写、终于露出底纹的纸。程野抬头，看见城中十二座钟楼在晨雾里静静矗立。",
-      "可他分明听见，从某个看不见的方向，第十三座钟正在为他一个人，敲响倒数第三天的第一声。他握紧了手里的信和照片，朝那声音走了过去。",
-    ],
-  },
-];
 
+// 与后端 chapter_service.READTHROUGH_PER_PAGE 保持一致（仅用于断言/展示；
+// 真正的分页在后端完成，本常数仅供参考）。
 const READTHROUGH_PER_PAGE = 6;
 
+// 通读视图状态机 + 异步数据驱动（仿 archiveLoadState/loadChapterArchive / 7.3 作品库范式）。
+// idle=未加载（路由初进会转 loading）；loading=拉取中（spinner）；ready=拿到响应；
+// error=失败（保留重试按钮）。readthroughData 缓存最近一次响应（{project, chapters,
+// totalChapters, hasUnfinalized}）；空章数组（totalChapters=0）触发 AC6 空态。
+let readthroughLoadState = "idle"; // idle | loading | ready | error
+let readthroughProjectId = null; // 当前通读路由对应的作品 id（校验路由守卫用）
+let readthroughData = null; // ReadthroughResponse | null
+let readthroughErrorText = "";
+let readthroughLoadSeq = 0; // 拉取代次，防在途赛跑（同 archiveLoadSeq / 7.3 projectsLoadSeq）
+
+// 章内/跨章翻页游标（与原型 readthroughPages 切页算法对齐）。
+let readthroughChapterIndex = 0;
+let readthroughPageIndex = 0;
+
+function readthroughChapters() {
+  // 统一从 readthroughData 取章列表——所有渲染/交互共用此入口；空态返 []。
+  return (readthroughData && readthroughData.chapters) || [];
+}
+
 function readthroughPages(chapter) {
-  const pages = [];
-  for (let i = 0; i < chapter.paragraphs.length; i += READTHROUGH_PER_PAGE) {
-    pages.push(chapter.paragraphs.slice(i, i + READTHROUGH_PER_PAGE));
-  }
+  // 后端已按 READTHROUGH_PER_PAGE 切好 pages，直接读 chapter.pages；
+  // 防御空章（totalPages=0）→ 返 [[]] 让翻页 disabled 态正常显示。
+  const pages = (chapter && chapter.pages) || [];
   return pages.length ? pages : [[]];
 }
 
@@ -5155,22 +5065,123 @@ function bindByokUnbind() {
   });
 }
 
+// Story 6.1 AC1/AC6：进通读路由时统一从后端拉一次（每次进入都刷新——同 archive）。
+// 异步数据驱动（仿 loadChapterArchive / loadProjects）：直接 submit 态渲染 spinner，
+// 完成后按结果更新 readthroughLoadState 并重绘 renderReadthrough。多 tab/快速切换
+// 由 readthroughLoadSeq 代次守卫；路由已切走的回包丢弃不写脏态。
+function loadReadthrough(projectId) {
+  const requestSeq = ++readthroughLoadSeq;
+  readthroughProjectId = projectId;
+  readthroughLoadState = "loading";
+  readthroughData = null;
+  readthroughErrorText = "";
+  readthroughChapterIndex = 0;
+  readthroughPageIndex = 0;
+  renderReadthrough();
+  readthroughApi
+    .get(projectId)
+    .then((data) => {
+      if (
+        requestSeq !== readthroughLoadSeq ||
+        hashPath() !== `#/projects/${projectId}/readthrough`
+      )
+        return;
+      readthroughData = data;
+      readthroughLoadState = "ready";
+      renderReadthrough();
+      // Subtask 3.2：进入通读页直接置 document.title；后续翻页不重复刷（陷阱①）。
+      document.title = `通读 · ${escapeHtml(
+        (data && data.project && data.project.title) || "未命名小说",
+      )} · Muse`;
+    })
+    .catch((err) => {
+      if (
+        requestSeq !== readthroughLoadSeq ||
+        hashPath() !== `#/projects/${projectId}/readthrough`
+      )
+        return;
+      readthroughData = null;
+      readthroughLoadState = "error";
+      // Subtask 2.2 错误归并：404 → project 不存在；其他（含 401 已由 apiFetch 兜、
+      // 500、network）→ 统一可读文案。token 失效由 apiFetch 拦截器处理跳登录、不到本分支。
+      readthroughErrorText =
+        err && err.code === "project_not_found"
+          ? "这本小说已不存在。"
+          : "通读加载失败，请稍后重试。";
+      renderReadthrough();
+    });
+}
+
 function renderReadthrough() {
-  const totalChapters = readthroughChapters.length;
+  const chapters = readthroughChapters();
+  const totalChapters = chapters.length;
+  const projectTitle =
+    (readthroughData && readthroughData.project && readthroughData.project.title) ||
+    explorationTitle;
+  const backHref = readthroughProjectId
+    ? `#/projects/${readthroughProjectId}/archive`
+    : "#/projects";
+
+  // ---- AC1 loading / error 分支：先统一的 spinner / 错误壳，再进入 ready 渲染。 ----
+  if (readthroughLoadState === "loading") {
+    document.title = `通读 · ${projectTitle} · Muse`;
+    app.innerHTML = `<div class="readthrough-page">
+      <header class="explore-header readthrough-header"><a class="explore-back" href="${backHref}">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(projectTitle)}</strong><span>通读</span></div></header>
+      <main class="readthrough-main">
+        <div class="chapter-generating"><span class="spinner" aria-hidden="true"></span><p>正在翻开你写下的书……</p></div>
+      </main>
+    </div>`;
+    return;
+  }
+  if (readthroughLoadState === "error") {
+    document.title = `通读 · ${projectTitle} · Muse`;
+    app.innerHTML = `<div class="readthrough-page">
+      <header class="explore-header readthrough-header"><a class="explore-back" href="${backHref}">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(projectTitle)}</strong><span>通读</span></div></header>
+      <main class="readthrough-main">
+        <div class="chapter-empty"><h2>暂无通读内容</h2><p>${escapeHtml(readthroughErrorText || "通读加载失败，请稍后重试。")}</p><button type="button" data-retry-readthrough>重新加载</button></div>
+      </main>
+    </div>`;
+    const retry = document.querySelector("[data-retry-readthrough]");
+    if (retry && readthroughProjectId) {
+      retry.addEventListener("click", () => loadReadthrough(readthroughProjectId));
+    }
+    return;
+  }
+
+  // ---- AC6 空态：作品存在但尚无已定稿章节（totalChapters=0）——非 404、非空白页。 ----
+  if (readthroughLoadState === "ready" && totalChapters === 0) {
+    document.title = `通读 · ${projectTitle} · Muse`;
+    app.innerHTML = `<div class="readthrough-page">
+      <header class="explore-header readthrough-header"><a class="explore-back" href="${backHref}">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(projectTitle)}</strong><span>通读</span></div></header>
+      <main class="readthrough-main">
+        <div class="chapter-empty readthrough-empty">
+          <h2>暂无通读内容</h2>
+          <p>还没有可通读的已定稿章节，继续创作吧。</p>
+        </div>
+      </main>
+    </div>`;
+    return;
+  }
+
+  // ---- ready 且有章节：渲染连续通读。 ----
   // 越界保护：选章/翻页后索引始终落在合法范围内。
   readthroughChapterIndex = Math.min(
     Math.max(0, readthroughChapterIndex),
     totalChapters - 1,
   );
-  const chapter = readthroughChapters[readthroughChapterIndex];
+  const chapter = chapters[readthroughChapterIndex];
   const pages = readthroughPages(chapter);
   readthroughPageIndex = Math.min(
     Math.max(0, readthroughPageIndex),
     pages.length - 1,
   );
+  // Subtask 3.3：chapterNo 从 1 起，'01' 两位补零；pageTotal 由后端 totalPages
+  // 或者前端读 pages.length 派生（一致；后端按 READTHROUGH_PER_PAGE 向上取整）。
   const chapterNo = String(readthroughChapterIndex + 1).padStart(2, "0");
   const pageNo = String(readthroughPageIndex + 1).padStart(2, "0");
-  const pageTotal = String(pages.length).padStart(2, "0");
+  const pageTotal = String(
+    (chapter && chapter.totalPages) || pages.length,
+  ).padStart(2, "0");
   // 是否处于全书首页 / 末页，用于禁用翻页按钮。
   const atBookStart =
     readthroughChapterIndex === 0 && readthroughPageIndex === 0;
@@ -5180,15 +5191,15 @@ function renderReadthrough() {
   const prose = pages[readthroughPageIndex]
     .map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`)
     .join("");
-  const chapterOptions = readthroughChapters
+  const chapterOptions = chapters
     .map(
       (item, index) =>
         `<option value="${index}" ${index === readthroughChapterIndex ? "selected" : ""}>第 ${String(index + 1).padStart(2, "0")} 章 · ${escapeHtml(item.title)}</option>`,
     )
     .join("");
-  document.title = `通读 · ${chapter.title} · Muse`;
+  document.title = `通读 · ${projectTitle} · Muse`;
   app.innerHTML = `<div class="readthrough-page">
-    <header class="explore-header readthrough-header"><a class="explore-back" href="#/projects/demo/archive">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(explorationTitle)}</strong><span>通读</span></div></header>
+    <header class="explore-header readthrough-header"><a class="explore-back" href="${backHref}">← 故事档案</a><div class="explore-project"><strong>${escapeHtml(projectTitle)}</strong><span>通读</span></div></header>
     <main class="readthrough-main">
       <article class="readthrough-reader" aria-live="polite">
         <div class="readthrough-chapter-meta"><span>第 ${chapterNo} 章</span><i></i><span>共 ${String(totalChapters).padStart(2, "0")} 章</span></div>
@@ -5206,6 +5217,9 @@ function renderReadthrough() {
     </main>
   </div>`;
   bindReadthroughInteractions();
+  // Subtask 3.2：跨页/跨章渲染后回到页首（顺序阅读不需保留内部滚动锚点）。
+  const main = document.querySelector(".readthrough-main");
+  if (main) main.scrollTop = 0;
 }
 
 function bindReadthroughInteractions() {
@@ -5219,13 +5233,12 @@ function bindReadthroughInteractions() {
   document.querySelectorAll("[data-readthrough-page]").forEach((button) => {
     button.addEventListener("click", () => {
       const direction = button.getAttribute("data-readthrough-page");
-      const pages = readthroughPages(
-        readthroughChapters[readthroughChapterIndex],
-      );
+      const chapters = readthroughChapters();
+      const pages = readthroughPages(chapters[readthroughChapterIndex]);
       if (direction === "next") {
         if (readthroughPageIndex < pages.length - 1) {
           readthroughPageIndex += 1;
-        } else if (readthroughChapterIndex < readthroughChapters.length - 1) {
+        } else if (readthroughChapterIndex < chapters.length - 1) {
           // 翻过本章末页 → 进入下一章第一页（跨章连续通读）。
           readthroughChapterIndex += 1;
           readthroughPageIndex = 0;
@@ -5237,7 +5250,7 @@ function bindReadthroughInteractions() {
           // 从本章首页往前 → 回到上一章末页。
           readthroughChapterIndex -= 1;
           readthroughPageIndex =
-            readthroughPages(readthroughChapters[readthroughChapterIndex])
+            readthroughPages(chapters[readthroughChapterIndex])
               .length - 1;
         }
       }
@@ -5255,6 +5268,12 @@ function render() {
   const archiveMatch = hashPath().match(/^#\/projects\/([^/]+)\/archive$/);
   const stageDirectionMatch = hashPath().match(
     /^#\/projects\/([^/]+)\/stage-direction$/,
+  );
+  // Story 6.1：通读视图（全新页面，FR26）。优先级与 explore/chapter/archive 同列；
+  // 匹配后 loadReadthrough 拉一次后端 → 渲染 loading→ready/error/empty 分支。**不要**
+  // 再保留旧的 `#/projects/demo/readthrough` 硬编码分支（那是原型 mock 占位）。
+  const readthroughMatch = hashPath().match(
+    /^#\/projects\/([^/]+)\/readthrough$/,
   );
   // review R2 P2：离开探索页时清理在途 SSE + 门禁（teardownExplorationInflight 原为死代码，此处挂载）。
   // 防 settle/interpret 在途时切走 → 流不 abort 连接悬挂 + 陈旧回调污染。teardown 不动 pending
@@ -5275,7 +5294,16 @@ function render() {
     // 每次进入作品库都重新拉取最新列表（新建/改名/删除后返回能看到变化）。
     projectsLoadState = "loading";
     renderProjects();
-  } else if (hashPath() === "#/projects/demo/readthrough") renderReadthrough();
+  } else if (readthroughMatch) {
+    // Story 6.1 AC1/AC6：消费路由真实 projectId（替换原型 demo 硬编码）。每次进入
+    // 都重新拉一次后端——章定稿/继续创作回到通读能看到最新进度。
+    const routeProjectId = readthroughMatch[1];
+    const routeProject = projects.find(
+      (project) => project.id === routeProjectId,
+    );
+    if (routeProject) explorationTitle = routeProject.title;
+    loadReadthrough(routeProjectId);
+  }
   else if (hashPath() === "#/settings/model-access") {
     // 每次进入设置页都重拉最新绑定态 + 用量（绑定/解绑后返回、跨账号都能看到变化）。
     byokLoadState = "loading";
@@ -5377,11 +5405,12 @@ function render() {
       loadFreeExploration(routeProjectId);
     }
   } else if (archiveMatch) {
+    const routeProjectId = archiveMatch[1];
     const archiveProject = projects.find(
-      (project) => project.id === archiveMatch[1],
+      (project) => project.id === routeProjectId,
     );
     if (archiveProject) explorationTitle = archiveProject.title;
-    renderChapterArchive();
+    loadChapterArchive(routeProjectId);
   } else if (chapterMatch) {
     const routeProjectId = chapterMatch[1];
     chapterCreationIndex = Math.max(0, Number(chapterMatch[2]) - 1);

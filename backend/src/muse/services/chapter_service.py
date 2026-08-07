@@ -39,7 +39,19 @@ from muse.repositories import (
     stage_plan_repo,
     story_bible_repo,
 )
-from muse.services import chapter_projection_service
+from muse.schemas.readthrough import (
+    ReadthroughChapter,
+    ReadthroughData,
+    ReadthroughProject,
+)
+from muse.services import chapter_projection_service, embedding_projection_service
+
+READTHROUGH_PER_PAGE = 6
+"""通读视图每页段数（Story 6.1 AC2/AC7，与 prototype/app/app.js:4579 常数一致）。
+
+唯一分页粒度参数；前端直接消费后端切好的 pages[i]，不再切页（**陷阱⑧：后端分页，
+前端不二次分页**）。若日后调整须同步前端（已约定通读视图不提供分页大小调整入口）。
+"""
 
 logger = logging.getLogger("muse")
 
@@ -50,6 +62,94 @@ def _project_not_found() -> ErrorEnvelope:
         code="project_not_found",
         message="作品不存在或无权访问。",
         http_status=404,
+    )
+
+
+def _split_pages(text: str, per_page: int = READTHROUGH_PER_PAGE) -> list[list[str]]:
+    """把章节正文按每 per_page 段切成 pages[i][j] 二维数组（Story 6.1 AC2/AC7，陷阱⑧）。
+
+    分段规则与前端 4.5 分页阅读「双换行 = 分段」一致（app.js chapterPages()）。
+    LLM 产物若只有单换行/无空行（防御），把单换行也视作分段符——不让整章塌成 1 段。
+    空章返 []（供前端空态分支识别）。
+    """
+    if not text:
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n\n" in normalized:
+        paragraphs = [p.strip() for p in normalized.split("\n\n") if p.strip()]
+    else:
+        paragraphs = [p.strip() for p in normalized.split("\n") if p.strip()]
+    return [paragraphs[i : i + per_page] for i in range(0, len(paragraphs), per_page)]
+
+
+async def get_readthrough_summary(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> ReadthroughData:
+    """组装通读视图聚合 payload（Story 6.1 AC1/AC4/AC5/AC6/AC7）。
+
+    1. 租户守卫：get_owned_project → None 抛 404 二义合一（NFR3）。
+    2. 取本作品**全部**章节（chapter_repo.list_chapters_by_project，按 chapter_number
+       升序）；状态二分：status="finalized" 的进 chapters、其他（draft）记 hasUnfinalized=True。
+       **读全量内存二分而非两次 SQL**（陷阱⑩）：draft 也要用来标 hasUnfinalized。
+    3. 章标题（AC2「第 NN 章 · title」）：chapter 表无 title 列（chapters JSONB 才有），
+       按 locate_stage_for_chapter 同款累计法——所有 stage_plan 升序累计 chapters 数，
+       第 N 章落在哪一段就取那段 chapters[序号-1].title；缺 title / 无规划 → 「第 N 章」兜底。
+    4. 分页（AC7 陷阱⑧）：每章 _split_pages(text, READTHROUGH_PER_PAGE)——后端切好
+       pages/totalPages 直发，前端不再二次分页。「双换行分段」与前端 4.5 分页阅读一致。
+    5. chapters.length=0 不报错、不 404（AC6 前端空态「还没有可通读的已定稿章节」）。
+
+    返回 ReadthroughData `{project, chapters, totalChapters, hasUnfinalized}`。
+    """
+    project = await project_repo.get_owned_project(session, project_id, user_id)
+    if project is None:
+        raise _project_not_found()
+
+    all_chapters = await chapter_repo.list_chapters_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+    stage_plans = await stage_plan_repo.list_all_by_project(
+        session, user_id=user_id, project_id=project_id
+    )
+
+    # 章号 → 章标题：按阶段累计法定位 stage_plan.chapters 内条目（复用 locate_stage_for_chapter
+    # 的累计策略）；chapter_number 超出全部规划时拿不到 title，兜底「第 N 章」。
+    chapter_titles: dict[int, str] = {}
+    offset = 0
+    for plan in stage_plans:
+        plan_chapters = plan.chapters or []
+        for idx, entry in enumerate(plan_chapters):
+            global_number = offset + idx + 1
+            title = (entry or {}).get("title") if isinstance(entry, dict) else None
+            if title:
+                chapter_titles[global_number] = str(title)
+        offset += len(plan_chapters)
+
+    finalized: list[ReadthroughChapter] = []
+    has_unfinalized = False
+    for ch in all_chapters:
+        if ch.status == "finalized":
+            pages = _split_pages(ch.text or "")
+            finalized.append(
+                ReadthroughChapter(
+                    chapter_number=ch.chapter_number,
+                    title=chapter_titles.get(
+                        ch.chapter_number, f"第 {ch.chapter_number} 章"
+                    ),
+                    pages=pages,
+                    total_pages=len(pages),
+                )
+            )
+        else:
+            has_unfinalized = True
+
+    return ReadthroughData(
+        project=ReadthroughProject(title=project.title or "未命名小说"),
+        chapters=finalized,
+        total_chapters=len(finalized),
+        has_unfinalized=has_unfinalized,
     )
 
 
@@ -479,7 +579,8 @@ async def finalize_chapter(
     if existing is None:
         raise _chapter_not_generated()
 
-    # 幂等：已定稿且 chapter_card 已落库 → 直接返回现行（投影已完成）。
+    # 已成功投影的定稿章节直接幂等返回。此路径不再依赖当前阶段计划，避免后来
+    # 重规划、删计划影响已经固定归属的历史章节。
     if existing.status == "finalized":
         card = await chapter_card_repo.get_by_chapter(
             session,
@@ -489,7 +590,27 @@ async def finalize_chapter(
         )
         if card is not None:
             return existing
-        # 已定稿但 chapter_card 缺失 → 视为「上次投影失败」→ 跳过 status 翻转直接走投影。
+
+    # 首次或补偿投影前固定章节归属。早期旧作品可能已有 chapter 正文却尚未落
+    # stage_plan，因此无任何规划时兼容写入第 1 阶段；有规划但目标章越界则拒绝，
+    # 且必须在 status=draft → finalized 提交前失败，不能留下错误定稿状态。
+    stage_plan = await stage_plan_repo.locate_stage_for_chapter(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        chapter_number=chapter_number,
+    )
+    if stage_plan is None:
+        existing_plans = await stage_plan_repo.list_all_by_project(
+            session, user_id=user_id, project_id=project_id
+        )
+        if existing_plans:
+            raise _chapter_out_of_range()
+        stage_number = 1
+    else:
+        stage_number = stage_plan.stage_number
+
+    if existing.status == "finalized":
         logger.info(
             "finalize 幂等重入：status 已 finalized 但 chapter_card 缺失，"
             "跳过 status 翻转直接走投影断点续跑：project=%s chapter=%s",
@@ -563,6 +684,7 @@ async def finalize_chapter(
                 user_id=user_id,
                 project_id=project_id,
                 chapter_number=chapter_number,
+                stage_number=stage_number,
                 extracted=extracted,
             )
             await projection_session.commit()
@@ -572,6 +694,30 @@ async def finalize_chapter(
                 project_id,
                 chapter_number,
             )
+
+            # ---------- Story 5.5 embedding 投影（三表 commit 后、独立事务、失败降级） ----------
+            # 受控决策 3 同构「投影失败 ≠ 定稿失败」：向量化 + 写 embedding 在 chapter_commit 三表
+            # 单事务**之外**（provider.embed 是外部 HTTP，在事务外调；写 embedding 行走 project_
+            # chapter_embeddings 内部自己的独立事务）。chapter_text 用 existing.text（chapter 表
+            # 实际入库的定稿正文，陷阱⑥），非 polisher 产物。
+            # 独立 try/except 吞异常：embedding 失败只 warning——三表已 commit、status 已 finalized、
+            # 用户已收成功响应；embedding 缺失只降级 5.6 RAG 召回质量（退 tsvector），**不阻断定稿、
+            # 不回滚已成功的三表投影**。故不复用外层 except（那会 rollback projection_session）。
+            try:
+                await embedding_projection_service.project_chapter_embeddings(
+                    user_id=user_id,
+                    project_id=project_id,
+                    chapter_number=chapter_number,
+                    chapter_text=existing.text,
+                )
+            except Exception:  # noqa: BLE001  embedding 失败不阻断定稿（已记日志、三表已落库）
+                logger.warning(
+                    "finalize embedding 投影失败（不阻断定稿，三表已落库，RAG 退 tsvector）："
+                    "project=%s chapter=%s",
+                    project_id,
+                    chapter_number,
+                    exc_info=True,
+                )
     except (RuntimeError, ErrorEnvelope) as exc:
         # 投影失败不向上抛（status 已 finalized 保留）——记日志留审计 + 显式 rollback +
         # 显式标 run.steps.data_agent 为 failed（供下次重入识别），下次定稿（本章或下一章）

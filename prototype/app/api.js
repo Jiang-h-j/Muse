@@ -317,6 +317,28 @@ const projectApi = {
 };
 
 // ---------------------------------------------------------------------
+// 归档 API（Story 5.3）：已确认设定圣经 + 按稳定阶段归属分组的章节卡片。
+// 归档页通过一个聚合请求获取全量数据，避免页面自行拼接 story_bible/chapter_card/stage_plan。
+const archiveApi = {
+  get(projectId) {
+    return apiFetch(`/api/projects/${projectId}/archive`);
+  },
+};
+
+// ---------------------------------------------------------------------
+// 通读视图 API（Story 6.1）：按序已定稿章节 + 后端分页（READTHROUGH_PER_PAGE=6）。
+// 通读页一次性聚合拉取，不做二次分页（响应已含 chapters[i].pages/totalPages）。
+// 后端契约（backend/src/muse/routers/readthrough.py，本 story 交付）：
+//   GET /api/projects/{id}/readthrough → 200 ReadthroughResponse
+//     {project:{title}, chapters:[{chapterNumber,title,pages,totalPages}],
+//      totalChapters, hasUnfinalized}
+const readthroughApi = {
+  get(projectId) {
+    return apiFetch(`/api/projects/${projectId}/readthrough`);
+  },
+};
+
+// ---------------------------------------------------------------------
 // BYOK API 薄封装（Story 7.4）：模型接入页绑定/查询/解绑自有 API Key。
 // 全部经 apiFetch（默认 auth=true）——token 注入、401 刷新重放、error envelope
 // 解包、跳登录收敛均由地基处理，本封装只拼 path/method/body。
@@ -728,6 +750,8 @@ if (typeof window !== "undefined") {
   window.ApiError = ApiError;
   window.authApi = authApi;
   window.projectApi = projectApi;
+  window.archiveApi = archiveApi;
+  window.readthroughApi = readthroughApi;
   window.byokApi = byokApi;
   window.usageApi = usageApi;
   window.apiStream = apiStream;
