@@ -13,6 +13,7 @@
 ## Deferred from: code review of story-5.3 (2026-08-06)
 
 - **第二阶段及后续章节生成仍按第一阶段计划校验，无法正常产生跨阶段归档** [backend/src/muse/services/chapter_service.py:242-247,315-320] — `trigger_chapter_generation` 与 `trigger_chapter_revision` 都调用未指定 `stage_number` 的 `get_stage_plan()`，恒取第一阶段，再将全局 `chapter_number` 与第一阶段 `chapters` 长度比较。第一阶段有 2 章、用户完成后进入第二阶段并生成全局第 3 章时，服务返回 `chapter_out_of_range`，后续无法定稿/投影 `chapter_card`。非 Story 5.3 引入，但会阻断生产路径形成跨阶段真实归档。**归章节阶段定位修复切片**：按全局章号与全部 stage_plan 累计范围定位目标阶段和阶段内索引（或显式传 `stage_number`），生成与修订使用同一规则，并加首阶段→下一阶段真实端到端回归。
+  - ✅ 2026-08-07 于 Story 4.8 关闭：`trigger_chapter_generation` / `trigger_chapter_revision` 改用 `stage_plan_repo.locate_stage_for_chapter` 按全局连续章号定位所属阶段（chapter_service.py），跨阶段生成/修订链路打通；跨阶段回归见 `backend/tests/test_chapter_cross_stage.py`（7 用例覆盖全局 3/4/5 章放行、第 6 章越界、chapter_number=0、未生成章前置、finalized 拒改）。
 
 ## Deferred from: code review of 5-2-写后投影-data-agent-chapter-commit单事务 (2026-08-06)
 

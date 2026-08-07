@@ -64,8 +64,10 @@ _DRAFT_MAX_TOKENS = 4000
 _REVIEW_MAX_TOKENS = 2048
 _POLISH_MAX_TOKENS = 4000
 # data-agent（Story 5.2）输出严格 JSON：五要素 + 三列快照 + 三类 thread 操作，结构化
-# 凝练体量小；但 reasoning 模型先吃预算（settle:55-58 踩坑），故 max_tokens 留足。
-_DATA_AGENT_MAX_TOKENS = 2048
+# 凝练体量小；但 flash 档对完整 prompt（设定摘要+前章卡+数千字正文+schema）会深度思考
+# 3000+ tokens（实测 chapter 1 正文 3815 字时 reasoning_tokens 即触 2048 上限、content 空串
+# 返 `_projection_failed`），故 max_tokens 提到 8192 给思考留足空间，正文再 ~1500 够用。
+_DATA_AGENT_MAX_TOKENS = 8192
 
 # 写前上下文注入的前序章节数（AC4）：V1 默认取最近 1 章（前一章）。取太多会挤爆 128K 上下文
 # （承 deferred-work.md:175 对话历史无上界顾虑）；单章正文约 1500-2500 字，1 章足够给 drafter

@@ -167,12 +167,15 @@ def _bible_not_confirmed() -> ErrorEnvelope:
 
 
 def _chapter_out_of_range() -> ErrorEnvelope:
-    """章号非法或超出当前阶段规划范围（→ 400）。
+    """章号非法或超出**全部**阶段规划的累计章数范围（→ 400）。
 
-    防御 API 直打：路由 int 转换器放行 0 与任意大整数（负数走 404）。生成一个 < 1 或不在
-    stage_plan.chapters 范围内的章号会真跑四段流水线真计费、并 upsert 污染 chapter 业务表
-    （生成阶段规划里根本不存在的「章」）。前端只在 stage_plan 有对应章时渲染生成表单，正常 UI
-    走不到——此校验拦住绕过 UI 的直接调用。
+    防御 API 直打：路由 int 转换器放行 0 与任意大整数（负数走 404）。生成一个 < 1 或按全局
+    连续章号 `locate_stage_for_chapter` 未命中任何阶段的章号，会真跑四段流水线真计费、并
+    upsert 污染 chapter 业务表（生成阶段规划里根本不存在的「章」）。前端只在 stage_plan 有
+    对应章时渲染生成表单，正常 UI 走不到——此校验拦住绕过 UI 的直接调用。
+
+    Story 4.8 起跨阶段：单阶段作品 locate 等价于「chapter_number ≤ stage1.chapters 长度」；
+    多阶段作品按累计章数定位所属阶段，未命中（含「完全无规划」「超出全部规划累计章数」）即越界。
     """
     return ErrorEnvelope(
         code="chapter_out_of_range",
@@ -310,15 +313,20 @@ async def trigger_chapter_generation(
     chapter_number: int,
     chapter_idea: str | None = None,
 ) -> str:
-    """触发「真实生成章节正文」ARQ 后台任务（Story 4.4 AC1/AC5）。返回 taskId 供前端连 SSE。
+    """触发「真实生成章节正文」ARQ 后台任务（Story 4.4 AC1/AC5 + Story 4.8 跨阶段定位）。
+
+    返回 taskId 供前端连 SSE。
 
     **完整仿 trigger_stage_planning**（本文件上文）：
     1. 租户守卫：get_owned_project → None 抛 404（二义合一，NFR3）。
     2. confirmed 前置（防御）：无 confirmed bible → 400 bible_not_confirmed（不给未确认作品
        排生成任务；正常流程确认设定后才进创作）。
-    3. taskId = uuid4 hex（不可枚举，与 tasks.py:38 同款）。
-    4. register_task_owner **必须在 enqueue_job 之前**（陷阱②）：否则 SSE 端点鉴权读不到属主。
-    5. ARQ pool 每次 create_pool + aclose；chapter_number（位置）+ chapter_idea 透传给
+    3. 章号范围校验（Story 4.8）：chapter_number < 1 或 `locate_stage_for_chapter` 未命中
+       任何阶段 → 400 chapter_out_of_range。按**全局连续章号**跨阶段定位，不再只按首阶段
+       chapters 长度比对（跨阶段后第 3+ 章必须能生成）。
+    4. taskId = uuid4 hex（不可枚举，与 tasks.py:38 同款）。
+    5. register_task_owner **必须在 enqueue_job 之前**（陷阱②）：否则 SSE 端点鉴权读不到属主。
+    6. ARQ pool 每次 create_pool + aclose；chapter_number（位置）+ chapter_idea 透传给
        worker.generate_chapter（worker.py:195-202 签名：ctx, task_id, user_id, project_id,
        chapter_number, chapter_idea=None）。真实生成在 pipeline.run_chapter_pipeline（幂等
        可断点续跑；重复触发同章复用同 run，不重复付费 NFR5）。
@@ -334,16 +342,17 @@ async def trigger_chapter_generation(
     if bible is None:
         raise _bible_not_confirmed()
 
-    # 章号范围校验（防御 API 直打）：chapter_number 须 >= 1 且落在首个阶段规划的章数范围内。
-    # 无阶段规划（尚未生成）时也拦——不给「阶段规划都没有」的作品排生成任务。前端正常流程只在
-    # stage_plan 有对应章时才渲染生成表单，此校验拦住绕过 UI 的越界调用（防真计费 + 污染业务表）。
+    # 章号范围校验（防御 API 直打，Story 4.8 跨阶段定位）：
+    # chapter_number 须 >= 1 且落在**全部**阶段规划的累计章数范围内。
+    # 无阶段规划（连首阶段都没生成）时也拦——不给「阶段规划都没有」的作品排生成任务。
+    # locate_stage_for_chapter 内部对 chapter_number<1 / 无规划 / 越界均返 None，
+    # 为保持 4.4 契约（无规划也抛 chapter_out_of_range），None 时不再细分原因。
     if chapter_number < 1:
         raise _chapter_out_of_range()
-    stage_plan = await stage_plan_repo.get_stage_plan(
-        session, user_id=user_id, project_id=project_id
+    target_stage = await stage_plan_repo.locate_stage_for_chapter(
+        session, user_id=user_id, project_id=project_id, chapter_number=chapter_number
     )
-    chapters = (stage_plan.chapters if stage_plan else None) or []
-    if chapter_number > len(chapters):
+    if target_stage is None:
         raise _chapter_out_of_range()
 
     settings = get_settings()
@@ -385,7 +394,9 @@ async def trigger_chapter_revision(
     feedback: str | None = None,
     annotations: list[dict] | None = None,
 ) -> str:
-    """触发「改进本章 / 重新生成整章」ARQ 后台任务（Story 4.6）。返回 taskId 供前端连 SSE。
+    """触发「改进本章 / 重新生成整章」ARQ 后台任务（Story 4.6 + Story 4.8 跨阶段定位）。
+
+    返回 taskId 供前端连 SSE。
 
     **完整仿 trigger_chapter_generation**（本文件上文），额外做三件事：
     1. 改进守卫（AC1）：action="improve" 且 feedback 空白且 annotations 空 → 400
@@ -395,6 +406,8 @@ async def trigger_chapter_revision(
     3. **强制重跑（AC3 核心）**：reset_run 作废旧 chapter_generation_run（清 steps + status→
        running），使 worker 里 run_chapter_pipeline 重跑全四段而非复用旧 succeeded 终稿。
 
+    章号范围校验同 trigger_chapter_generation（Story 4.8）：chapter_number < 1 或
+    `locate_stage_for_chapter` 未命中 → 400 chapter_out_of_range，跨阶段定位。
     触发范式同 trigger_chapter_generation：register_task_owner 必先于 enqueue_job（陷阱②）。
     并发去重/限流沿用 deferred-work.md:391 defer（本 story 不做，前端按钮 disabled 防单页双击）。
     """
@@ -409,14 +422,15 @@ async def trigger_chapter_revision(
     if bible is None:
         raise _bible_not_confirmed()
 
-    # 章号范围校验（防御 API 直打，同 trigger_chapter_generation）。
+    # 章号范围校验（防御 API 直打，Story 4.8 跨阶段定位，同 trigger_chapter_generation）：
+    # chapter_number 须 >= 1 且落在**全部**阶段规划的累计章数范围内；无规划 / 越界均抛
+    # chapter_out_of_range（保持 4.4 契约，不再细分原因）。
     if chapter_number < 1:
         raise _chapter_out_of_range()
-    stage_plan = await stage_plan_repo.get_stage_plan(
-        session, user_id=user_id, project_id=project_id
+    target_stage = await stage_plan_repo.locate_stage_for_chapter(
+        session, user_id=user_id, project_id=project_id, chapter_number=chapter_number
     )
-    chapters = (stage_plan.chapters if stage_plan else None) or []
-    if chapter_number > len(chapters):
+    if target_stage is None:
         raise _chapter_out_of_range()
 
     # 改进守卫（AC1）：改进须有反馈（整体点评或段落批注其一）；重生允许空反馈。

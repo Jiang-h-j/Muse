@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-07（Story 5.6 创建：RAG 三级召回接回写前上下文 → ready-for-dev）
+# last_updated: 2026-08-07（Story 4.8 跨阶段章节生成定位修复实现完成 → review）
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-07 (V1 收口：5-6/6-1 review→done 用户拍板不走 code review；6-2 deferred；epic-5/6 done，全项目 V1 收尾)
+last_updated: 2026-08-07 (Story 4.8 跨阶段章节生成定位修复实现完成 → review，关闭 deferred-work 5.3 段第 1 条)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -88,7 +88,7 @@ development_status:
   epic-3-retrospective: optional
 
   # ---------- Epic 4: 章节创作（含盲测门禁）----------
-  epic-4: done
+  epic-4: in-progress
   4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: done
   4-2-五段流水线编排底座V1四段-去AI味词表: done
   4-3-首章无缝进入-幕后阶段规划: done
@@ -96,6 +96,7 @@ development_status:
   4-5-分页阅读-段落批注-整体点评: done
   4-6-改进本章-重新生成整章: done
   4-7-定稿本章-阶段循环-阶段交界方向输入: done
+  4-8-跨阶段章节生成定位修复: review
   epic-4-retrospective: optional
 
   # ---------- Epic 5: 故事档案与归档（含 RAG）----------
