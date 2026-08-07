@@ -15,6 +15,9 @@
 # 空占位文件
 /npx
 
+# 学习笔记（个人通读代码的笔记，不入库）
+/docs/
+
 # Python / uv 后端产物
 .venv/
 __pycache__/

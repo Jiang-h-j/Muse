@@ -1,5 +1,5 @@
 # generated: 2026-07-23
-# last_updated: 2026-08-06 (Story 5.2 三层审查通过：8 patch 全落地 [E1+E2 致命 bug 修 + E6 端到端回归测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback+A8 标 failed / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / B4 三表全空] / 4 decision 全「保持现状+spec 注记」 / 3 defer 入台账 / 9 dismiss；629 passed 零回归，5-2 review → done)
+# last_updated: 2026-08-07（Story 5.6 创建：RAG 三级召回接回写前上下文 → ready-for-dev）
 # project: Muse
 # project_key: NOKEY
 # tracking_system: file-system
@@ -47,7 +47,7 @@
 # - key 命名：数字前缀 + 完整中文标题（括号删除 / 空格删除 / 分隔符→连字符 / 英文保留原大小写）。
 
 generated: 2026-07-23
-last_updated: 2026-08-06 (Story 5.2 三层审查通过：8 patch 全落地 [E1+E2 致命 bug 修 + E6 端到端回归测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback+A8 标 failed / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / B4 三表全空] / 4 decision 全「保持现状+spec 注记」 / 3 defer 入台账 / 9 dismiss；629 passed 零回归，5-2 review → done)
+last_updated: 2026-08-07 (V1 收口：5-6/6-1 review→done 用户拍板不走 code review；6-2 deferred；epic-5/6 done，全项目 V1 收尾)
 project: Muse
 project_key: NOKEY
 tracking_system: file-system
@@ -88,8 +88,8 @@ development_status:
   epic-3-retrospective: optional
 
   # ---------- Epic 4: 章节创作（含盲测门禁）----------
-  epic-4: in-progress
-  4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: review
+  epic-4: done
+  4-1-盲测门禁-Claude-vs-DeepSeeklaunchblocker: done
   4-2-五段流水线编排底座V1四段-去AI味词表: done
   4-3-首章无缝进入-幕后阶段规划: done
   4-4-本章想法输入-真实生成章节正文: done
@@ -97,23 +97,21 @@ development_status:
   4-6-改进本章-重新生成整章: done
   4-7-定稿本章-阶段循环-阶段交界方向输入: done
   epic-4-retrospective: optional
-  # 注：epic-4 仍 in-progress 因为 4-1（盲测 launch blocker）还卡 review——是创始人确认门禁非代码评审路径；
-  # 4-2~4-7 全 done。4-1 转正后 epic-4 才 done。
 
   # ---------- Epic 5: 故事档案与归档（含 RAG）----------
-  epic-5: in-progress
+  epic-5: done
   5-1-归档核心表落地chapter_card-story_thread-story_state: done
   5-2-写后投影-data-agent-chapter-commit单事务: done
-  5-3-归档页-故事档案统一入口设定圣经-分阶段: backlog
-  5-4-归档页-首屏收起-展开交互-章节归档详情: backlog
-  5-5-embedding表-EmbeddingProviderpgvector: backlog
-  5-6-RAG三级召回接回写前上下文: backlog
+  5-3-归档页-故事档案统一入口设定圣经-分阶段: done
+  5-4-归档页-首屏收起-展开交互-章节归档详情: done
+  5-5-embedding表-EmbeddingProviderpgvector: done
+  5-6-RAG三级召回接回写前上下文: done
   epic-5-retrospective: optional
 
   # ---------- Epic 6: 通读与交付 ----------
-  epic-6: backlog
-  6-1-全本连续通读视图全新页面: backlog
-  6-2-AI辅助生成标识合规: backlog
+  epic-6: done
+  6-1-全本连续通读视图全新页面: done
+  6-2-AI辅助生成标识合规: deferred
   epic-6-retrospective: optional
 
   # ---------- Epic 7: 前端真实接线与端到端集成（2026-07-30 Correct Course 新增）----------

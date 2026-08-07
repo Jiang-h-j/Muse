@@ -1,5 +1,19 @@
 # Deferred Work
 
+## Deferred from: V1 收尾决策 (2026-08-07)
+
+> 用户 Jianghj 拍板收口 V1，不再为剩余 story 走三层 code-review、不再做 6-2。
+> 本节如实登记状态、潜在风险、以及 V1 若转公测必须回头补救的项。
+
+- 🔴 **6-2 AI 辅助生成标识合规未做（backlog → deferred）** — 按照《人工智能生成合成内容标识办法》（2025-09-01 施行），AI 生成内容须显式标识。V1 单用户/内测不公开对外发布 → 风险可控；**若 V1 转公测/公开分享出去，须先补做本 story 再开分享**。覆盖范围（原计划）：通读视图/归档页/分享页的「AI 辅助生成」标识 + 导出文件元信息嵌入。当前不阻塞 Epic 5/6 内部交付。
+- 🟡 **5-6 / 6-1 未走三层 code-review 直接 review→done**（脱离 V1 项目先例：Epic 1-4 / Epic 7 每个 story 都带「含代码审查修复」）。**紧固建议**：V1 上线前若要加保险，可单独对这两个 story 跑一次 `/bmad-code-review`（尤其 5-6 RAG 召回正确性、6-1 前端零测试覆盖两个面）。
+- 🟡 **前端零自动化测试覆盖（Epic 7 + 6-1 通病）** — 仓库无 jest/vitest 配置，无 `*.test.js`。前端行为仅靠后端契约测试 + 浏览器手验兜底。6-1 Subtask 4.2「`test_readthrough_frontend.js`」按此前例跳过。若 V1 要做发布质量门禁 (CI)，须先立前端测试框架（vitest + happy-dom 或 Playwright 均可），并把 Epic 7 关键接线（登录流/作品库/探索/章节创作流）+ 6-1 翻页交互一并补测。
+- 🟢 **前两批 defer 已有定论** — 本文件上面 4-7/5-2/5-3/7-5 各段此前登记的技术债（`NextStagePlanRequest.direction` 无 max_length、跨 tab revise 竞态、`NextStagePlanRequest` 并发 _job_id 治理、SSE 编排硬化等）依旧 open，与 V1 收尾决策不冲突，归「开放注册前加固批次」统一处理。
+
+## Deferred from: code review of story-5.3 (2026-08-06)
+
+- **第二阶段及后续章节生成仍按第一阶段计划校验，无法正常产生跨阶段归档** [backend/src/muse/services/chapter_service.py:242-247,315-320] — `trigger_chapter_generation` 与 `trigger_chapter_revision` 都调用未指定 `stage_number` 的 `get_stage_plan()`，恒取第一阶段，再将全局 `chapter_number` 与第一阶段 `chapters` 长度比较。第一阶段有 2 章、用户完成后进入第二阶段并生成全局第 3 章时，服务返回 `chapter_out_of_range`，后续无法定稿/投影 `chapter_card`。非 Story 5.3 引入，但会阻断生产路径形成跨阶段真实归档。**归章节阶段定位修复切片**：按全局章号与全部 stage_plan 累计范围定位目标阶段和阶段内索引（或显式传 `stage_number`），生成与修订使用同一规则，并加首阶段→下一阶段真实端到端回归。
+
 ## Deferred from: code review of 5-2-写后投影-data-agent-chapter-commit单事务 (2026-08-06)
 
 > 三层对抗式审查（Blind Hunter / Edge Case Hunter / Acceptance Auditor）。Edge 发现 **E1+E2 致命 bug**（finalize 投影链路把 chapter.status 从 finalized 改回 draft、revision 从 N 重置为 1——FR21 破功）已就地修复（pipeline.py:361-368 加 `if not run_data_agent_step:` 跳过 upsert_chapter）；Acceptance Auditor 确认 4/5 AC 兑现、5 受控决策全兑现、defer 台账 4 条防线全兑现。8 条 patch 待落地（E6 端到端测试 / E4+E5 类型+章号防御 / B1 KeyError / B4 显式 rollback / B5+E9 fence 正则 / A7 前序 chapter_card 注入 / A8 投影失败标 failed / B4 三表全空断言）、4 条 decision-needed（PIPELINE_STEPS 拆分 / 参数名+判定位置 / 错误工厂+类型归一 / schema 字段名），以下 3 条 defer。
